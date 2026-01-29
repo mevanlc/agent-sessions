@@ -29,36 +29,10 @@ enum ClaudeProbeConfig {
     }
 
     /// Returns true if the given session appears to be an Agent Sessions probe session.
+    /// With CLAUDE_CONFIG_DIR quarantining, this is a simple path-prefix check — O(1), no I/O.
     static func isProbeSession(_ session: Session) -> Bool {
         guard session.source == .claude else { return false }
-
-        // 1) Fast path: session file lives under our quarantined config dir (new probes)
-        let configPrefix = probeConfigDir()
-        if session.filePath.hasPrefix(configPrefix + "/") {
-            return true
-        }
-
-        // 2) Legacy: session file lives under a previously-discovered probe project
-        //    in ~/.claude/projects/. Uses a cached result to avoid repeated filesystem scans.
-        if let projectID = ClaudeProbeProject.cachedProbeProjectId(), !projectID.isEmpty {
-            let legacyRoot = (NSHomeDirectory() as NSString)
-                .appendingPathComponent(".claude/projects/\(projectID)")
-            if session.filePath.hasPrefix(legacyRoot + "/") {
-                return true
-            }
-        }
-
-        // 3) cwd match for lightweight sessions
-        if let cwd = session.lightweightCwd, !cwd.isEmpty {
-            if normalizePath(cwd) == normalizePath(probeWorkingDirectory()) { return true }
-        }
-
-        return false
-    }
-
-    private static func normalizePath(_ path: String) -> String {
-        let expanded = (path as NSString).expandingTildeInPath
-        return (expanded as NSString).standardizingPath
+        return session.filePath.hasPrefix(probeConfigDir() + "/")
     }
 
     private static func envValue(_ key: String) -> String? {

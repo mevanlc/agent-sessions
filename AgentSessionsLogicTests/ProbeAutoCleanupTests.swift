@@ -10,26 +10,14 @@ final class ProbeAutoCleanupTests: XCTestCase {
         return dir
     }
 
-    func testCleanupNowIfAutoDeletesProject() throws {
-        let projectsRoot = mkdtemp(prefix: "as-proj-root")
-        let probeWD = mkdtemp(prefix: "as-probe-wd")
-        setEnv("AS_TEST_CLAUDE_PROJECTS_ROOT", projectsRoot.path)
-        setEnv("AS_TEST_PROBE_WD", probeWD.path)
+    func testCleanupNowIfAutoDeletesQuarantineDir() throws {
+        let configDir = mkdtemp(prefix: "as-probe-config")
+        setEnv("AS_TEST_PROBE_CONFIG_DIR", configDir.path)
 
-        // Create a fake project matching the probe WD
-        let projectDir = projectsRoot.appendingPathComponent("proj-auto")
-        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
-        try JSONSerialization.data(withJSONObject: ["rootPath": probeWD.path], options: [])
-            .write(to: projectDir.appendingPathComponent("project.json"))
-        // Add one tiny probe session (assistant response only)
-        let sessionLine = [
-            "type": "assistant",
-            "sessionId": "s1",
-            "cwd": probeWD.path,
-            "message": ["content": "usage: 50%"]
-        ] as [String : Any]
-        let data = try JSONSerialization.data(withJSONObject: sessionLine)
-        try (String(data: data, encoding: .utf8)! + "\n").write(to: projectDir.appendingPathComponent("one.jsonl"), atomically: true, encoding: .utf8)
+        // Create a fake session file inside the quarantine dir
+        let projectsDir = configDir.appendingPathComponent("projects/test-proj")
+        try FileManager.default.createDirectory(at: projectsDir, withIntermediateDirectories: true)
+        try "{}".write(to: projectsDir.appendingPathComponent("one.jsonl"), atomically: true, encoding: .utf8)
 
         // Enable auto mode and execute immediate cleanup
         ClaudeProbeProject.setCleanupMode(.auto)
@@ -38,7 +26,10 @@ final class ProbeAutoCleanupTests: XCTestCase {
         case .success: break
         default: XCTFail("Expected success, got: \(status)")
         }
+        // The config dir should be recreated empty
         var isDir: ObjCBool = false
-        XCTAssertFalse(FileManager.default.fileExists(atPath: projectDir.path, isDirectory: &isDir))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configDir.path, isDirectory: &isDir))
+        // But session files should be gone
+        XCTAssertFalse(FileManager.default.fileExists(atPath: projectsDir.path, isDirectory: &isDir))
     }
 }
