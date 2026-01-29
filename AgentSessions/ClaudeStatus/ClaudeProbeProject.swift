@@ -195,32 +195,58 @@ enum ClaudeProbeProject {
 
     // MARK: - Discovery
 
+    /// In-memory cache for the probe project ID. Populated once, then reused for all
+    /// subsequent `isProbeSession` calls to avoid repeated filesystem scans.
+    private static let _cachedID = Locked<String?>(nil)
+    private static let _cachePopulated = Locked<Bool>(false)
+
+    /// Returns the cached probe project ID without performing any filesystem discovery.
+    /// Returns nil if discovery hasn't been run yet or found nothing.
+    /// Safe to call from the main thread (O(1), no I/O).
+    static func cachedProbeProjectId() -> String? {
+        if _cachePopulated.withLock({ $0 }) {
+            return _cachedID.withLock { $0 }
+        }
+        // First call: run discovery once and cache the result.
+        let result = discoverProbeProjectId()
+        _cachePopulated.withLock { $0 = true }
+        return result
+    }
+
     /// Returns a cached or freshly-discovered Claude project id matching the Probe WD.
+    /// NOTE: This performs filesystem I/O. Prefer `cachedProbeProjectId()` in hot paths.
     static func discoverProbeProjectId() -> String? {
+        func cacheAndReturn(_ id: String) -> String {
+            _cachedID.withLock { $0 = id }
+            _cachePopulated.withLock { $0 = true }
+            UserDefaults.standard.set(id, forKey: Keys.cachedProjectID)
+            return id
+        }
+
         if let cached = UserDefaults.standard.string(forKey: Keys.cachedProjectID), !cached.isEmpty {
             let candidate = claudeProjectsRoot().appendingPathComponent(cached)
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDir), isDir.boolValue,
                isVerifiedProbeProjectDir(candidate) {
-                return cached
+                return cacheAndReturn(cached)
             }
         }
         if let marked = probeProjectDirectoryByMarker() {
-            UserDefaults.standard.set(marked.lastPathComponent, forKey: Keys.cachedProjectID)
-            return marked.lastPathComponent
+            return cacheAndReturn(marked.lastPathComponent)
         }
         if let hinted = probeProjectDirectoryByNameHint(),
            projectJsonMatchesProbeWD(projectDir: hinted) || probeMarkerExists(in: hinted) || validateProjectContents(projectDir: hinted) {
-            UserDefaults.standard.set(hinted.lastPathComponent, forKey: Keys.cachedProjectID)
-            return hinted.lastPathComponent
+            return cacheAndReturn(hinted.lastPathComponent)
         }
         let projectsRoot = claudeProjectsRoot()
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: projectsRoot.path, isDirectory: &isDir), isDir.boolValue else {
+            _cachePopulated.withLock { $0 = true }
             return nil
         }
         let expected = normalizePath(ClaudeProbeConfig.probeWorkingDirectory())
         guard let contents = try? FileManager.default.contentsOfDirectory(at: projectsRoot, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
+            _cachePopulated.withLock { $0 = true }
             return nil
         }
         for dir in contents {
@@ -230,11 +256,11 @@ enum ClaudeProbeProject {
             guard let data = try? Data(contentsOf: meta), let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
             if let root = extractRootPath(from: obj) {
                 if normalizePath(root) == expected {
-                    UserDefaults.standard.set(dir.lastPathComponent, forKey: Keys.cachedProjectID)
-                    return dir.lastPathComponent
+                    return cacheAndReturn(dir.lastPathComponent)
                 }
             }
         }
+        _cachePopulated.withLock { $0 = true }
         return nil
     }
 
