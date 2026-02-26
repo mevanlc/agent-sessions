@@ -110,9 +110,9 @@ actor AnalyticsIndexer {
             if !enabledSources.contains(source) { continue }
             var files = enumerate()
             if source == "claude" {
-                // Never index Agent Sessions' Claude probe project sessions; they are hidden by default
-                // and contain large synthetic payloads that slow search and grow the DB.
-                files.removeAll { $0.path.contains("AgentSessions-ClaudeProbeProject") }
+                // Exclude probe sessions that live under the quarantined CLAUDE_CONFIG_DIR.
+                let probePrefix = ClaudeProbeConfig.probeConfigDir()
+                files.removeAll { $0.path.hasPrefix(probePrefix + "/") }
             }
             if !incremental {
                 // Full rebuild: purge everything for the source and reindex.

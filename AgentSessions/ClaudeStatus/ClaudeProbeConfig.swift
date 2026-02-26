@@ -16,38 +16,23 @@ enum ClaudeProbeConfig {
         return home.appendingPathComponent("Library/Application Support/AgentSessions/ClaudeProbeProject")
     }
 
-    /// Returns true if the given session appears to be an Agent Sessions probe session.
-    /// Heuristics (ordered, conservative to avoid false positives):
-    /// - Source must be `.claude`.
-    /// - Path-based: if the file lives inside the discovered probe project under ~/.claude/projects,
-    ///   it is a probe session (fast and definitive when project discovery works).
-    /// - Fast path: if lightweight `cwd` matches the Probe WD, treat as probe.
-    ///
-    /// Note: Probe sessions send no user messages to preserve usage limits.
-    /// Identification relies solely on working directory matching.
-    static func isProbeSession(_ session: Session) -> Bool {
-        guard session.source == .claude else { return false }
-
-        // 1) Path-based classification via discovered probe project id
-        if let projectID = ClaudeProbeProject.discoverProbeProjectId(), !projectID.isEmpty {
-            let root = (NSHomeDirectory() as NSString)
-                .appendingPathComponent(".claude/projects/\(projectID)")
-            if session.filePath.hasPrefix(root + "/") || session.filePath == root {
-                return true
-            }
+    /// Quarantined CLAUDE_CONFIG_DIR for probe sessions.
+    /// Setting this env var when launching Claude Code causes it to write session
+    /// data under this directory instead of ~/.claude/, making probe sessions
+    /// trivially identifiable by path prefix — no filesystem scanning needed.
+    static func probeConfigDir() -> String {
+        if let override = envValue("AS_TEST_PROBE_CONFIG_DIR"), !override.isEmpty {
+            return (override as NSString).expandingTildeInPath
         }
-
-        // 2) Fast path: cwd match for lightweight sessions
-        if let cwd = session.lightweightCwd, !cwd.isEmpty {
-            if normalizePath(cwd) == normalizePath(probeWorkingDirectory()) { return true }
-        }
-
-        return false
+        let home = NSHomeDirectory() as NSString
+        return home.appendingPathComponent("Library/Application Support/AgentSessions/claude-probe-config")
     }
 
-    private static func normalizePath(_ path: String) -> String {
-        let expanded = (path as NSString).expandingTildeInPath
-        return (expanded as NSString).standardizingPath
+    /// Returns true if the given session appears to be an Agent Sessions probe session.
+    /// With CLAUDE_CONFIG_DIR quarantining, this is a simple path-prefix check — O(1), no I/O.
+    static func isProbeSession(_ session: Session) -> Bool {
+        guard session.source == .claude else { return false }
+        return session.filePath.hasPrefix(probeConfigDir() + "/")
     }
 
     private static func envValue(_ key: String) -> String? {

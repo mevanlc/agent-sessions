@@ -1242,9 +1242,9 @@ actor IndexDB {
         if let df = dateFrom { clauses.append("COALESCE(sm.end_ts, sm.mtime) >= ?"); binds.append(Int64(df.timeIntervalSince1970)) }
         if let dt = dateTo { clauses.append("COALESCE(sm.end_ts, sm.mtime) <= ?"); binds.append(Int64(dt.timeIntervalSince1970)) }
         if !includeSystemProbes {
-            // Exclude Agent Sessions' Claude probe sessions; these are hidden by default in the UI.
+            // Exclude probe sessions under the quarantined CLAUDE_CONFIG_DIR.
             clauses.append("NOT (sm.source = 'claude' AND sm.path LIKE ?)")
-            binds.append("%AgentSessions-ClaudeProbeProject%")
+            binds.append(ClaudeProbeConfig.probeConfigDir() + "/%")
         }
 
         let whereSQL = clauses.isEmpty ? "" : (" WHERE " + clauses.joined(separator: " AND "))

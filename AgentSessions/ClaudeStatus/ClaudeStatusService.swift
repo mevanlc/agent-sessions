@@ -322,6 +322,11 @@ actor ClaudeStatusService {
         env["SLEEP_BOOT"] = "0.4"
         env["SLEEP_AFTER_USAGE"] = "2.0"
 
+        // Quarantine probe sessions under our controlled config dir
+        let probeConfigDir = ClaudeProbeConfig.probeConfigDir()
+        try? FileManager.default.createDirectory(atPath: probeConfigDir, withIntermediateDirectories: true)
+        env["CLAUDE_CONFIG_DIR"] = probeConfigDir
+
         let claudeEnv = ClaudeCLIEnvironment()
         let claudeBin = claudeEnv.resolveBinary(customPath: nil)?.path
         if let claudeBin { env["CLAUDE_BIN"] = claudeBin }
@@ -384,8 +389,12 @@ actor ClaudeStatusService {
         env["SLEEP_BOOT"] = "0.4"
         env["SLEEP_AFTER_USAGE"] = "2.0"
 
-        // Use real HOME for auth credentials (temp WORKDIR prevents file access prompts)
-        // No CLAUDE_HOME override - let it use real ~/.claude/ with credentials
+        // Quarantine probe sessions: set CLAUDE_CONFIG_DIR so Claude Code writes session
+        // data under our controlled directory instead of ~/.claude/. Auth lives in
+        // ~/.claude.json (outside the config dir) so credentials are unaffected.
+        let probeConfigDir = ClaudeProbeConfig.probeConfigDir()
+        try? FileManager.default.createDirectory(atPath: probeConfigDir, withIntermediateDirectories: true)
+        env["CLAUDE_CONFIG_DIR"] = probeConfigDir
 
         // Pass resolved Claude binary path (same logic as resume)
         let claudeEnv = ClaudeCLIEnvironment()
