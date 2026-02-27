@@ -1,0 +1,1 @@
+../../../../AgentSessions/Indexing/AnalyticsIndexer.swift

@@ -1,0 +1,1 @@
+../../../../AgentSessions/Model/Session.swift
