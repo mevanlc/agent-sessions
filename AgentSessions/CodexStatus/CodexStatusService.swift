@@ -419,6 +419,10 @@ actor CodexStatusService {
     ) -> NSRegularExpression? {
         makeRegex(pattern: pattern, options: options, label: label)
     }
+
+    func parseTokenCountTailForTesting(url: URL) -> RateLimitSummary? {
+        parseTokenCountTail(url: url)
+    }
 #endif
 
     // Regex helpers
@@ -1525,6 +1529,8 @@ actor CodexStatusService {
 
     private func parseTokenCountTail(url: URL) -> RateLimitSummary? {
         guard let lines = tailLines(url: url, maxBytes: logTailReadMaxBytes) else { return nil }
+        var fallbackSummary: RateLimitSummary? = nil
+        var didCaptureNewestUsage = false
         // Walk most-recent → older. Be permissive about shape; Codex logs can vary.
         for raw in lines.reversed() {
             guard let data = raw.data(using: .utf8) else { continue }
@@ -1541,77 +1547,133 @@ actor CodexStatusService {
                             Date()
 
             // Surface usage tokens if present (new or legacy forms)
-            extractUsageIfPresent(from: payload, createdAt: createdAt)
+            if !didCaptureNewestUsage {
+                didCaptureNewestUsage = extractUsageIfPresent(from: payload, createdAt: createdAt)
+            }
 
             // Rate limits may appear at payload.rate_limits or (legacy) at top-level
             if let rate = (payload["rate_limits"] as? [String: Any]) ?? (obj["rate_limits"] as? [String: Any]) {
-                let capturedAt = decodeFlexibleDate(rate["captured_at"] as Any?) ?? createdAt
-                if capturedAt > Date() { continue }
-                let primary = rate["primary"] as? [String: Any]
-                let secondary = rate["secondary"] as? [String: Any]
-                let five = decodeWindow(primary, created: createdAt, capturedAt: capturedAt)
-                let week = decodeWindow(secondary, created: createdAt, capturedAt: capturedAt)
-                let base = capturedAt
-                let stale = Date().timeIntervalSince(base) > 3 * 60
-                return RateLimitSummary(fiveHour: five, weekly: week, eventTimestamp: base, stale: stale, sourceFile: url)
+                guard let summary = makeRateLimitSummary(rate: rate, createdAt: createdAt, sourceFile: url) else { continue }
+                let limitID = normalizeLimitID(rate["limit_id"])
+                if limitID == "codex" || limitID == nil {
+                    return summary
+                }
+                if fallbackSummary == nil {
+                    fallbackSummary = summary
+                }
+                continue
             }
 
             // Legacy: token_count style where rate_limits nested under payload.info
             if let kind = payload["type"] as? String, kind.lowercased() == "token_count" {
                 if let info = payload["info"] as? [String: Any], let rate = info["rate_limits"] as? [String: Any] {
-                    let capturedAt = decodeFlexibleDate(rate["captured_at"] as Any?) ?? createdAt
-                    if capturedAt > Date() { continue }
-                    let primary = rate["primary"] as? [String: Any]
-                    let secondary = rate["secondary"] as? [String: Any]
-                    let five = decodeWindow(primary, created: createdAt, capturedAt: capturedAt)
-                    let week = decodeWindow(secondary, created: createdAt, capturedAt: capturedAt)
-                    let base = capturedAt
-                    let stale = Date().timeIntervalSince(base) > 3 * 60
-                    return RateLimitSummary(fiveHour: five, weekly: week, eventTimestamp: base, stale: stale, sourceFile: url)
+                    guard let summary = makeRateLimitSummary(rate: rate, createdAt: createdAt, sourceFile: url) else { continue }
+                    let limitID = normalizeLimitID(rate["limit_id"])
+                    if limitID == "codex" || limitID == nil {
+                        return summary
+                    }
+                    if fallbackSummary == nil {
+                        fallbackSummary = summary
+                    }
                 }
             }
         }
-        return nil
+        return fallbackSummary
     }
 
     // MARK: - Usage extraction (new + legacy)
 
-    private func extractUsageIfPresent(from payload: [String: Any], createdAt: Date) {
+    @discardableResult
+    private func extractUsageIfPresent(from payload: [String: Any], createdAt: Date) -> Bool {
         // New model: turn.completed with usage {...}
         if let kind = (payload["type"] as? String)?.lowercased(), kind == "turn.completed" || kind == "turn_completed" || kind == "turn-completed" {
             if let usage = payload["usage"] as? [String: Any] ?? (payload["data"] as? [String: Any])?["usage"] as? [String: Any] {
+                let parsedInput = intValue(usage["input_tokens"])
+                let parsedCachedInput = intValue(usage["cached_input_tokens"])
+                let parsedOutput = intValue(usage["output_tokens"])
+                let parsedReasoning = intValue(usage["reasoning_output_tokens"])
+                let parsedTotal = intValue(usage["total_tokens"])
                 var s = snapshot
-                s.lastInputTokens = intValue(usage["input_tokens"]) ?? s.lastInputTokens
-                s.lastCachedInputTokens = intValue(usage["cached_input_tokens"]) ?? s.lastCachedInputTokens
-                s.lastOutputTokens = intValue(usage["output_tokens"]) ?? s.lastOutputTokens
-                s.lastReasoningOutputTokens = intValue(usage["reasoning_output_tokens"]) ?? s.lastReasoningOutputTokens
-                if let i = s.lastInputTokens, let o = s.lastOutputTokens {
-                    s.lastTotalTokens = i + o
-                } else {
-                    s.lastTotalTokens = intValue(usage["total_tokens"]) ?? s.lastTotalTokens
+                var decodedAnyField = false
+                if let parsedInput {
+                    s.lastInputTokens = parsedInput
+                    decodedAnyField = true
                 }
+                if let parsedCachedInput {
+                    s.lastCachedInputTokens = parsedCachedInput
+                    decodedAnyField = true
+                }
+                if let parsedOutput {
+                    s.lastOutputTokens = parsedOutput
+                    decodedAnyField = true
+                }
+                if let parsedReasoning {
+                    s.lastReasoningOutputTokens = parsedReasoning
+                    decodedAnyField = true
+                }
+                if let parsedTotal {
+                    s.lastTotalTokens = parsedTotal
+                    decodedAnyField = true
+                } else if (parsedInput != nil || parsedOutput != nil),
+                          let i = s.lastInputTokens,
+                          let o = s.lastOutputTokens {
+                    s.lastTotalTokens = i + o
+                    decodedAnyField = true
+                }
+
+                guard decodedAnyField else { return false }
                 snapshot = s
                 updateHandler(snapshot)
                 // Usage sampling for cap ETA disabled; analytics will compute on demand.
-                return
+                return true
             }
         }
         // Legacy path: token_count.info.last_token_usage {...}
         if let kind = (payload["type"] as? String)?.lowercased(), kind == "token_count" {
             if let info = payload["info"] as? [String: Any] {
                 if let last = info["last_token_usage"] as? [String: Any] {
+                    let parsedInput = intValue(last["input_tokens"])
+                    let parsedCachedInput = intValue(last["cached_input_tokens"])
+                    let parsedOutput = intValue(last["output_tokens"])
+                    let parsedReasoning = intValue(last["reasoning_output_tokens"])
+                    let parsedTotal = intValue(last["total_tokens"])
                     var s = snapshot
-                    s.lastInputTokens = intValue(last["input_tokens"]) ?? s.lastInputTokens
-                    s.lastCachedInputTokens = intValue(last["cached_input_tokens"]) ?? s.lastCachedInputTokens
-                    s.lastOutputTokens = intValue(last["output_tokens"]) ?? s.lastOutputTokens
-                    s.lastReasoningOutputTokens = intValue(last["reasoning_output_tokens"]) ?? s.lastReasoningOutputTokens
-                    s.lastTotalTokens = intValue(last["total_tokens"]) ?? ((s.lastInputTokens ?? 0) + (s.lastOutputTokens ?? 0))
+                    var decodedAnyField = false
+                    if let parsedInput {
+                        s.lastInputTokens = parsedInput
+                        decodedAnyField = true
+                    }
+                    if let parsedCachedInput {
+                        s.lastCachedInputTokens = parsedCachedInput
+                        decodedAnyField = true
+                    }
+                    if let parsedOutput {
+                        s.lastOutputTokens = parsedOutput
+                        decodedAnyField = true
+                    }
+                    if let parsedReasoning {
+                        s.lastReasoningOutputTokens = parsedReasoning
+                        decodedAnyField = true
+                    }
+                    if let parsedTotal {
+                        s.lastTotalTokens = parsedTotal
+                        decodedAnyField = true
+                    } else if (parsedInput != nil || parsedOutput != nil),
+                              let i = s.lastInputTokens,
+                              let o = s.lastOutputTokens {
+                        s.lastTotalTokens = i + o
+                        decodedAnyField = true
+                    }
+
+                    guard decodedAnyField else { return false }
                     snapshot = s
                     updateHandler(snapshot)
                     // Usage sampling for cap ETA disabled; analytics will compute on demand.
+                    return true
                 }
             }
         }
+        return false
     }
 
     private func intValue(_ any: Any?) -> Int? {
@@ -1621,6 +1683,24 @@ actor CodexStatusService {
         if let n = any as? NSNumber { return n.intValue }
         if let s = any as? String, let v = Double(s) { return Int(v.rounded()) }
         return nil
+    }
+
+    private func makeRateLimitSummary(rate: [String: Any], createdAt: Date, sourceFile: URL) -> RateLimitSummary? {
+        let capturedAt = decodeFlexibleDate(rate["captured_at"] as Any?) ?? createdAt
+        if capturedAt > Date() { return nil }
+        let primary = rate["primary"] as? [String: Any]
+        let secondary = rate["secondary"] as? [String: Any]
+        let five = decodeWindow(primary, created: createdAt, capturedAt: capturedAt)
+        let week = decodeWindow(secondary, created: createdAt, capturedAt: capturedAt)
+        let stale = Date().timeIntervalSince(capturedAt) > 3 * 60
+        return RateLimitSummary(fiveHour: five, weekly: week, eventTimestamp: capturedAt, stale: stale, sourceFile: sourceFile)
+    }
+
+    private func normalizeLimitID(_ any: Any?) -> String? {
+        guard let raw = any as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.lowercased()
     }
 
     // MARK: - Flexible date decoding for Codex logs
@@ -1799,7 +1879,10 @@ actor CodexStatusService {
         p.waitUntilExit()
         guard p.terminationStatus == 0 else { return nil }
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Strip OSC escapes injected by terminal shell integrations.
+        let raw = String(data: data, encoding: .utf8)?
+            .replacingOccurrences(of: "\u{1b}\\][^\u{07}]*\u{07}", with: "", options: .regularExpression)
+        let path = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (path?.isEmpty == false) ? path : nil
     }
 
@@ -1812,7 +1895,9 @@ actor CodexStatusService {
         let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
         do { try p.run() } catch { return nil }
         p.waitUntilExit()
-        let s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        var s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Strip OSC escapes injected by terminal shell integrations.
+        s = s.replacingOccurrences(of: "\u{1b}\\][^\u{07}]*\u{07}", with: "", options: .regularExpression)
         let path = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? nil : path
     }

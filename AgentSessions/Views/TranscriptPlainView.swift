@@ -22,6 +22,111 @@ struct TranscriptRenderGenerationGate {
     }
 }
 
+enum TranscriptSessionRenderKey {
+    static func build(for session: Session) -> String {
+        "\(session.id)|\(session.eventCount)|\(session.events.count)|\(session.fileSizeBytes ?? -1)|\(session.endTime?.timeIntervalSince1970 ?? 0)|\(session.isFavorite ? 1 : 0)"
+    }
+}
+
+struct TranscriptTailUpdateState: Equatable {
+    enum BottomProximity: Equatable {
+        case unknown
+        case nearBottom
+        case awayFromBottom
+    }
+
+    private(set) var sessionID: String? = nil
+    private(set) var lastContentVersion: Int = 0
+    private(set) var bottomProximity: BottomProximity = .unknown
+    private(set) var hasUnseenUpdates: Bool = false
+    private(set) var stickyFollowEnabled: Bool = true
+    private(set) var scrollToBottomToken: Int = 0
+
+    var shouldShowJumpToLatestButton: Bool {
+        bottomProximity != .nearBottom
+    }
+
+    var isNearBottom: Bool {
+        bottomProximity == .nearBottom
+    }
+
+    mutating func reset(sessionID: String, contentVersion: Int) {
+        self.sessionID = sessionID
+        self.lastContentVersion = contentVersion
+        self.bottomProximity = .unknown
+        self.hasUnseenUpdates = false
+        self.stickyFollowEnabled = true
+    }
+
+    mutating func viewportChanged(isNearBottom: Bool) {
+        self.bottomProximity = isNearBottom ? .nearBottom : .awayFromBottom
+        if isNearBottom {
+            hasUnseenUpdates = false
+            stickyFollowEnabled = true
+        } else {
+            stickyFollowEnabled = false
+        }
+    }
+
+    mutating func contentVersionChanged(sessionID: String, contentVersion: Int) {
+        guard self.sessionID == sessionID else {
+            reset(sessionID: sessionID, contentVersion: contentVersion)
+            return
+        }
+        guard contentVersion != lastContentVersion else { return }
+
+        lastContentVersion = contentVersion
+        if bottomProximity != .awayFromBottom || stickyFollowEnabled {
+            hasUnseenUpdates = false
+            scrollToBottomToken &+= 1
+        } else {
+            hasUnseenUpdates = true
+        }
+    }
+
+    mutating func jumpToLatest() {
+        bottomProximity = .nearBottom
+        hasUnseenUpdates = false
+        stickyFollowEnabled = true
+        scrollToBottomToken &+= 1
+    }
+}
+
+enum TranscriptSessionResolutionPolicy {
+    // Backward-compatible overload to avoid stale call sites during incremental test bundles.
+    static func preferredSession(live: Session?, cached: Session?, sessionID: String) -> Session? {
+        preferredSession(
+            live: live,
+            cached: cached,
+            sessionID: sessionID,
+            isLoadingSession: true,
+            loadingSessionID: sessionID
+        )
+    }
+
+    static func preferredSession(live: Session?,
+                                 cached: Session?,
+                                 sessionID: String,
+                                 isLoadingSession: Bool,
+                                 loadingSessionID: String?) -> Session? {
+        if let live {
+            let isTransientlyReloadingSameSession = isLoadingSession && loadingSessionID == sessionID
+            if live.events.isEmpty,
+               isTransientlyReloadingSameSession,
+               let cached,
+               cached.id == sessionID,
+               !cached.events.isEmpty {
+                return cached
+            }
+            return live
+        }
+        if let cached, cached.id == sessionID {
+            return cached
+        }
+        return nil
+    }
+}
+
 /// Codex transcript view - now a wrapper around UnifiedTranscriptView
 struct TranscriptPlainView: View {
     @EnvironmentObject var indexer: SessionIndexer
@@ -169,6 +274,7 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
     // Selection for auto-scroll to find matches
     @State private var selectedNSRange: NSRange? = nil
     @State private var selectionScrollMode: SelectionScrollMode = .ensureVisible
+    @State private var tailUpdateState = TranscriptTailUpdateState()
     // Ephemeral copy confirmation (popover)
     @State private var showIDCopiedPopover: Bool = false
     // Terminal-only jump trigger (Session view uses SessionTerminalView, not NSTextView selection)
@@ -177,6 +283,7 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
     @State private var terminalRoleNavToken: Int = 0
     @State private var terminalRoleNavRole: SessionTerminalView.RoleToggle = .user
     @State private var terminalRoleNavDirection: Int = 1
+    @State private var pendingFirstRenderSessionID: String? = nil
 
     // Text view navigation cursors (used for keyboard jumps)
     @State private var lastUserJumpLocation: Int? = nil
@@ -196,104 +303,111 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
     @State private var lastRenderedViewModeRaw: String = SessionViewMode.terminal.rawValue
     @State private var lastRenderedAppendConfigKey: String? = nil
 
-    private var shouldShowLoadingAnimation: Bool {
-        guard let id = sessionID else { return false }
-        return indexer.isLoadingSession && indexer.loadingSessionID == id
+    private var transcriptTraceEnabled: Bool {
+        ProcessInfo.processInfo.environment["AGENTSESSIONS_TRACE_TRANSCRIPT"] == "1"
+            || UserDefaults.standard.bool(forKey: "DebugTraceTranscript")
+    }
+
+    private func transcriptTrace(_ message: @autoclosure () -> String) {
+        #if DEBUG
+        guard transcriptTraceEnabled else { return }
+        print("🧭[Transcript] \(message())")
+        #endif
+    }
+
+    private func sessionBuildKey(_ session: Session) -> String {
+        TranscriptSessionRenderKey.build(for: session)
+    }
+
+    private var renderKey: String {
+        guard let id = sessionID else { return "none" }
+
+        if let session = resolvedSessionForRender(id: id) {
+            return sessionBuildKey(session)
+        }
+        return "unresolved:\(id)"
+    }
+
+    private func resolvedSessionForRender(id: String) -> Session? {
+        let live = indexer.allSessions.first(where: { $0.id == id })
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: live,
+            cached: lastResolvedSession,
+            sessionID: id,
+            isLoadingSession: indexer.isLoadingSession,
+            loadingSessionID: indexer.loadingSessionID
+        )
+        let liveCount = live?.events.count ?? -1
+        let cachedCount = (lastResolvedSession?.id == id ? lastResolvedSession?.events.count : nil) ?? -1
+        let preferredCount = preferred?.events.count ?? -1
+        transcriptTrace(
+            "resolve id=\(id) liveEvents=\(liveCount) cachedEvents=\(cachedCount) preferredEvents=\(preferredCount) loading=\(indexer.isLoadingSession ? 1 : 0) loadingID=\(indexer.loadingSessionID ?? "nil")"
+        )
+        if let live, live.events.isEmpty, let cached = lastResolvedSession, cached.id == id, !cached.events.isEmpty {
+            transcriptTrace("prefer-cached-non-empty id=\(id) cachedEvents=\(cached.events.count)")
+        }
+        return preferred
     }
 
     var body: some View {
-        let liveSession = sessionID.flatMap { id in
-            indexer.allSessions.first(where: { $0.id == id })
-        }
-        let displaySession = liveSession ?? lastResolvedSession.flatMap { cached in
-            guard cached.id == sessionID else { return nil }
-            return cached
-        }
+        let displaySession = sessionID.flatMap { id in resolvedSessionForRender(id: id) }
 
-        if let id = sessionID, let session = displaySession {
+        if sessionID != nil, let session = displaySession {
             VStack(spacing: 0) {
                 toolbar(session: session)
                     .frame(maxWidth: .infinity)
                     .background(Color(NSColor.controlBackgroundColor))
                 Divider()
-	                ZStack {
-	                    if viewMode == .terminal {
-	                        SessionTerminalView(
-	                            session: session,
-	                            unifiedQuery: unifiedFreeText,
-	                            unifiedFindToken: terminalUnifiedFindToken,
-	                            unifiedFindDirection: terminalUnifiedFindDirection,
-	                            unifiedFindReset: terminalUnifiedFindResetFlag,
-	                            unifiedAllowMatchAutoScroll: terminalUnifiedAllowMatchAutoScroll,
-	                            unifiedExternalMatchCount: $terminalUnifiedMatchesCount,
-	                            unifiedExternalTotalMatchCount: $terminalUnifiedTotalMatchesCount,
-	                            unifiedExternalCurrentMatchIndex: $terminalUnifiedCurrentIndex,
-	                            findQuery: findQuery,
-	                            findToken: terminalFindToken,
-	                            findDirection: terminalFindDirection,
-	                            findReset: terminalFindResetFlag,
-	                            allowMatchAutoScroll: terminalAllowMatchAutoScroll,
-	                            jumpToken: terminalJumpToken,
-	                            roleNavToken: terminalRoleNavToken,
-	                            roleNavRole: terminalRoleNavRole,
-	                            roleNavDirection: terminalRoleNavDirection,
-	                            externalMatchCount: $terminalFindMatchesCount,
-	                            externalTotalMatchCount: $terminalFindTotalMatchesCount,
-	                            externalCurrentMatchIndex: $terminalFindCurrentIndex
-	                        )
-	                    } else {
-	                        PlainTextScrollView(
-	                            text: transcript,
-	                            selection: selectedNSRange,
-	                            selectionScrollMode: selectionScrollMode,
-	                            fontSize: CGFloat(transcriptFontSize),
-	                            highlights: unifiedHighlightRanges,
-	                            currentIndex: unifiedCurrentMatchIndex,
-	                            findCurrentRange: findCurrentRange,
-	                            commandRanges: (shouldColorize || isJSONMode) ? commandRanges : [],
-	                            userRanges: (shouldColorize || isJSONMode) ? userRanges : [],
-	                            assistantRanges: (shouldColorize || isJSONMode) ? assistantRanges : [],
-	                            outputRanges: (shouldColorize || isJSONMode) ? outputRanges : [],
-                            errorRanges: (shouldColorize || isJSONMode) ? errorRanges : [],
-                            isJSONMode: isJSONMode,
-                            appAppearanceRaw: appAppearanceRaw,
-                            colorScheme: colorScheme,
-                            monochrome: stripMonochrome
-                        )
+                ZStack(alignment: .bottom) {
+                    if viewMode == .terminal {
+                        terminalTranscriptView(session: session)
+                    } else {
+                        plainTranscriptView(session: session)
                     }
 
-                    // Show animation during lazy load OR full refresh
-                    if shouldShowLoadingAnimation {
-                        LoadingAnimationView(
-                            codexColor: Color.agentCodex,
-                            claudeColor: Color.agentClaude
-                        )
+                    if shouldShowJumpToLatestButton {
+                        jumpToLatestButton
                     }
                 }
             }
             .onAppear {
-                lastResolvedSession = session
-                rebuild(session: session)
+                if lastRenderedSessionID != session.id || transcript.isEmpty {
+                    pendingFirstRenderSessionID = session.id
+                }
+                tailUpdateState.reset(
+                    sessionID: session.id,
+                    contentVersion: transcriptContentVersion(for: session)
+                )
             }
-            .onChange(of: id) { oldID, newID in
-                if oldID != newID, lastResolvedSession?.id != newID {
-                    lastResolvedSession = nil
+            .onChange(of: session.id) { _, _ in
+                if lastRenderedSessionID != session.id || transcript.isEmpty {
+                    pendingFirstRenderSessionID = session.id
                 }
-                let resolvedSession = indexer.allSessions.first(where: { $0.id == newID })
-                    ?? (lastResolvedSession?.id == newID ? lastResolvedSession : nil)
-                if let resolvedSession {
-                    lastResolvedSession = resolvedSession
-                    rebuild(session: resolvedSession)
-                }
+                tailUpdateState.reset(
+                    sessionID: session.id,
+                    contentVersion: transcriptContentVersion(for: session)
+                )
+            }
+            .onChange(of: renderKey) { oldValue, newValue in
+                transcriptTrace("renderKey changed id=\(sessionID ?? "nil") old=\(oldValue) new=\(newValue)")
+            }
+            .onChange(of: transcriptContentVersion(for: session)) { _, newValue in
+                tailUpdateState.contentVersionChanged(
+                    sessionID: session.id,
+                    contentVersion: newValue
+                )
+            }
+            .task(id: renderKey) {
+                guard let id = sessionID else { return }
+
+                guard let resolvedSession = resolvedSessionForRender(id: id) else { return }
+                transcriptTrace("task rebuild id=\(id) events=\(resolvedSession.events.count) eventCount=\(resolvedSession.eventCount)")
+                rebuild(session: resolvedSession)
             }
             .onChange(of: viewModeRaw) { _, _ in
                 syncRenderModeWithViewMode()
                 rebuild(session: session)
             }
-            .onChange(of: session.events.count) { _, _ in rebuild(session: session) }
-            .onChange(of: session.eventCount) { _, _ in rebuild(session: session) }
-            .onChange(of: session.fileSizeBytes) { _, _ in rebuild(session: session) }
-            .onChange(of: session.endTime) { _, _ in rebuild(session: session) }
             .onChange(of: searchState.query) { _, newValue in
                 unifiedSearchJumpWorkItem?.cancel()
                 unifiedSearchJumpWorkItem = nil
@@ -342,7 +456,113 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
             Text("Select a session to view transcript")
                 .foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onAppear {
+                    pendingFirstRenderSessionID = nil
+                    transcriptTrace(
+                        "placeholder visible sessionID=\(sessionID ?? "nil") lastResolvedID=\(lastResolvedSession?.id ?? "nil") lastResolvedEvents=\(lastResolvedSession?.events.count ?? -1)"
+                    )
+                }
         }
+    }
+
+    private func transcriptContentVersion(for session: Session) -> Int {
+        var hasher = Hasher()
+        hasher.combine(session.id)
+        hasher.combine(session.eventCount)
+        hasher.combine(session.events.count)
+        hasher.combine(session.events.last?.id ?? "")
+        hasher.combine(session.endTime?.timeIntervalSince1970 ?? 0)
+        return hasher.finalize()
+    }
+
+    private var shouldShowJumpToLatestButton: Bool {
+        tailUpdateState.shouldShowJumpToLatestButton
+    }
+
+    private var jumpToLatestButton: some View {
+        Button(action: {
+            tailUpdateState.jumpToLatest()
+        }) {
+            ZStack {
+                Circle()
+                    .fill(Color.white)
+                Circle()
+                    .stroke(Color.black.opacity(0.18), lineWidth: 1)
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 13, weight: .regular))
+                    .symbolRenderingMode(.monochrome)
+                    .foregroundStyle(Color.black)
+            }
+            .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .help("Jump to latest output")
+        .accessibilityLabel("Jump to latest output")
+        .frame(maxWidth: .infinity)
+        .padding(.bottom, 12)
+        .zIndex(4)
+    }
+
+    private func updateBottomProximity(_ isNearBottom: Bool) {
+        tailUpdateState.viewportChanged(isNearBottom: isNearBottom)
+    }
+
+    private func terminalTranscriptView(session: Session) -> some View {
+        SessionTerminalView(
+            session: session,
+            unifiedQuery: unifiedFreeText,
+            unifiedFindToken: terminalUnifiedFindToken,
+            unifiedFindDirection: terminalUnifiedFindDirection,
+            unifiedFindReset: terminalUnifiedFindResetFlag,
+            unifiedAllowMatchAutoScroll: terminalUnifiedAllowMatchAutoScroll,
+            unifiedExternalMatchCount: $terminalUnifiedMatchesCount,
+            unifiedExternalTotalMatchCount: $terminalUnifiedTotalMatchesCount,
+            unifiedExternalCurrentMatchIndex: $terminalUnifiedCurrentIndex,
+            findQuery: findQuery,
+            findToken: terminalFindToken,
+            findDirection: terminalFindDirection,
+            findReset: terminalFindResetFlag,
+            allowMatchAutoScroll: terminalAllowMatchAutoScroll,
+            scrollToBottomToken: tailUpdateState.scrollToBottomToken,
+            onBottomProximityChange: updateBottomProximity,
+            onRenderComplete: { id in
+                if pendingFirstRenderSessionID == id {
+                    pendingFirstRenderSessionID = nil
+                }
+            },
+            jumpToken: terminalJumpToken,
+            roleNavToken: terminalRoleNavToken,
+            roleNavRole: terminalRoleNavRole,
+            roleNavDirection: terminalRoleNavDirection,
+            externalMatchCount: $terminalFindMatchesCount,
+            externalTotalMatchCount: $terminalFindTotalMatchesCount,
+            externalCurrentMatchIndex: $terminalFindCurrentIndex
+        )
+    }
+
+    private func plainTranscriptView(session: Session) -> some View {
+        let roleRangesEnabled = shouldColorize || isJSONMode
+        return PlainTextScrollView(
+            proximityContextID: session.id,
+            text: transcript,
+            selection: selectedNSRange,
+            selectionScrollMode: selectionScrollMode,
+            fontSize: CGFloat(transcriptFontSize),
+            highlights: unifiedHighlightRanges,
+            currentIndex: unifiedCurrentMatchIndex,
+            findCurrentRange: findCurrentRange,
+            scrollToBottomToken: tailUpdateState.scrollToBottomToken,
+            onBottomProximityChange: updateBottomProximity,
+            commandRanges: roleRangesEnabled ? commandRanges : [],
+            userRanges: roleRangesEnabled ? userRanges : [],
+            assistantRanges: roleRangesEnabled ? assistantRanges : [],
+            outputRanges: roleRangesEnabled ? outputRanges : [],
+            errorRanges: roleRangesEnabled ? errorRanges : [],
+            isJSONMode: isJSONMode,
+            appAppearanceRaw: appAppearanceRaw,
+            colorScheme: colorScheme,
+            monochrome: stripMonochrome
+        )
     }
 
     private func toolbar(session: Session) -> some View {
@@ -699,6 +919,7 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
     }
 
     private func rebuild(session: Session) {
+        transcriptTrace("rebuild start id=\(session.id) events=\(session.events.count) eventCount=\(session.eventCount) viewMode=\(viewModeRaw)")
         lastResolvedSession = session
         let generation = beginRenderGeneration()
 
@@ -707,9 +928,8 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
         let filters: TranscriptFilters = .current(showTimestamps: showTimestamps, showMeta: false)
         let mode = viewModeSnapshot.transcriptRenderMode
         let skipFlag = skipAgentsPreambleEnabled() ? 1 : 0
-        let fileSizeToken = session.fileSizeBytes ?? -1
-        let endTimeToken = Int((session.endTime ?? .distantPast).timeIntervalSince1970)
-        let buildKey = "\(session.id)|\(session.events.count)|\(session.eventCount)|\(fileSizeToken)|\(endTimeToken)|\(viewModeSnapshot.rawValue)|\(showTimestamps ? 1 : 0)|\(skipFlag)"
+        let sessionKey = sessionBuildKey(session)
+        let buildKey = "\(sessionKey)|\(viewModeSnapshot.rawValue)|\(showTimestamps ? 1 : 0)|\(skipFlag)"
         let appendConfigKey = makeAppendConfigKey(viewMode: viewModeSnapshot,
                                                   showTimestamps: showTimestamps,
                                                   skipFlag: skipFlag)
@@ -994,6 +1214,9 @@ struct UnifiedTranscriptView<Indexer: SessionIndexerProtocol>: View {
         lastRenderedTailEventSnapshot = session.events.last
         lastRenderedViewModeRaw = renderedViewMode.rawValue
         lastRenderedAppendConfigKey = appendConfigKey
+        if pendingFirstRenderSessionID == session.id, renderedViewMode != .terminal {
+            pendingFirstRenderSessionID = nil
+        }
     }
 
     private func makeAppendConfigKey(viewMode: SessionViewMode,
@@ -2351,6 +2574,7 @@ private func jsonSyntaxHighlightRanges(for text: String) -> ([NSRange], [NSRange
 }
 
 private struct PlainTextScrollView: NSViewRepresentable {
+    let proximityContextID: String
     let text: String
     let selection: NSRange?
     let selectionScrollMode: SelectionScrollMode
@@ -2358,6 +2582,8 @@ private struct PlainTextScrollView: NSViewRepresentable {
     let highlights: [NSRange]
     let currentIndex: Int
     let findCurrentRange: NSRange?
+    let scrollToBottomToken: Int
+    let onBottomProximityChange: (Bool) -> Void
     let commandRanges: [NSRange]
     let userRanges: [NSRange]
     let assistantRanges: [NSRange]
@@ -2378,6 +2604,25 @@ private struct PlainTextScrollView: NSViewRepresentable {
         var lastIsJSONMode: Bool = false
         var lastMonochrome: Bool = false
         var lastColorSignature: (Int, Int, Int, Int, Int) = (0, 0, 0, 0, 0)
+        var scrollView: NSScrollView?
+        var scrollObserver: NSObjectProtocol?
+        weak var observedDocumentView: NSView?
+        var documentFrameObserver: NSObjectProtocol?
+        var lastNearBottom: Bool? = nil
+        var lastProximityContextID: String = ""
+        var onBottomProximityChange: ((Bool) -> Void)?
+        var lastScrollToBottomToken: Int = 0
+
+        deinit {
+            if let scrollObserver {
+                NotificationCenter.default.removeObserver(scrollObserver)
+                self.scrollObserver = nil
+            }
+            if let documentFrameObserver {
+                NotificationCenter.default.removeObserver(documentFrameObserver)
+                self.documentFrameObserver = nil
+            }
+        }
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -2441,6 +2686,8 @@ private struct PlainTextScrollView: NSViewRepresentable {
         context.coordinator.lastAppearanceRaw = appAppearanceRaw
         context.coordinator.lastColorScheme = colorScheme
         context.coordinator.lastFindRange = findCurrentRange
+        context.coordinator.onBottomProximityChange = onBottomProximityChange
+        context.coordinator.lastProximityContextID = proximityContextID
 
         // Set background with proper dark mode support
         let isDark = (textView.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
@@ -2459,102 +2706,234 @@ private struct PlainTextScrollView: NSViewRepresentable {
         applyFindHighlights(textView, coordinator: context.coordinator)
 
         scroll.documentView = textView
+        installScrollObserverIfNeeded(scrollView: scroll, coordinator: context.coordinator)
+
         if let sel = selection {
             scrollSelection(textView, range: sel, mode: selectionScrollMode)
             // Clear selection immediately to avoid blue highlight - we use yellow/white backgrounds instead
             textView.setSelectedRange(NSRange(location: 0, length: 0))
         }
+
+        if scrollToBottomToken != context.coordinator.lastScrollToBottomToken {
+            scrollToBottom(scrollView: scroll, textView: textView)
+            context.coordinator.lastScrollToBottomToken = scrollToBottomToken
+        }
+        emitBottomProximityIfNeeded(scrollView: scroll, coordinator: context.coordinator, force: true)
+        scheduleBottomProximityUpdate(scrollView: scroll, coordinator: context.coordinator)
         return scroll
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
-        if let tv = nsView.documentView as? NSTextView {
-            let textChanged = tv.string != text
-            let appearanceChanged = context.coordinator.lastAppearanceRaw != appAppearanceRaw
-            let schemeChanged = context.coordinator.lastColorScheme != colorScheme
-            let modeChanged = context.coordinator.lastIsJSONMode != isJSONMode
-            let monochromeChanged = context.coordinator.lastMonochrome != monochrome
-            let findRangeChanged = context.coordinator.lastFindRange != findCurrentRange
-            let colorSignature = (
-                commandRanges.count,
-                userRanges.count,
-                assistantRanges.count,
-                outputRanges.count,
-                errorRanges.count
-            )
-            let colorsChanged = colorSignature != context.coordinator.lastColorSignature
+        guard let tv = nsView.documentView as? NSTextView else { return }
 
-            // Explicitly set NSView appearance when app appearance changes
-            if appearanceChanged {
-                let appAppearance = AppAppearance(rawValue: appAppearanceRaw) ?? .system
-                switch appAppearance {
-                case .light:
-                    nsView.appearance = NSAppearance(named: .aqua)
-                    tv.appearance = NSAppearance(named: .aqua)
-                case .dark:
-                    nsView.appearance = NSAppearance(named: .darkAqua)
-                    tv.appearance = NSAppearance(named: .darkAqua)
-                case .system:
-                    nsView.appearance = nil
-                    tv.appearance = nil
-                }
-                context.coordinator.lastAppearanceRaw = appAppearanceRaw
-            }
+        context.coordinator.onBottomProximityChange = onBottomProximityChange
+        installScrollObserverIfNeeded(scrollView: nsView, coordinator: context.coordinator)
 
-            if textChanged {
-                tv.string = text
-                context.coordinator.lastPaintedHighlights = []
-            }
-
-            // Reapply colors when text, appearance, mode, monochrome, or ranges change
-            if textChanged || appearanceChanged || schemeChanged || modeChanged || monochromeChanged || colorsChanged {
-                applySyntaxColors(tv)
-            }
-
-            if let font = tv.font, abs(font.pointSize - fontSize) > 0.5 {
-                tv.font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
-            }
-
-            // Set background with proper dark mode support
-            let isDark = (tv.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
-            let baseBackground: NSColor = isDark ? NSColor(white: 0.15, alpha: 1.0) : NSColor.textBackgroundColor
-
-            // Apply/remove dimming effect based on Find state (like Apple Notes)
-            if !highlights.isEmpty {
-                tv.backgroundColor = isDark ? NSColor(white: 0.12, alpha: 1.0) : NSColor.black.withAlphaComponent(0.08)
-            } else {
-                tv.backgroundColor = baseBackground
-            }
-
-            let width = max(1, nsView.contentSize.width)
-            tv.textContainer?.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
-            tv.setFrameSize(NSSize(width: width, height: tv.frame.size.height))
-
-            // Scroll to current match if any
-            if let sel = selection {
-                scrollSelection(tv, range: sel, mode: selectionScrollMode)
-                // Clear selection immediately to avoid blue highlight - we use yellow/white backgrounds instead
-                tv.setSelectedRange(NSRange(location: 0, length: 0))
-            }
-
-            applyFindHighlights(tv, coordinator: context.coordinator)
-
-            // Update local Find overlay (blue outline) via the custom layout manager
-            if findRangeChanged, let lm = tv.layoutManager as? PlainFindLayoutManager {
-                lm.findRange = findCurrentRange
-                lm.isDark = isDark
-                tv.setNeedsDisplay(tv.visibleRect)
-                context.coordinator.lastFindRange = findCurrentRange
-            } else if let lm = tv.layoutManager as? PlainFindLayoutManager {
-                lm.isDark = isDark
-            }
-
-            // Update last seen scheme at the end of the pass
-            context.coordinator.lastColorScheme = colorScheme
-            context.coordinator.lastIsJSONMode = isJSONMode
-            context.coordinator.lastMonochrome = monochrome
-            context.coordinator.lastColorSignature = colorSignature
+        let proximityContextChanged = context.coordinator.lastProximityContextID != proximityContextID
+        if proximityContextChanged {
+            context.coordinator.lastProximityContextID = proximityContextID
+            context.coordinator.lastNearBottom = nil
+            emitBottomProximityIfNeeded(scrollView: nsView, coordinator: context.coordinator, force: true)
         }
+
+        let textChanged = tv.string != text
+        let appearanceChanged = context.coordinator.lastAppearanceRaw != appAppearanceRaw
+        let schemeChanged = context.coordinator.lastColorScheme != colorScheme
+        let modeChanged = context.coordinator.lastIsJSONMode != isJSONMode
+        let monochromeChanged = context.coordinator.lastMonochrome != monochrome
+        let findRangeChanged = context.coordinator.lastFindRange != findCurrentRange
+        let colorSignature = (
+            commandRanges.count,
+            userRanges.count,
+            assistantRanges.count,
+            outputRanges.count,
+            errorRanges.count
+        )
+        let colorsChanged = colorSignature != context.coordinator.lastColorSignature
+
+        // Explicitly set NSView appearance when app appearance changes
+        if appearanceChanged {
+            let appAppearance = AppAppearance(rawValue: appAppearanceRaw) ?? .system
+            switch appAppearance {
+            case .light:
+                nsView.appearance = NSAppearance(named: .aqua)
+                tv.appearance = NSAppearance(named: .aqua)
+            case .dark:
+                nsView.appearance = NSAppearance(named: .darkAqua)
+                tv.appearance = NSAppearance(named: .darkAqua)
+            case .system:
+                nsView.appearance = nil
+                tv.appearance = nil
+            }
+            context.coordinator.lastAppearanceRaw = appAppearanceRaw
+        }
+
+        if textChanged {
+            tv.string = text
+            context.coordinator.lastPaintedHighlights = []
+        }
+
+        // Reapply colors when text, appearance, mode, monochrome, or ranges change
+        if textChanged || appearanceChanged || schemeChanged || modeChanged || monochromeChanged || colorsChanged {
+            applySyntaxColors(tv)
+        }
+
+        if let font = tv.font, abs(font.pointSize - fontSize) > 0.5 {
+            tv.font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        }
+
+        // Set background with proper dark mode support
+        let isDark = (tv.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
+        let baseBackground: NSColor = isDark ? NSColor(white: 0.15, alpha: 1.0) : NSColor.textBackgroundColor
+
+        // Apply/remove dimming effect based on Find state (like Apple Notes)
+        if !highlights.isEmpty {
+            tv.backgroundColor = isDark ? NSColor(white: 0.12, alpha: 1.0) : NSColor.black.withAlphaComponent(0.08)
+        } else {
+            tv.backgroundColor = baseBackground
+        }
+
+        let width = max(1, nsView.contentSize.width)
+        tv.textContainer?.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+        tv.setFrameSize(NSSize(width: width, height: tv.frame.size.height))
+
+        // Scroll to current match if any
+        if let sel = selection {
+            scrollSelection(tv, range: sel, mode: selectionScrollMode)
+            // Clear selection immediately to avoid blue highlight - we use yellow/white backgrounds instead
+            tv.setSelectedRange(NSRange(location: 0, length: 0))
+        }
+
+        if scrollToBottomToken != context.coordinator.lastScrollToBottomToken {
+            scrollToBottom(scrollView: nsView, textView: tv)
+            context.coordinator.lastScrollToBottomToken = scrollToBottomToken
+            emitBottomProximityIfNeeded(scrollView: nsView, coordinator: context.coordinator, force: true)
+            scheduleBottomProximityUpdate(scrollView: nsView, coordinator: context.coordinator)
+        }
+
+        applyFindHighlights(tv, coordinator: context.coordinator)
+
+        // Update local Find overlay (blue outline) via the custom layout manager
+        if findRangeChanged, let lm = tv.layoutManager as? PlainFindLayoutManager {
+            lm.findRange = findCurrentRange
+            lm.isDark = isDark
+            tv.setNeedsDisplay(tv.visibleRect)
+            context.coordinator.lastFindRange = findCurrentRange
+        } else if let lm = tv.layoutManager as? PlainFindLayoutManager {
+            lm.isDark = isDark
+        }
+
+        // Update last seen scheme at the end of the pass
+        context.coordinator.lastColorScheme = colorScheme
+        context.coordinator.lastIsJSONMode = isJSONMode
+        context.coordinator.lastMonochrome = monochrome
+        context.coordinator.lastColorSignature = colorSignature
+        emitBottomProximityIfNeeded(scrollView: nsView, coordinator: context.coordinator)
+        if textChanged || proximityContextChanged {
+            scheduleBottomProximityUpdate(scrollView: nsView, coordinator: context.coordinator)
+        }
+    }
+
+    private func installScrollObserverIfNeeded(scrollView: NSScrollView, coordinator: Coordinator) {
+        if coordinator.scrollView !== scrollView {
+            if let existing = coordinator.scrollObserver {
+                NotificationCenter.default.removeObserver(existing)
+                coordinator.scrollObserver = nil
+            }
+            if let existing = coordinator.documentFrameObserver {
+                NotificationCenter.default.removeObserver(existing)
+                coordinator.documentFrameObserver = nil
+            }
+            coordinator.observedDocumentView = nil
+            coordinator.scrollView = scrollView
+            coordinator.lastNearBottom = nil
+        }
+
+        if coordinator.scrollObserver == nil {
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            coordinator.scrollObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView,
+                queue: .main
+            ) { [weak coordinator, weak scrollView] _ in
+                guard let coordinator, let scrollView else { return }
+                emitBottomProximityIfNeeded(scrollView: scrollView, coordinator: coordinator)
+            }
+        }
+
+        if coordinator.observedDocumentView !== scrollView.documentView {
+            if let existing = coordinator.documentFrameObserver {
+                NotificationCenter.default.removeObserver(existing)
+                coordinator.documentFrameObserver = nil
+            }
+
+            coordinator.observedDocumentView = scrollView.documentView
+            if let documentView = scrollView.documentView {
+                documentView.postsFrameChangedNotifications = true
+                coordinator.documentFrameObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: documentView,
+                    queue: .main
+                ) { [weak coordinator, weak scrollView] _ in
+                    guard let coordinator, let scrollView else { return }
+                    emitBottomProximityIfNeeded(scrollView: scrollView, coordinator: coordinator)
+                }
+            }
+        }
+    }
+
+    private func emitBottomProximityIfNeeded(scrollView: NSScrollView,
+                                             coordinator: Coordinator,
+                                             force: Bool = false) {
+        let nearBottom = isNearBottom(scrollView: scrollView)
+        guard force || coordinator.lastNearBottom != nearBottom else { return }
+        coordinator.lastNearBottom = nearBottom
+        coordinator.onBottomProximityChange?(nearBottom)
+    }
+
+    private func scheduleBottomProximityUpdate(scrollView: NSScrollView, coordinator: Coordinator) {
+        for delay in [0.0, 0.05, 0.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak coordinator, weak scrollView] in
+                guard let coordinator, let scrollView else { return }
+                emitBottomProximityIfNeeded(scrollView: scrollView, coordinator: coordinator)
+            }
+        }
+    }
+
+    private func isNearBottom(scrollView: NSScrollView) -> Bool {
+        let visibleRect = scrollView.contentView.documentVisibleRect
+        let contentHeight = measuredContentHeight(scrollView: scrollView)
+        let maxOffset = max(0, contentHeight - visibleRect.height)
+        let currentOffset = max(0, min(visibleRect.origin.y, maxOffset))
+        let distanceToBottom = max(0, maxOffset - currentOffset)
+        return distanceToBottom <= 48
+    }
+
+    private func measuredContentHeight(scrollView: NSScrollView) -> CGFloat {
+        let visibleHeight = scrollView.contentView.documentVisibleRect.height
+        guard let documentView = scrollView.documentView else { return visibleHeight }
+
+        var contentHeight = max(documentView.bounds.height, documentView.frame.height, visibleHeight)
+        if let textView = documentView as? NSTextView,
+           let layoutManager = textView.layoutManager,
+           let textContainer = textView.textContainer {
+            layoutManager.ensureLayout(for: textContainer)
+            let usedHeight = layoutManager.usedRect(for: textContainer).height + (textView.textContainerInset.height * 2)
+            contentHeight = max(contentHeight, usedHeight)
+        }
+        return contentHeight
+    }
+
+    private func scrollToBottom(scrollView: NSScrollView, textView: NSTextView) {
+        if textView.string.isEmpty {
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            return
+        }
+
+        let length = (textView.string as NSString).length
+        textView.scrollRangeToVisible(NSRange(location: max(0, length - 1), length: 1))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     private final class PlainFindLayoutManager: NSLayoutManager {

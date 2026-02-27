@@ -98,6 +98,19 @@ enum PreferencesKey {
         static let lastSendAt = "DiagnosticsLastSendAt"
         static let lastSendError = "DiagnosticsLastSendError"
     }
+
+    enum Transcript {
+        static let preferredIDETarget = "TranscriptPreferredIDETarget"
+        static let ideBinaryOverridePath = "TranscriptIDEBinaryOverridePath"
+        static let enableReviewCards = "TranscriptEnableReviewCards"
+        static let enableCodeDiffLineNumbers = "TranscriptEnableCodeDiffLineNumbers"
+        static let enableLinkification = "TranscriptEnableLinkification"
+    }
+
+    enum Cockpit {
+        static let codexActiveSessionsEnabled = "CockpitCodexActiveSessionsEnabled"
+        static let codexActiveRegistryRootOverride = "CockpitCodexActiveRegistryRootOverride"
+    }
 }
 
 enum SessionViewAutoScrollTarget: String, CaseIterable, Identifiable {

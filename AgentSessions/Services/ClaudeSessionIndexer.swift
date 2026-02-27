@@ -70,6 +70,9 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
     private var cancellables = Set<AnyCancellable>()
     private var lastShowSystemProbeSessions: Bool = UserDefaults.standard.bool(forKey: "ShowSystemProbeSessions")
     private var refreshToken = UUID()
+    private var reloadingSessionIDs: Set<String> = []
+    private let reloadLock = NSLock()
+    private var lastFullReloadFileStatsBySessionID: [String: SessionFileStat] = [:]
     private var lastPrewarmSignatureByID: [String: Int] = [:]
     private var lastKnownFileStatsByPath: [String: SessionFileStat] = [:]
     @Published private var filterEpoch: Int = 0
@@ -282,7 +285,33 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
                 mergedByPath.removeValue(forKey: removed)
             }
             for session in changedSessions {
-                mergedByPath[session.filePath] = session
+                if let existing = mergedByPath[session.filePath],
+                   !existing.events.isEmpty,
+                   session.events.isEmpty {
+                    #if DEBUG
+                    let filename = session.filePath.components(separatedBy: "/").last ?? "?"
+                    print("⚠️ Preserve full events during refresh: \(filename)")
+                    #endif
+                    let merged = Session(
+                        id: existing.id,
+                        source: existing.source,
+                        startTime: existing.startTime ?? session.startTime,
+                        endTime: session.endTime ?? existing.endTime,
+                        model: session.model ?? existing.model,
+                        filePath: existing.filePath,
+                        fileSizeBytes: session.fileSizeBytes ?? existing.fileSizeBytes,
+                        eventCount: max(existing.eventCount, session.eventCount),
+                        events: existing.events,
+                        cwd: session.lightweightCwd ?? existing.lightweightCwd,
+                        repoName: nil,
+                        lightweightTitle: session.lightweightTitle ?? existing.lightweightTitle,
+                        lightweightCommands: session.lightweightCommands ?? existing.lightweightCommands,
+                        isHousekeeping: existing.isHousekeeping
+                    )
+                    mergedByPath[session.filePath] = merged
+                } else {
+                    mergedByPath[session.filePath] = session
+                }
             }
             let hideProbes = !(UserDefaults.standard.bool(forKey: "ShowSystemProbeSessions"))
             let merged = Array(mergedByPath.values).filter(exists)
@@ -545,79 +574,155 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
         }
     }
 
-    // Reload a specific lightweight session with full parse
-    func reloadSession(id: String) {
-        guard let existing = allSessions.first(where: { $0.id == id }),
-              existing.events.isEmpty,
-              FileManager.default.fileExists(atPath: existing.filePath) else {
+    enum ReloadReason: String {
+        case selection
+        case focusedSessionMonitor
+        case manualRefresh
+    }
+
+    // Reload a specific session with full parse.
+    // When force is true, reload even if events are already present.
+    func reloadSession(id: String,
+                       force: Bool = false,
+                       reason: ReloadReason = .selection) {
+        reloadLock.lock()
+        if reloadingSessionIDs.contains(id) {
+            reloadLock.unlock()
+            #if DEBUG
+            print("⏭️ Skip reload: Claude session \(id.prefix(8)) already reloading")
+            #endif
             return
         }
-        let url = URL(fileURLWithPath: existing.filePath)
+        reloadingSessionIDs.insert(id)
+        reloadLock.unlock()
 
-        let filename = existing.filePath.components(separatedBy: "/").last ?? "?"
-        #if DEBUG
-        print("🔄 Reloading lightweight Claude session: \(filename)")
-        #endif
-
-        isLoadingSession = true
-        loadingSessionID = id
+        let existingSnapshot: Session? = {
+            if Thread.isMainThread {
+                return self.allSessions.first(where: { $0.id == id })
+            }
+            var session: Session?
+            DispatchQueue.main.sync {
+                session = self.allSessions.first(where: { $0.id == id })
+            }
+            return session
+        }()
 
         let bgQueue = FeatureFlags.lowerQoSForHeavyWork ? DispatchQueue.global(qos: .utility) : DispatchQueue.global(qos: .userInitiated)
         bgQueue.async {
-            let startTime = Date()
+            defer {
+                self.reloadLock.lock()
+                self.reloadingSessionIDs.remove(id)
+                self.reloadLock.unlock()
+            }
 
-            if let fullSession = ClaudeSessionParser.parseFileFull(at: url, forcedID: id) {
-                let elapsed = Date().timeIntervalSince(startTime)
+            guard let existing = existingSnapshot,
+                  FileManager.default.fileExists(atPath: existing.filePath) else {
+                return
+            }
+
+            let hasLoadedEvents = !existing.events.isEmpty
+            if hasLoadedEvents && !force { return }
+
+            let url = URL(fileURLWithPath: existing.filePath)
+            let preParseStat = Self.fileStat(for: url)
+            self.reloadLock.lock()
+            let lastReloadStat = self.lastFullReloadFileStatsBySessionID[id]
+            self.reloadLock.unlock()
+
+            if force,
+               reason != .manualRefresh,
+               hasLoadedEvents,
+               let preParseStat,
+               let lastReloadStat,
+               preParseStat == lastReloadStat {
                 #if DEBUG
-                print("  ⏱️ Parse took \(String(format: "%.1f", elapsed))s - events=\(fullSession.events.count)")
+                print("⏭️ Skip Claude reload: unchanged file for \(id.prefix(8)) reason=\(reason.rawValue)")
                 #endif
+                return
+            }
 
+            let shouldSurfaceLoadingState = reason == .manualRefresh || !hasLoadedEvents
+            if shouldSurfaceLoadingState {
                 self.publishAfterCurrentUpdate { [weak self] in
-                    guard let self else { return }
-                    if let idx = self.allSessions.firstIndex(where: { $0.id == id }) {
-                        let current = self.allSessions[idx]
-                        let merged = Session(
-                            id: fullSession.id,
-                            source: fullSession.source,
-                            startTime: fullSession.startTime ?? current.startTime,
-                            endTime: fullSession.endTime ?? current.endTime,
-                            model: fullSession.model ?? current.model,
-                            filePath: fullSession.filePath,
-                            fileSizeBytes: fullSession.fileSizeBytes ?? current.fileSizeBytes,
-                            eventCount: max(current.eventCount, fullSession.nonMetaCount),
-                            events: fullSession.events,
-                            cwd: current.lightweightCwd ?? fullSession.cwd,
-                            repoName: current.repoName,
-                            lightweightTitle: current.lightweightTitle ?? fullSession.lightweightTitle,
-                            lightweightCommands: current.lightweightCommands
-                        )
-                        self.allSessions[idx] = merged
-
-                        // Update transcript cache for accurate search
-                        let cache = self.transcriptCache
-                        Task.detached(priority: FeatureFlags.lowerQoSForHeavyWork ? .utility : .userInitiated) {
-                            let filters: TranscriptFilters = .current(showTimestamps: false, showMeta: false)
-                            let transcript = SessionTranscriptBuilder.buildPlainTerminalTranscript(
-                                session: merged,
-                                filters: filters,
-                                mode: .normal
-                            )
-                            cache.set(merged.id, transcript: transcript)
-                        }
-                    }
-                    self.isLoadingSession = false
-                    self.loadingSessionID = nil
+                    self?.isLoadingSession = true
+                    self?.loadingSessionID = id
                 }
+            }
+
+            let startTime = Date()
+            let fullSession = ClaudeSessionParser.parseFileFull(at: url, forcedID: id)
+            let elapsed = Date().timeIntervalSince(startTime)
+            #if DEBUG
+            print("🔄 Reloading Claude session \(id.prefix(8)) force=\(force) reason=\(reason.rawValue) elapsed=\(String(format: "%.1f", elapsed))s events=\(fullSession?.events.count ?? 0)")
+            #endif
+
+            let postParseStat = Self.fileStat(for: url)
+            self.reloadLock.lock()
+            if let preParseStat {
+                self.lastFullReloadFileStatsBySessionID[id] = preParseStat
             } else {
+                self.lastFullReloadFileStatsBySessionID.removeValue(forKey: id)
+            }
+            self.reloadLock.unlock()
+            if preParseStat != postParseStat {
                 #if DEBUG
-                print("  ❌ Full parse failed")
+                print("ℹ️ Claude file changed during reload; next monitor tick will retry")
                 #endif
-                self.publishAfterCurrentUpdate { [weak self] in
-                    self?.isLoadingSession = false
-                    self?.loadingSessionID = nil
+            }
+
+            self.publishAfterCurrentUpdate { [weak self] in
+                guard let self else { return }
+                defer {
+                    if shouldSurfaceLoadingState, self.loadingSessionID == id {
+                        self.isLoadingSession = false
+                        self.loadingSessionID = nil
+                    }
+                }
+
+                guard let fullSession,
+                      let idx = self.allSessions.firstIndex(where: { $0.id == id }) else {
+                    return
+                }
+
+                let current = self.allSessions[idx]
+                let merged = Session(
+                    id: fullSession.id,
+                    source: fullSession.source,
+                    startTime: fullSession.startTime ?? current.startTime,
+                    endTime: fullSession.endTime ?? current.endTime,
+                    model: fullSession.model ?? current.model,
+                    filePath: fullSession.filePath,
+                    fileSizeBytes: fullSession.fileSizeBytes ?? current.fileSizeBytes,
+                    eventCount: max(current.eventCount, fullSession.nonMetaCount),
+                    events: fullSession.events,
+                    cwd: current.lightweightCwd ?? fullSession.cwd,
+                    repoName: current.repoName,
+                    lightweightTitle: current.lightweightTitle ?? fullSession.lightweightTitle,
+                    lightweightCommands: current.lightweightCommands
+                )
+                self.allSessions[idx] = merged
+
+                let cache = self.transcriptCache
+                Task.detached(priority: FeatureFlags.lowerQoSForHeavyWork ? .utility : .userInitiated) {
+                    let filters: TranscriptFilters = .current(showTimestamps: false, showMeta: false)
+                    let transcript = SessionTranscriptBuilder.buildPlainTerminalTranscript(
+                        session: merged,
+                        filters: filters,
+                        mode: .normal
+                    )
+                    cache.set(merged.id, transcript: transcript)
                 }
             }
         }
+    }
+
+    private static func fileStat(for url: URL) -> SessionFileStat? {
+        guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+              let modified = values.contentModificationDate else {
+            return nil
+        }
+        let size = Int64(values.fileSize ?? 0)
+        return SessionFileStat(mtime: Int64(modified.timeIntervalSince1970), size: size)
     }
 
     private func publishAfterCurrentUpdate(_ work: @escaping @MainActor () -> Void) {

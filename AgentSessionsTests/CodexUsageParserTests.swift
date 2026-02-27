@@ -9,6 +9,17 @@ final class CodexUsageParserTests: XCTestCase {
         return bundle.url(forResource: name, withExtension: "jsonl")!
     }
 
+    private func writeTempJSONL(_ objects: [[String: Any]]) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex_usage_dual_limit_\(UUID().uuidString).jsonl")
+        let lines = try objects.map { obj -> String in
+            let data = try JSONSerialization.data(withJSONObject: obj, options: [])
+            return String(decoding: data, as: UTF8.self)
+        }
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
     // MARK: - Legacy Format (0.50)
 
     func testParsesLegacyTokenCountFormat() throws {
@@ -209,6 +220,445 @@ final class CodexUsageParserTests: XCTestCase {
         }
 
         XCTAssertTrue(foundAccountUpdate, "Should find rate limit update notification")
+    }
+
+    func testPrefersCodexLimitIDWhenDualLimitBucketsExist() async throws {
+        let now = Date()
+        let olderTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-6))
+        let newerTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-2))
+        let resetAt = Int(now.addingTimeInterval(3600).timeIntervalSince1970)
+
+        let codexLine: [String: Any] = [
+            "timestamp": olderTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex",
+                    "primary": [
+                        "used_percent": 20.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 15.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let bengalfoxLine: [String: Any] = [
+            "timestamp": newerTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex_bengalfox",
+                    "primary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let url = try writeTempJSONL([codexLine, bengalfoxLine])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let service = CodexStatusService(updateHandler: { _ in }, availabilityHandler: { _ in })
+        let summary = await service.parseTokenCountTailForTesting(url: url)
+
+        XCTAssertNotNil(summary, "Parser should extract a rate-limit summary")
+        XCTAssertEqual(summary?.fiveHour.remainingPercent, 80, "Should prioritize the codex account bucket over spark bucket")
+        XCTAssertEqual(summary?.weekly.remainingPercent, 85, "Should keep secondary remaining percentage from codex bucket")
+    }
+
+    func testPrefersMissingLimitIDBucketOverNonCodexLimitID() async throws {
+        let now = Date()
+        let olderTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-6))
+        let newerTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-2))
+        let resetAt = Int(now.addingTimeInterval(3600).timeIntervalSince1970)
+
+        let unlabeledCodexLine: [String: Any] = [
+            "timestamp": olderTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "primary": [
+                        "used_percent": 35.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 25.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let bengalfoxLine: [String: Any] = [
+            "timestamp": newerTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex_bengalfox",
+                    "primary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let url = try writeTempJSONL([unlabeledCodexLine, bengalfoxLine])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let service = CodexStatusService(updateHandler: { _ in }, availabilityHandler: { _ in })
+        let summary = await service.parseTokenCountTailForTesting(url: url)
+
+        XCTAssertNotNil(summary, "Parser should extract a rate-limit summary")
+        XCTAssertEqual(summary?.fiveHour.remainingPercent, 65, "Should treat missing limit_id in primary rate_limits as preferred codex stream")
+        XCTAssertEqual(summary?.weekly.remainingPercent, 75, "Should keep secondary remaining percentage from unlabeled codex stream")
+    }
+
+    func testUsageParsingContinuesWhileSearchingForCodexLimitID() async throws {
+        let now = Date()
+        let olderTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-10))
+        let midTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-6))
+        let newerTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-2))
+        let resetAt = Int(now.addingTimeInterval(3600).timeIntervalSince1970)
+
+        let codexLine: [String: Any] = [
+            "timestamp": olderTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex",
+                    "primary": [
+                        "used_percent": 40.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 30.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let usageLine: [String: Any] = [
+            "timestamp": midTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "turn.completed",
+                "usage": [
+                    "input_tokens": 1200,
+                    "cached_input_tokens": 200,
+                    "output_tokens": 300,
+                    "reasoning_output_tokens": 75,
+                    "total_tokens": 1500
+                ]
+            ]
+        ]
+
+        let nonCodexNewestLine: [String: Any] = [
+            "timestamp": newerTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex_bengalfox",
+                    "primary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let url = try writeTempJSONL([codexLine, usageLine, nonCodexNewestLine])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let lock = NSLock()
+        var snapshots: [CodexUsageSnapshot] = []
+
+        let service = CodexStatusService(
+            updateHandler: { snapshot in
+                lock.lock()
+                snapshots.append(snapshot)
+                lock.unlock()
+            },
+            availabilityHandler: { _ in }
+        )
+        let summary = await service.parseTokenCountTailForTesting(url: url)
+
+        XCTAssertNotNil(summary, "Parser should still return a preferred codex rate-limit summary")
+        XCTAssertEqual(summary?.fiveHour.remainingPercent, 60, "Should return codex primary remaining percent")
+        XCTAssertEqual(summary?.weekly.remainingPercent, 70, "Should return codex secondary remaining percent")
+
+        lock.lock()
+        let usageSnapshot = snapshots.last
+        lock.unlock()
+
+        XCTAssertNotNil(usageSnapshot, "Parser should emit at least one usage snapshot update")
+        XCTAssertEqual(usageSnapshot?.lastInputTokens, 1200, "Usage extraction should stay active while searching for codex limit_id")
+        XCTAssertEqual(usageSnapshot?.lastCachedInputTokens, 200)
+        XCTAssertEqual(usageSnapshot?.lastOutputTokens, 300)
+        XCTAssertEqual(usageSnapshot?.lastReasoningOutputTokens, 75)
+        XCTAssertEqual(usageSnapshot?.lastTotalTokens, 1500)
+    }
+
+    func testKeepsNewestUsageWhenScanningBackToPreferredCodexLimit() async throws {
+        let now = Date()
+        let codexTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-20))
+        let olderUsageTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-12))
+        let newerUsageTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-8))
+        let nonCodexTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-2))
+        let resetAt = Int(now.addingTimeInterval(3600).timeIntervalSince1970)
+
+        let codexLine: [String: Any] = [
+            "timestamp": codexTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex",
+                    "primary": [
+                        "used_percent": 42.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 31.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let olderLegacyUsageLine: [String: Any] = [
+            "timestamp": olderUsageTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "info": [
+                    "last_token_usage": [
+                        "input_tokens": 900,
+                        "cached_input_tokens": 100,
+                        "output_tokens": 120,
+                        "reasoning_output_tokens": 20,
+                        "total_tokens": 1020
+                    ]
+                ]
+            ]
+        ]
+
+        let newerTurnUsageLine: [String: Any] = [
+            "timestamp": newerUsageTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "turn.completed",
+                "usage": [
+                    "input_tokens": 2400,
+                    "cached_input_tokens": 400,
+                    "output_tokens": 360,
+                    "reasoning_output_tokens": 80,
+                    "total_tokens": 2760
+                ]
+            ]
+        ]
+
+        let nonCodexNewestLine: [String: Any] = [
+            "timestamp": nonCodexTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex_bengalfox",
+                    "primary": [
+                        "used_percent": 5.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 1.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let url = try writeTempJSONL([codexLine, olderLegacyUsageLine, newerTurnUsageLine, nonCodexNewestLine])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let lock = NSLock()
+        var snapshots: [CodexUsageSnapshot] = []
+
+        let service = CodexStatusService(
+            updateHandler: { snapshot in
+                lock.lock()
+                snapshots.append(snapshot)
+                lock.unlock()
+            },
+            availabilityHandler: { _ in }
+        )
+        let summary = await service.parseTokenCountTailForTesting(url: url)
+
+        XCTAssertNotNil(summary, "Parser should still resolve the preferred codex rate-limit summary")
+        XCTAssertEqual(summary?.fiveHour.remainingPercent, 58)
+        XCTAssertEqual(summary?.weekly.remainingPercent, 69)
+
+        lock.lock()
+        let usageSnapshot = snapshots.last
+        lock.unlock()
+
+        XCTAssertNotNil(usageSnapshot, "Parser should emit usage updates during the scan")
+        XCTAssertEqual(usageSnapshot?.lastInputTokens, 2400, "Older usage rows must not overwrite the newest usage seen during the same scan")
+        XCTAssertEqual(usageSnapshot?.lastCachedInputTokens, 400)
+        XCTAssertEqual(usageSnapshot?.lastOutputTokens, 360)
+        XCTAssertEqual(usageSnapshot?.lastReasoningOutputTokens, 80)
+        XCTAssertEqual(usageSnapshot?.lastTotalTokens, 2760)
+    }
+
+    func testFallsBackToOlderUsageWhenNewestUsageIsUnparseable() async throws {
+        let now = Date()
+        let codexTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-20))
+        let validUsageTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-12))
+        let malformedUsageTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-8))
+        let nonCodexTimestamp = ISO8601DateFormatter().string(from: now.addingTimeInterval(-2))
+        let resetAt = Int(now.addingTimeInterval(3600).timeIntervalSince1970)
+
+        let codexLine: [String: Any] = [
+            "timestamp": codexTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex",
+                    "primary": [
+                        "used_percent": 22.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 10.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let validOlderUsageLine: [String: Any] = [
+            "timestamp": validUsageTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "turn.completed",
+                "usage": [
+                    "input_tokens": 1700,
+                    "cached_input_tokens": 250,
+                    "output_tokens": 280,
+                    "reasoning_output_tokens": 70,
+                    "total_tokens": 1980
+                ]
+            ]
+        ]
+
+        let malformedNewerUsageLine: [String: Any] = [
+            "timestamp": malformedUsageTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "turn.completed",
+                "usage": [
+                    "input_tokens": "not-a-number",
+                    "cached_input_tokens": "??",
+                    "output_tokens": "n/a",
+                    "reasoning_output_tokens": ["invalid"],
+                    "total_tokens": NSNull()
+                ]
+            ]
+        ]
+
+        let nonCodexNewestLine: [String: Any] = [
+            "timestamp": nonCodexTimestamp,
+            "type": "event_msg",
+            "payload": [
+                "type": "token_count",
+                "rate_limits": [
+                    "limit_id": "codex_bengalfox",
+                    "primary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 300,
+                        "resets_at": resetAt
+                    ],
+                    "secondary": [
+                        "used_percent": 0.0,
+                        "window_minutes": 10080,
+                        "resets_at": resetAt + 5000
+                    ]
+                ]
+            ]
+        ]
+
+        let url = try writeTempJSONL([codexLine, validOlderUsageLine, malformedNewerUsageLine, nonCodexNewestLine])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let lock = NSLock()
+        var snapshots: [CodexUsageSnapshot] = []
+
+        let service = CodexStatusService(
+            updateHandler: { snapshot in
+                lock.lock()
+                snapshots.append(snapshot)
+                lock.unlock()
+            },
+            availabilityHandler: { _ in }
+        )
+        let summary = await service.parseTokenCountTailForTesting(url: url)
+
+        XCTAssertNotNil(summary, "Parser should still resolve preferred codex rate limits")
+        XCTAssertEqual(summary?.fiveHour.remainingPercent, 78)
+        XCTAssertEqual(summary?.weekly.remainingPercent, 90)
+
+        lock.lock()
+        let usageSnapshot = snapshots.last
+        lock.unlock()
+
+        XCTAssertNotNil(usageSnapshot, "Parser should still publish decoded usage from older valid rows")
+        XCTAssertEqual(usageSnapshot?.lastInputTokens, 1700)
+        XCTAssertEqual(usageSnapshot?.lastCachedInputTokens, 250)
+        XCTAssertEqual(usageSnapshot?.lastOutputTokens, 280)
+        XCTAssertEqual(usageSnapshot?.lastReasoningOutputTokens, 70)
+        XCTAssertEqual(usageSnapshot?.lastTotalTokens, 1980)
     }
 
     // MARK: - Integration Tests

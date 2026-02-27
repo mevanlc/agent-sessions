@@ -48,6 +48,12 @@ REVIEW_PROMPT_MODE="${REVIEW_PROMPT_MODE:-plain}"
 SCOPE_MODE="uncommitted"  # uncommitted|base|commit
 SCOPE_BASE_BRANCH=""
 SCOPE_COMMIT_SHA=""
+REVIEW_LOOP_MODE="${REVIEW_LOOP_MODE:-conservative}"  # conservative|balanced
+SCOPE_INCLUDE_UNTRACKED="${SCOPE_INCLUDE_UNTRACKED:-}"
+SCOPE_ALLOWLIST_FILE="${SCOPE_ALLOWLIST_FILE:-}"
+FAIL_ON_SCOPE_VIOLATION="${FAIL_ON_SCOPE_VIOLATION:-}"
+REVERT_SCOPE_VIOLATION_UNTRACKED="${REVERT_SCOPE_VIOLATION_UNTRACKED:-}"
+FAIL_ON_FORBIDDEN_COMMANDS="${FAIL_ON_FORBIDDEN_COMMANDS:-}"
 
 # CLI-only knobs
 DRY_RUN="0"
@@ -56,8 +62,11 @@ ERROR_SCAN_TAIL_LINES="${ERROR_SCAN_TAIL_LINES:-200}"
 REVIEW_TIMEOUT_SECONDS="${REVIEW_TIMEOUT_SECONDS:-900}"
 FIX_TIMEOUT_SECONDS="${FIX_TIMEOUT_SECONDS:-900}"
 REVIEW_TIMEOUT_RETRIES="${REVIEW_TIMEOUT_RETRIES:-1}"
+AUTH_FAILURE_RETRIES="${AUTH_FAILURE_RETRIES:-1}"
+AUTH_SCAN_TAIL_LINES="${AUTH_SCAN_TAIL_LINES:-200}"
 FINDINGS_FUZZY="${FINDINGS_FUZZY:-1}"
 FINDINGS_FUZZY_THRESHOLD="${FINDINGS_FUZZY_THRESHOLD:-0.86}"
+AUTH_ERROR_EXIT_CODE=66
 
 # Control-file overrides (loaded between rounds)
 CF_STATUS="resume"           # pause|resume|stop
@@ -75,6 +84,8 @@ LAST_EFFECTIVE_FIX_EFFORT=""
 LAUNCH_CHILD_PID=""
 LAUNCH_ISOLATED="0"
 LAUNCH_CHILD_PGID=""
+HEARTBEAT_AUTH_FAILURE="0"
+HEARTBEAT_AUTH_DETAIL=""
 
 # ----------------------------- Helpers ---------------------------------------
 
@@ -83,6 +94,12 @@ usage() {
 Usage:
   codex_review_fix_loop.sh [--uncommitted] [--base <branch>] [--commit <sha>]
                            [--max-rounds <n>]
+                           [--loop-mode <conservative|balanced>]
+                           [--scope-include-untracked|--scope-ignore-untracked]
+                           [--scope-allowlist-file <path>]
+                           [--fail-on-scope-violation <0|1>]
+                           [--revert-scope-violation-untracked <0|1>]
+                           [--fail-on-forbidden-commands <0|1>]
                            [--review-model-early <id|effort|model@effort>]
                            [--review-model-late  <id|effort|model@effort>]
                            [--fix-model-early <id|effort|model@effort>]
@@ -96,6 +113,8 @@ Usage:
                            [--review-timeout-seconds <n>]
                            [--fix-timeout-seconds <n>]
                            [--review-timeout-retries <n>]
+                           [--auth-failure-retries <n>]
+                           [--auth-scan-tail-lines <n>]
                            [--error-scan-tail-lines <n>]
                            [--control-file <path>]
                            [--artifacts-dir <path>]
@@ -104,6 +123,11 @@ Usage:
 Defaults:
   --uncommitted
   --max-rounds 6
+  --loop-mode conservative
+  --scope-ignore-untracked (for uncommitted scope)
+  --fail-on-scope-violation 1
+  --revert-scope-violation-untracked 1
+  --fail-on-forbidden-commands 1
   --review-model-early high
   --review-model-late  xhigh
   --fix-model-early    high
@@ -113,6 +137,8 @@ Defaults:
   --review-timeout-seconds 900
   --fix-timeout-seconds    900
   --review-timeout-retries 1
+  --auth-failure-retries   1
+  --auth-scan-tail-lines   200
   --error-scan-tail-lines  200
   --control-file       .codex-review-control.md
   --artifacts-dir      .codex-review-artifacts
@@ -124,9 +150,13 @@ Notes:
   - Heartbeat lines print periodic in-progress summaries during review/fix commands.
   - Review/fix phases are killed when timeout is exceeded (>0 seconds).
   - Review phase retries once on timeout by default (configurable).
+  - Auth failures (for example `refresh_token_reused`) are detected and fail
+    fast instead of stalling until timeout.
   - Review error parsing ignores known benign internal rollout-log noise.
   - Finding deltas use exact matching + optional fuzzy reworded reconciliation
     (env: FINDINGS_FUZZY=1, FINDINGS_FUZZY_THRESHOLD=0.86).
+  - Conservative mode blocks build/test/package-manager command execution in
+    fix output and fails on post-fix edits outside the computed scope.
 USAGE
 }
 
@@ -141,6 +171,32 @@ trim() {
   # shellcheck disable=SC2001
   s="$(echo "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   printf "%s" "$s"
+}
+
+validate_toggle_01() {
+  local flag_name="$1"
+  local value="$2"
+  [[ "$value" =~ ^[01]$ ]] || die "${flag_name} must be 0 or 1"
+}
+
+apply_mode_defaults() {
+  case "$REVIEW_LOOP_MODE" in
+    conservative)
+      if [[ -z "$SCOPE_INCLUDE_UNTRACKED" ]]; then SCOPE_INCLUDE_UNTRACKED="0"; fi
+      if [[ -z "$FAIL_ON_SCOPE_VIOLATION" ]]; then FAIL_ON_SCOPE_VIOLATION="1"; fi
+      if [[ -z "$REVERT_SCOPE_VIOLATION_UNTRACKED" ]]; then REVERT_SCOPE_VIOLATION_UNTRACKED="1"; fi
+      if [[ -z "$FAIL_ON_FORBIDDEN_COMMANDS" ]]; then FAIL_ON_FORBIDDEN_COMMANDS="1"; fi
+      ;;
+    balanced)
+      if [[ -z "$SCOPE_INCLUDE_UNTRACKED" ]]; then SCOPE_INCLUDE_UNTRACKED="1"; fi
+      if [[ -z "$FAIL_ON_SCOPE_VIOLATION" ]]; then FAIL_ON_SCOPE_VIOLATION="0"; fi
+      if [[ -z "$REVERT_SCOPE_VIOLATION_UNTRACKED" ]]; then REVERT_SCOPE_VIOLATION_UNTRACKED="0"; fi
+      if [[ -z "$FAIL_ON_FORBIDDEN_COMMANDS" ]]; then FAIL_ON_FORBIDDEN_COMMANDS="0"; fi
+      ;;
+    *)
+      die "--loop-mode must be one of: conservative|balanced"
+      ;;
+  esac
 }
 
 is_effort() {
@@ -282,6 +338,27 @@ ensure_git_repo() {
     return 0
   fi
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repo (git rev-parse failed)."
+}
+
+ensure_codex_login_healthy() {
+  local out_file="$1"
+  if ! codex_login_status_is_healthy "$out_file"; then
+    warn "Codex login status is unhealthy; review loop will not start."
+    warn "Run 'codex logout' then 'codex login' and retry."
+    warn "login status output:"
+    sed 's/^/  /' "$out_file" >&2 || true
+    return 1
+  fi
+  if grep -Eqi 'login status unsupported; preflight skipped' "$out_file"; then
+    warn "Codex CLI does not support 'codex login status'; auth preflight skipped."
+    return 0
+  fi
+  if grep -Eqi 'logged in using chatgpt' "$out_file"; then
+    warn "Codex login is using ChatGPT session auth."
+    warn "For maximum loop reliability, prefer API-key login in automation:"
+    warn "  printenv OPENAI_API_KEY | codex login --with-api-key"
+  fi
+  return 0
 }
 
 mk_run_dir() {
@@ -598,6 +675,93 @@ is_benign_review_error_line() {
   return 1
 }
 
+is_auth_error_line() {
+  local line="$1"
+  # Keep this matcher strict: it is used to fail-fast long-running child
+  # processes, so broad phrases can cause false-positive aborts.
+  # Ignore diff-like output lines where auth phrases may appear in content.
+  if printf "%s" "$line" | grep -Eq '^[[:space:]]*(\+\+\+|---|@@|\+|-)'; then
+    return 1
+  fi
+  # Match real Codex auth refresh failures emitted by the CLI/runtime.
+  if printf "%s" "$line" | grep -Eqi '^([0-9]{4}-[0-9]{2}-[0-9]{2}T[^[:space:]]+[[:space:]]+)?ERROR[[:space:]]+codex_core::auth:[[:space:]]+Failed to refresh token:'; then
+    return 0
+  fi
+  return 1
+}
+
+auth_error_summary() {
+  local file="$1"
+  local tail_buf line
+  tail_buf="$(tail -n "$AUTH_SCAN_TAIL_LINES" "$file" 2>/dev/null || true)"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if is_auth_error_line "$line"; then
+      printf "%s" "$line" | cut -c1-240
+      return 0
+    fi
+  done <<< "$tail_buf"
+  return 1
+}
+
+is_login_status_unsupported_output() {
+  local text="$1"
+  if printf "%s" "$text" | grep -Eqi '(unknown|unrecognized|unsupported|invalid|unexpected)[[:space:][:punct:]]*(subcommand|command|argument)[^[:cntrl:]]*status'; then
+    return 0
+  fi
+  if printf "%s" "$text" | grep -Eqi '(unknown|unrecognized|unsupported|invalid|unexpected)[[:space:][:punct:]]*(subcommand|command|argument|option|choice)[^[:cntrl:]]*status'; then
+    return 0
+  fi
+  if printf "%s" "$text" | grep -Eqi '(subcommand|command|argument|option|choice)[^[:cntrl:]]*status[^[:cntrl:]]*(unknown|unrecognized|unsupported|invalid|unexpected|not[[:space:]]+supported|not[[:space:]]+recognized|not[[:space:]]+found|wasn'\''t expected)'; then
+    return 0
+  fi
+  if printf "%s" "$text" | grep -Eqi 'no[[:space:]]+such[[:space:]]+(subcommand|command|option)[^[:cntrl:]]*status'; then
+    return 0
+  fi
+  if printf "%s" "$text" | grep -Eqi 'found[[:space:]]+argument[^[:cntrl:]]*status[^[:cntrl:]]*(wasn'\''t expected|unexpected)'; then
+    return 0
+  fi
+  return 1
+}
+
+codex_login_status_is_healthy() {
+  local out_file="$1"
+  local out_text
+  set +e
+  out_text="$(codex login status 2>&1)"
+  local ec=$?
+  set -e
+  printf "%s\n" "$out_text" >"$out_file"
+
+  if [[ "$ec" -ne 0 ]]; then
+    if is_login_status_unsupported_output "$out_text"; then
+      printf "%s\n" "login status unsupported; preflight skipped." >> "$out_file"
+      return 0
+    fi
+    return 1
+  fi
+
+  if auth_error_summary "$out_file" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if grep -Eqi 'not[[:space:]]+logged[[:space:]]+in|login[[:space:]]+required' "$out_file"; then
+    return 1
+  fi
+
+  if grep -Eqi '^logged[[:space:]]+in( using| as)?' "$out_file"; then
+    return 0
+  fi
+
+  # Fallback for minor output format variations while still avoiding
+  # "Not logged in" false-positives.
+  if grep -Eqi 'logged[[:space:]]+in' "$out_file"; then
+    return 0
+  fi
+
+  return 1
+}
+
 count_error_events() {
   local phase="$1"
   local file="$2"
@@ -624,7 +788,9 @@ phase_hint_from_output() {
   local file="$2"
   local tail_buf
   tail_buf="$(tail -n 120 "$file" 2>/dev/null || true)"
-  if [[ "$(count_error_events "$phase" "$file")" -gt 0 ]]; then
+  if auth_error_summary "$file" >/dev/null 2>&1; then
+    printf "auth-error"
+  elif [[ "$(count_error_events "$phase" "$file")" -gt 0 ]]; then
     printf "error"
   elif printf "%s" "$tail_buf" | grep -Eqi '(^exec$|succeeded in [0-9]+ms|in_progress)'; then
     printf "executing"
@@ -639,7 +805,7 @@ phase_hint_from_output() {
 
 clean_signal_from_output() {
   local file="$1"
-  if grep -Eqi '(REVIEW_CLEAN|no issues found|no issues identified|no findings|looks good|lgtm)' "$file"; then
+  if grep -Eqi '(REVIEW_CLEAN|no issues found|no issues identified|no findings|looks good|lgtm|did not identify any (actionable )?(discrete )?(defects|issues)|did not find any actionable defects|no actionable defects)' "$file"; then
     printf "possible"
   else
     printf "none"
@@ -749,7 +915,9 @@ capture_changed_file_hashes() {
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
     local digest
-    if [[ -e "$path" ]]; then
+    if [[ -d "$path" ]]; then
+      digest="__DIR__"
+    elif [[ -e "$path" ]]; then
       digest="$(hash_file "$path")"
     else
       digest="__MISSING__"
@@ -814,26 +982,521 @@ compute_scope_allowed_files() {
     return 0
   fi
 
+  local tmp_file
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/codex-scope-allowed.XXXXXX")"
+  : > "$tmp_file"
+
   case "$scope_mode" in
     uncommitted)
       {
         git diff --name-only 2>/dev/null || true
         git diff --cached --name-only 2>/dev/null || true
-        git ls-files --others --exclude-standard 2>/dev/null || true
-      } | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u > "$out_file"
+        if [[ "$SCOPE_INCLUDE_UNTRACKED" == "1" ]]; then
+          git ls-files --others --exclude-standard 2>/dev/null || true
+        fi
+      } >> "$tmp_file"
       ;;
     base)
-      git diff --name-only "${scope_base}...HEAD" 2>/dev/null | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u > "$out_file" || true
+      git diff --name-only "${scope_base}...HEAD" 2>/dev/null >> "$tmp_file" || true
       ;;
     commit)
-      git diff-tree --no-commit-id --name-only -r "$scope_sha" 2>/dev/null | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u > "$out_file" || true
-      if [[ ! -s "$out_file" ]]; then
-        git show --name-only --pretty=format: "$scope_sha" 2>/dev/null | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u > "$out_file" || true
+      git diff-tree --no-commit-id --name-only -r "$scope_sha" 2>/dev/null >> "$tmp_file" || true
+      if [[ ! -s "$tmp_file" ]]; then
+        git show --name-only --pretty=format: "$scope_sha" 2>/dev/null >> "$tmp_file" || true
       fi
       ;;
     *)
       ;;
   esac
+
+  if [[ -n "$SCOPE_ALLOWLIST_FILE" && -f "$SCOPE_ALLOWLIST_FILE" ]]; then
+    awk 'NF && $0 !~ /^[[:space:]]*#/{print}' "$SCOPE_ALLOWLIST_FILE" >> "$tmp_file"
+  fi
+
+  sed '/^[[:space:]]*$/d' "$tmp_file" | LC_ALL=C sort -u > "$out_file"
+  rm -f "$tmp_file"
+}
+
+compute_scope_violations() {
+  local touched_file="$1"
+  local allowed_file="$2"
+  local out_file="$3"
+  : > "$out_file"
+
+  [[ -s "$touched_file" ]] || return 0
+  # Empty allowed scope means every touched file is out-of-scope.
+  if [[ ! -s "$allowed_file" ]]; then
+    awk 'NF{print}' "$touched_file" | LC_ALL=C sort -u > "$out_file"
+    return 0
+  fi
+
+  if have_cmd python3; then
+    python3 - "$touched_file" "$allowed_file" "$out_file" <<'PY'
+import sys
+
+touched_path, allowed_path, out_path = sys.argv[1:]
+
+def load(path):
+    values = []
+    seen = set()
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            item = raw.strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            values.append(item)
+    return values
+
+touched = load(touched_path)
+allowed = set(load(allowed_path))
+violations = [p for p in touched if p not in allowed]
+
+with open(out_path, "w", encoding="utf-8") as f:
+    for p in violations:
+        f.write(p + "\n")
+PY
+  else
+    while IFS= read -r path; do
+      [[ -z "$path" ]] && continue
+      if ! grep -Fxq -- "$path" "$allowed_file"; then
+        echo "$path" >> "$out_file"
+      fi
+    done < "$touched_file"
+  fi
+}
+
+is_safe_repo_relative_path() {
+  local path="$1"
+  [[ -n "$path" ]] || return 1
+  [[ "$path" != /* ]] || return 1
+  [[ "$path" != "." ]] || return 1
+  [[ "$path" != ".." ]] || return 1
+  [[ "$path" != ../* ]] || return 1
+  [[ "$path" != */../* ]] || return 1
+  [[ "$path" != */.. ]] || return 1
+  [[ "$path" != *$'\n'* ]] || return 1
+  return 0
+}
+
+lookup_snapshot_digest() {
+  local snapshot_file="$1"
+  local path="$2"
+  local digest
+  digest="$(awk -F'\t' -v target="$path" '$1 == target { print $2; found=1; exit } END { if (!found) print "__MISSING__" }' "$snapshot_file")"
+  printf "%s" "$digest"
+}
+
+revert_new_untracked_scope_violations() {
+  local before_snapshot="$1"
+  local violations_file="$2"
+  local reverted_file="$3"
+  : > "$reverted_file"
+
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    if ! is_safe_repo_relative_path "$path"; then
+      warn "Skipping unsafe scope-violation path: '$path'"
+      continue
+    fi
+    local before_digest
+    before_digest="$(lookup_snapshot_digest "$before_snapshot" "$path")"
+    [[ "$before_digest" == "__MISSING__" ]] || continue
+    [[ -e "$path" || -L "$path" ]] || continue
+    if have_cmd git && git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+      continue
+    fi
+    rm -rf -- "$path"
+    echo "$path" >> "$reverted_file"
+  done < "$violations_file"
+}
+
+extract_forbidden_commands_from_output() {
+  local in_file="$1"
+  local out_file="$2"
+  : > "$out_file"
+
+  if have_cmd python3; then
+    python3 - "$in_file" "$out_file" <<'PY'
+import os
+import re
+import shlex
+import sys
+
+in_path, out_path = sys.argv[1], sys.argv[2]
+lines = open(in_path, "r", encoding="utf-8", errors="ignore").read().splitlines()
+
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SHELL_SEPARATORS = {";", "&&", "||", "|", "&", "(", ")"}
+SHELL_WRAPPERS = {"command", "builtin", "env", "nohup", "time", "sudo"}
+NESTED_SHELLS = {"sh", "bash", "zsh", "ksh", "dash"}
+CONTROL_KEYWORDS = {
+    "if", "then", "else", "elif", "fi",
+    "for", "while", "until", "do", "done",
+    "case", "esac", "select", "function", "{", "}",
+}
+
+
+def shell_payload_from_exec_line(line):
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return None
+    try:
+        i = tokens.index("-lc")
+    except ValueError:
+        return None
+    if i + 1 >= len(tokens):
+        return None
+    return tokens[i + 1]
+
+
+def tokenize_shell_command(command):
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def normalize_cmd_name(token):
+    cmd = os.path.basename(token).lower()
+    if cmd.endswith(".exe"):
+        cmd = cmd[:-4]
+    return cmd
+
+
+def consume_wrapper(tokens, idx):
+    wrapper = os.path.basename(tokens[idx]).lower()
+    j = idx + 1
+
+    if wrapper in {"command", "builtin", "time", "nohup"}:
+        while j < len(tokens):
+            token = tokens[j]
+            if token == "--":
+                j += 1
+                break
+            if token.startswith("-"):
+                j += 1
+                continue
+            break
+        return j
+
+    if wrapper == "env":
+        while j < len(tokens):
+            token = tokens[j]
+            if token == "--":
+                j += 1
+                break
+            if token.startswith("-"):
+                j += 1
+                continue
+            if ASSIGNMENT_RE.match(token):
+                j += 1
+                continue
+            break
+        return j
+
+    if wrapper == "sudo":
+        short_with_arg = {"-u", "-g", "-h", "-p", "-r", "-t", "-C", "-c", "-U", "-D"}
+        long_with_arg = {
+            "--user", "--group", "--host", "--prompt", "--role", "--type",
+            "--close-from", "--chdir", "--other-user",
+        }
+        while j < len(tokens):
+            token = tokens[j]
+            if token == "--":
+                j += 1
+                break
+            if ASSIGNMENT_RE.match(token):
+                j += 1
+                continue
+            if not token.startswith("-"):
+                break
+            if token in short_with_arg:
+                j += 1
+                if j < len(tokens):
+                    j += 1
+                continue
+            if any(token == opt or token.startswith(opt + "=") for opt in long_with_arg):
+                j += 1
+                if token in long_with_arg and j < len(tokens):
+                    j += 1
+                continue
+            if re.match(r"^-[ughprtCcUD].+", token):
+                j += 1
+                continue
+            j += 1
+        return j
+
+    return idx + 1
+
+
+def is_forbidden_invocation(tokens, idx):
+    cmd = normalize_cmd_name(tokens[idx])
+    next1 = tokens[idx + 1].lower() if idx + 1 < len(tokens) else ""
+    next2 = tokens[idx + 2].lower() if idx + 2 < len(tokens) else ""
+
+    if cmd in {"xcodebuild", "xcpretty", "pnpm", "yarn", "pytest", "cmake", "make"}:
+        return True
+    if cmd == "swift" and next1 in {"build", "test", "package"}:
+        return True
+    if cmd == "npm" and next1 in {"install", "test", "run"}:
+        return True
+    if cmd == "bundle" and next1 == "exec":
+        return True
+    if cmd == "pod" and next1 == "install":
+        return True
+    if cmd == "cargo" and next1 in {"build", "test"}:
+        return True
+    if cmd == "go" and next1 == "test":
+        return True
+    if re.match(r"^python([0-9]+([.][0-9]+)*)?$", cmd) and next1 == "-m" and next2 == "pytest":
+        return True
+    return False
+
+
+def extract_nested_shell_payload(tokens, idx):
+    cmd = normalize_cmd_name(tokens[idx])
+    if cmd not in NESTED_SHELLS:
+        return None
+
+    long_opts_with_arg = {"--rcfile", "--init-file"}
+    j = idx + 1
+    while j < len(tokens):
+        token = tokens[j]
+        if token == "--":
+            j += 1
+            continue
+        if token in {"-c", "-lc"}:
+            if j + 1 < len(tokens):
+                return tokens[j + 1]
+            return None
+        if token.startswith("--"):
+            if "=" in token:
+                j += 1
+                continue
+            if token in long_opts_with_arg:
+                j += 1
+                if j < len(tokens):
+                    j += 1
+                continue
+            j += 1
+            continue
+        if token.startswith("-"):
+            # Combined shell flags like -lc, -ic, -cl.
+            short_flags = token[1:]
+            if short_flags.isalpha() and "c" in short_flags:
+                if j + 1 < len(tokens):
+                    return tokens[j + 1]
+                return None
+            j += 1
+            continue
+        break
+    return None
+
+
+def extract_backtick_segments(command):
+    segments = []
+    in_single = False
+    in_double = False
+    in_backtick = False
+    escaped = False
+    buf = []
+
+    for ch in command:
+        if escaped:
+            if in_backtick:
+                buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            if in_backtick:
+                buf.append(ch)
+            continue
+        if in_backtick:
+            if ch == "`":
+                segments.append("".join(buf))
+                buf = []
+                in_backtick = False
+            else:
+                buf.append(ch)
+            continue
+
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if ch == "`" and not in_single:
+            in_backtick = True
+            buf = []
+            continue
+
+    return segments
+
+
+def extract_dollar_paren_segments(command):
+    segments = []
+    i = 0
+    n = len(command)
+    in_single = False
+    in_double = False
+    escaped = False
+
+    while i < n:
+        ch = command[i]
+
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+
+        if not in_single and ch == "$" and i + 1 < n and command[i + 1] == "(":
+            depth = 1
+            j = i + 2
+            sub_in_single = False
+            sub_in_double = False
+            sub_escaped = False
+
+            while j < n:
+                c = command[j]
+                if sub_escaped:
+                    sub_escaped = False
+                    j += 1
+                    continue
+
+                if c == "\\":
+                    sub_escaped = True
+                    j += 1
+                    continue
+
+                if c == "'" and not sub_in_double:
+                    sub_in_single = not sub_in_single
+                    j += 1
+                    continue
+
+                if c == '"' and not sub_in_single:
+                    sub_in_double = not sub_in_double
+                    j += 1
+                    continue
+
+                if not sub_in_single:
+                    if c == "$" and j + 1 < n and command[j + 1] == "(":
+                        depth += 1
+                        j += 2
+                        continue
+                    if c == ")":
+                        depth -= 1
+                        if depth == 0:
+                            segments.append(command[i + 2:j])
+                            i = j + 1
+                            break
+
+                j += 1
+
+            if depth == 0:
+                continue
+
+        i += 1
+
+    return segments
+
+
+def contains_forbidden_command(command, depth=0):
+    if depth < 3:
+        for segment in extract_backtick_segments(command):
+            if contains_forbidden_command(segment, depth + 1):
+                return True
+        for segment in extract_dollar_paren_segments(command):
+            if contains_forbidden_command(segment, depth + 1):
+                return True
+
+    try:
+        tokens = tokenize_shell_command(command)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+
+    command_start = True
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        lower = token.lower()
+        cmd_name = normalize_cmd_name(token)
+
+        if token in SHELL_SEPARATORS:
+            command_start = True
+            i += 1
+            continue
+
+        if not command_start:
+            i += 1
+            continue
+
+        if ASSIGNMENT_RE.match(token):
+            i += 1
+            continue
+
+        if cmd_name in SHELL_WRAPPERS:
+            i = consume_wrapper(tokens, i)
+            continue
+
+        if lower in CONTROL_KEYWORDS:
+            i += 1
+            command_start = True
+            continue
+
+        if depth < 4:
+            nested_payload = extract_nested_shell_payload(tokens, i)
+            if nested_payload is not None and contains_forbidden_command(nested_payload, depth + 1):
+                return True
+
+        if is_forbidden_invocation(tokens, i):
+            return True
+
+        command_start = False
+        i += 1
+
+    return False
+
+seen = set()
+items = []
+for line in lines:
+    payload = shell_payload_from_exec_line(line)
+    if payload is None:
+        continue
+    if not contains_forbidden_command(payload):
+        continue
+    if line in seen:
+        continue
+    seen.add(line)
+    items.append(line)
+
+with open(out_path, "w", encoding="utf-8") as f:
+    for item in items:
+        f.write(item + "\n")
+PY
+  else
+    grep -Ei "^[^[:space:]].*[[:space:]]-lc[[:space:]]([\\\"']?[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+|((sudo|env|time|command|builtin|nohup)([[:space:]]+-[^[:space:]]+)*[[:space:]]+))*(xcodebuild|xcpretty|pnpm|yarn|pytest|cmake|make|swift[[:space:]]+(build|test|package)|npm[[:space:]]+(install|test|run)|bundle[[:space:]]+exec|pod[[:space:]]+install|cargo[[:space:]]+(build|test)|go[[:space:]]+test|python([0-9]+([.][0-9]+)*)?[[:space:]]+-m[[:space:]]+pytest)\\b|[\\\"']?.*[;&|]{1,2}[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+[[:space:]]+|((sudo|env|time|command|builtin|nohup)([[:space:]]+-[^[:space:]]+)*[[:space:]]+))*(xcodebuild|xcpretty|pnpm|yarn|pytest|cmake|make|swift[[:space:]]+(build|test|package)|npm[[:space:]]+(install|test|run)|bundle[[:space:]]+exec|pod[[:space:]]+install|cargo[[:space:]]+(build|test)|go[[:space:]]+test|python([0-9]+([.][0-9]+)*)?[[:space:]]+-m[[:space:]]+pytest)\\b)" "$in_file" > "$out_file" || true
+  fi
 }
 
 format_elapsed_clock() {
@@ -848,18 +1511,29 @@ print_heartbeat() {
   local elapsed="$4"
 
   local findings cmds errs phase_hint clean_signal file_refs
-  local action message phase_label clock alert_detail
+  local action message phase_label clock alert_detail auth_detail
 
   cmds="$(count_exec_events "$out_file")"
   errs="$(count_error_events "$phase" "$out_file")"
   phase_hint="$(phase_hint_from_output "$phase" "$out_file")"
   clock="$(format_elapsed_clock "$elapsed")"
+  HEARTBEAT_AUTH_FAILURE="0"
+  HEARTBEAT_AUTH_DETAIL=""
+  auth_detail="$(auth_error_summary "$out_file" || true)"
+  if [[ -n "$auth_detail" ]]; then
+    HEARTBEAT_AUTH_FAILURE="1"
+    HEARTBEAT_AUTH_DETAIL="$auth_detail"
+  fi
 
   if [[ "$phase" == "review" ]]; then
     phase_label="review"
     findings="$(estimate_findings_count "$out_file")"
     clean_signal="$(clean_signal_from_output "$out_file")"
-    if [[ "$errs" -gt 0 ]]; then
+    if [[ "$HEARTBEAT_AUTH_FAILURE" == "1" ]]; then
+      action="stop"
+      message="auth failure detected; stopping review"
+      alert_detail="$auth_detail"
+    elif [[ "$errs" -gt 0 ]]; then
       action="stop"
       message="error detected (${errs}); review may be blocked"
       alert_detail="${errs} error(s) detected while reviewing"
@@ -880,7 +1554,11 @@ print_heartbeat() {
   else
     phase_label="fix"
     file_refs="$(file_mentions_from_output "$out_file")"
-    if [[ "$errs" -gt 0 ]]; then
+    if [[ "$HEARTBEAT_AUTH_FAILURE" == "1" ]]; then
+      action="stop"
+      message="auth failure detected; stopping fix"
+      alert_detail="$auth_detail"
+    elif [[ "$errs" -gt 0 ]]; then
       action="stop"
       message="error detected (${errs}); fix may be blocked"
       alert_detail="${errs} error(s) detected while fixing"
@@ -954,6 +1632,16 @@ run_with_heartbeat() {
     fi
     last_action="$HEARTBEAT_ACTION"
 
+    if [[ "$HEARTBEAT_AUTH_FAILURE" == "1" ]]; then
+      warn "Authentication failure detected during ${phase}: ${HEARTBEAT_AUTH_DETAIL}"
+      kill_pid_or_group "$child_pid" "$pgid"
+      wait "$child_pid" >/dev/null 2>&1 || true
+      LAUNCH_CHILD_PID=""
+      LAUNCH_ISOLATED="0"
+      LAUNCH_CHILD_PGID=""
+      return "$AUTH_ERROR_EXIT_CODE"
+    fi
+
     if [[ "$phase_timeout" -gt 0 && "$elapsed" -ge "$phase_timeout" ]]; then
       warn "${phase} timed out after ${phase_timeout}s in round ${round}; terminating active command."
       kill_pid_or_group "$child_pid" "$pgid"
@@ -986,6 +1674,9 @@ run_with_heartbeat() {
   LAUNCH_CHILD_PID=""
   LAUNCH_ISOLATED="0"
   LAUNCH_CHILD_PGID=""
+  if [[ "$ec" -ne 0 ]] && auth_error_summary "$out_file" >/dev/null 2>&1; then
+    return "$AUTH_ERROR_EXIT_CODE"
+  fi
   return $ec
 }
 
@@ -999,6 +1690,7 @@ run_with_timeout_retry() {
 
   local ec=0
   local retry_count=0
+  local auth_retry_count=0
   while true; do
     run_with_heartbeat "$phase" "$round" "$out_file" "$stdin_file" "$@"
     ec=$?
@@ -1006,6 +1698,17 @@ run_with_timeout_retry() {
       retry_count=$((retry_count + 1))
       warn "Review timed out; retrying (${retry_count}/${retries})."
       continue
+    fi
+    if [[ "$ec" -eq "$AUTH_ERROR_EXIT_CODE" ]] \
+      && auth_error_summary "$out_file" >/dev/null 2>&1 \
+      && [[ "$auth_retry_count" -lt "$AUTH_FAILURE_RETRIES" ]]; then
+      auth_retry_count=$((auth_retry_count + 1))
+      local auth_status_file="${RUN_DIR}/round-${round}-${phase}-auth-retry-${auth_retry_count}.txt"
+      if codex_login_status_is_healthy "$auth_status_file"; then
+        warn "Auth failure looked transient; retrying ${phase} (${auth_retry_count}/${AUTH_FAILURE_RETRIES})."
+        sleep 2
+        continue
+      fi
     fi
     return "$ec"
   done
@@ -1040,17 +1743,17 @@ is_review_clean_output() {
   fi
 
   # Strict anchored clean lines in the tail section.
-  if tail -n 60 "$file" | grep -Eiq '^[[:space:]]*(REVIEW_CLEAN|No issues found\.?|No issues identified\.?|No findings\.?)\s*$'; then
+  if tail -n 120 "$file" | grep -Eiq '^[[:space:]]*(REVIEW_CLEAN|No issues found\.?|No issues identified\.?|No findings\.?)\s*$'; then
     return 0
   fi
 
-  # Fuzzy clean phrases are only accepted for short outputs with no findings/errors.
-  if [[ "$nonempty_count" -le 40 ]] && tail -n 60 "$file" | grep -Eiq '^[[:space:]]*(Looks good\.?|LGTM\.?)\s*$'; then
+  # Common reviewer "clean" prose, still guarded by zero findings/errors above.
+  if tail -n 120 "$file" | grep -Eiq '(I did not identify any (actionable )?(discrete )?(defects|issues)|I did not find any actionable defects|no actionable defects)'; then
     return 0
   fi
 
-  # If extraction found nothing, only treat very short outputs as clean.
-  if [[ "$findings_count" -eq 0 && "$nonempty_count" -le 12 ]]; then
+  # Fuzzy clean phrases are accepted when strongly anchored.
+  if [[ "$nonempty_count" -le 80 ]] && tail -n 120 "$file" | grep -Eiq '^[[:space:]]*(Looks good\.?|LGTM\.?)\s*$'; then
     return 0
   fi
 
@@ -1240,7 +1943,8 @@ Goal:
 - Fix the issues described in the review output below.
 - Keep changes minimal and directly tied to the findings.
 - Do not introduce unrelated refactors.
-- If tests exist and are fast, run them. If lint exists and is fast, run it.
+- Do not run build/test/lint/package-install commands in this fix pass.
+- Focus on source edits only; validation happens in a separate step.
 
 Review output (verbatim):
 ------------------------
@@ -1255,8 +1959,8 @@ EOF
     if [[ "$allowed_count" -gt 0 ]]; then
       cat <<EOF
 Allowed edit scope:
-- Keep edits within the current review scope file set unless strictly required.
-- You may also update adjacent tests/docs directly related to these files.
+- Keep edits strictly within the scope files listed below.
+- If a required fix is outside this list, stop and explain exactly which path is needed.
 
 Scope files:
 EOF
@@ -1283,6 +1987,7 @@ Deliverable:
 - Apply fixes in the repository.
 - Summarize what you changed and why.
 - List any commands you ran and their results.
+- Allowed commands should be read/edit/git introspection only.
 
 Do NOT run anything destructive.
 EOF
@@ -1407,7 +2112,7 @@ run_fix() {
       args+=(--config "model_reasoning_effort=$effort_try")
     fi
 
-    run_with_heartbeat "fix" "$round" "$out_file" "$fix_prompt_file" codex exec "${args[@]}" -
+    run_with_timeout_retry "fix" "$round" "$out_file" "$fix_prompt_file" 0 codex exec "${args[@]}" -
     ec=$?
     if [[ "$ec" -eq 0 ]]; then
       LAST_EFFECTIVE_FIX_EFFORT="$effort_try"
@@ -1468,6 +2173,39 @@ while [[ $# -gt 0 ]]; do
     --max-rounds)
       [[ $# -ge 2 ]] || die "--max-rounds requires <n>"
       MAX_ROUNDS="$2"
+      shift 2
+      ;;
+    --loop-mode)
+      [[ $# -ge 2 ]] || die "--loop-mode requires <conservative|balanced>"
+      REVIEW_LOOP_MODE="$2"
+      shift 2
+      ;;
+    --scope-include-untracked)
+      SCOPE_INCLUDE_UNTRACKED="1"
+      shift
+      ;;
+    --scope-ignore-untracked)
+      SCOPE_INCLUDE_UNTRACKED="0"
+      shift
+      ;;
+    --scope-allowlist-file)
+      [[ $# -ge 2 ]] || die "--scope-allowlist-file requires <path>"
+      SCOPE_ALLOWLIST_FILE="$2"
+      shift 2
+      ;;
+    --fail-on-scope-violation)
+      [[ $# -ge 2 ]] || die "--fail-on-scope-violation requires <0|1>"
+      FAIL_ON_SCOPE_VIOLATION="$2"
+      shift 2
+      ;;
+    --revert-scope-violation-untracked)
+      [[ $# -ge 2 ]] || die "--revert-scope-violation-untracked requires <0|1>"
+      REVERT_SCOPE_VIOLATION_UNTRACKED="$2"
+      shift 2
+      ;;
+    --fail-on-forbidden-commands)
+      [[ $# -ge 2 ]] || die "--fail-on-forbidden-commands requires <0|1>"
+      FAIL_ON_FORBIDDEN_COMMANDS="$2"
       shift 2
       ;;
     --review-model-early)
@@ -1536,6 +2274,16 @@ while [[ $# -gt 0 ]]; do
       REVIEW_TIMEOUT_RETRIES="$2"
       shift 2
       ;;
+    --auth-failure-retries)
+      [[ $# -ge 2 ]] || die "--auth-failure-retries requires <n>"
+      AUTH_FAILURE_RETRIES="$2"
+      shift 2
+      ;;
+    --auth-scan-tail-lines)
+      [[ $# -ge 2 ]] || die "--auth-scan-tail-lines requires <n>"
+      AUTH_SCAN_TAIL_LINES="$2"
+      shift 2
+      ;;
     --error-scan-tail-lines)
       [[ $# -ge 2 ]] || die "--error-scan-tail-lines requires <n>"
       ERROR_SCAN_TAIL_LINES="$2"
@@ -1567,14 +2315,25 @@ done
 
 # Validate scope exclusivity implicitly by parsing: only one mode is active
 # Validate rounds integer
+apply_mode_defaults
 [[ "$MAX_ROUNDS" =~ ^[0-9]+$ ]] || die "--max-rounds must be an integer"
 [[ "$HEARTBEAT_SECONDS" =~ ^[0-9]+$ ]] || die "--heartbeat-seconds must be an integer"
 [[ "$HEARTBEAT_SECONDS" -gt 0 ]] || die "--heartbeat-seconds must be > 0"
 [[ "$REVIEW_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--review-timeout-seconds must be an integer"
 [[ "$FIX_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || die "--fix-timeout-seconds must be an integer"
 [[ "$REVIEW_TIMEOUT_RETRIES" =~ ^[0-9]+$ ]] || die "--review-timeout-retries must be an integer"
+[[ "$AUTH_FAILURE_RETRIES" =~ ^[0-9]+$ ]] || die "--auth-failure-retries must be an integer"
+[[ "$AUTH_SCAN_TAIL_LINES" =~ ^[0-9]+$ ]] || die "--auth-scan-tail-lines must be an integer"
+[[ "$AUTH_SCAN_TAIL_LINES" -gt 0 ]] || die "--auth-scan-tail-lines must be > 0"
 [[ "$ERROR_SCAN_TAIL_LINES" =~ ^[0-9]+$ ]] || die "--error-scan-tail-lines must be an integer"
 [[ "$ERROR_SCAN_TAIL_LINES" -gt 0 ]] || die "--error-scan-tail-lines must be > 0"
+validate_toggle_01 "--scope-include-untracked/--scope-ignore-untracked" "$SCOPE_INCLUDE_UNTRACKED"
+validate_toggle_01 "--fail-on-scope-violation" "$FAIL_ON_SCOPE_VIOLATION"
+validate_toggle_01 "--revert-scope-violation-untracked" "$REVERT_SCOPE_VIOLATION_UNTRACKED"
+validate_toggle_01 "--fail-on-forbidden-commands" "$FAIL_ON_FORBIDDEN_COMMANDS"
+if [[ -n "$SCOPE_ALLOWLIST_FILE" && ! -f "$SCOPE_ALLOWLIST_FILE" ]]; then
+  die "--scope-allowlist-file not found: $SCOPE_ALLOWLIST_FILE"
+fi
 case "$REVIEW_PROMPT_MODE" in
   plain|prompt|auto) ;;
   *) die "--review-prompt-mode must be one of: plain|prompt|auto" ;;
@@ -1593,6 +2352,12 @@ print_phase "Artifacts: $RUN_DIR"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "Planned:"
   echo "- Scope default: $SCOPE_MODE"
+  echo "- Loop mode: $REVIEW_LOOP_MODE"
+  echo "- Scope include untracked: $SCOPE_INCLUDE_UNTRACKED"
+  echo "- Scope allowlist file: ${SCOPE_ALLOWLIST_FILE:-<none>}"
+  echo "- Fail on scope violation: $FAIL_ON_SCOPE_VIOLATION"
+  echo "- Revert untracked scope violations: $REVERT_SCOPE_VIOLATION_UNTRACKED"
+  echo "- Fail on forbidden commands: $FAIL_ON_FORBIDDEN_COMMANDS"
   echo "- Max rounds: $MAX_ROUNDS"
   echo "- Review selector early: $REVIEW_MODEL_EARLY"
   echo "- Review selector late:  $REVIEW_MODEL_LATE"
@@ -1603,6 +2368,8 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "- Review timeout sec:    $REVIEW_TIMEOUT_SECONDS"
   echo "- Fix timeout sec:       $FIX_TIMEOUT_SECONDS"
   echo "- Review timeout retries:$REVIEW_TIMEOUT_RETRIES"
+  echo "- Auth failure retries:  $AUTH_FAILURE_RETRIES"
+  echo "- Auth scan tail lines:  $AUTH_SCAN_TAIL_LINES"
   echo "- Error scan tail lines: $ERROR_SCAN_TAIL_LINES"
   echo "- Review model id override: ${REVIEW_MODEL_ID:-<none>}"
   echo "- Fix model id override:    ${FIX_MODEL_ID:-<none>}"
@@ -1610,6 +2377,12 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "- Finding fuzzy threshold:  ${FINDINGS_FUZZY_THRESHOLD}"
   echo "- Control file: $CONTROL_FILE"
   exit 0
+fi
+
+login_status_file="${RUN_DIR}/login-status-preflight.txt"
+if ! ensure_codex_login_healthy "$login_status_file"; then
+  print_phase "❌ Codex authentication preflight failed. Artifacts at $RUN_DIR"
+  exit 2
 fi
 
 # Run summary state
@@ -1665,6 +2438,12 @@ for ((round=1; round<=MAX_ROUNDS; round++)); do
     if [[ "$review_ec" -eq 130 ]]; then
       print_phase "Stopped during review (artifacts kept at $RUN_DIR)."
       exit 130
+    fi
+    if [[ "$review_ec" -eq "$AUTH_ERROR_EXIT_CODE" ]] && auth_error_summary "$review_file" >/dev/null 2>&1; then
+      warn "Authentication failed during review; aborting loop."
+      warn "Run 'codex logout' then 'codex login', then re-run this skill."
+      print_phase "❌ Review stopped due to authentication failure. Artifacts at $RUN_DIR"
+      exit 2
     fi
     warn "Review command exited non-zero (exit=$review_ec). Continuing."
   fi
@@ -1747,6 +2526,13 @@ for ((round=1; round<=MAX_ROUNDS; round++)); do
   # Build fix prompt (includes full review output)
   allowed_files_file="$RUN_DIR/round-${round}-allowed-files.txt"
   compute_scope_allowed_files "$scope_mode" "$scope_base" "$scope_sha" "$allowed_files_file"
+  allowed_scope_count="$(count_nonempty_lines "$allowed_files_file")"
+  if [[ "$allowed_scope_count" -eq 0 ]]; then
+    warn "Computed allowed scope is empty for round ${round} (scope=${scope_desc})."
+    if [[ "$FAIL_ON_SCOPE_VIOLATION" == "1" ]]; then
+      warn "Scope-violation hard-fail is enabled; consider --scope-include-untracked or --scope-allowlist-file."
+    fi
+  fi
   fix_prompt="$(build_fix_prompt "$review_file" "$CF_APPEND_CONTEXT" "$allowed_files_file")"
   printf "%s" "$fix_prompt" > "$fix_prompt_file"
 
@@ -1763,6 +2549,12 @@ for ((round=1; round<=MAX_ROUNDS; round++)); do
     if [[ "$fix_ec" -eq 130 ]]; then
       print_phase "Stopped during fix (artifacts kept at $RUN_DIR)."
       exit 130
+    fi
+    if [[ "$fix_ec" -eq "$AUTH_ERROR_EXIT_CODE" ]] && auth_error_summary "$fix_file" >/dev/null 2>&1; then
+      warn "Authentication failed during fix; aborting loop."
+      warn "Run 'codex logout' then 'codex login', then re-run this skill."
+      print_phase "❌ Fix stopped due to authentication failure. Artifacts at $RUN_DIR"
+      exit 2
     fi
     warn "Fix command exited non-zero (exit=$fix_ec). Continuing to next round."
   fi
@@ -1783,6 +2575,42 @@ for ((round=1; round<=MAX_ROUNDS; round++)); do
     echo "What I changed:"
     print_indented_list "$fix_touched_file"
   fi
+
+  forbidden_cmds_file="$RUN_DIR/round-${round}-forbidden-commands.txt"
+  extract_forbidden_commands_from_output "$fix_file" "$forbidden_cmds_file"
+  forbidden_cmds_count="$(count_nonempty_lines "$forbidden_cmds_file")"
+  if [[ "$forbidden_cmds_count" -gt 0 ]]; then
+    warn "Fix output includes ${forbidden_cmds_count} forbidden build/test/package command(s)."
+    echo "Forbidden commands detected:"
+    print_indented_list "$forbidden_cmds_file"
+    if [[ "$FAIL_ON_FORBIDDEN_COMMANDS" == "1" ]]; then
+      print_phase "❌ Forbidden command policy violated in round ${round}. Aborting."
+      exit 3
+    fi
+  fi
+
+  scope_violations_file="$RUN_DIR/round-${round}-scope-violations.txt"
+  compute_scope_violations "$fix_touched_file" "$allowed_files_file" "$scope_violations_file"
+  scope_violations_count="$(count_nonempty_lines "$scope_violations_file")"
+  if [[ "$scope_violations_count" -gt 0 ]]; then
+    warn "Detected ${scope_violations_count} out-of-scope touched file(s)."
+    echo "Out-of-scope touched files:"
+    print_indented_list "$scope_violations_file"
+    if [[ "$REVERT_SCOPE_VIOLATION_UNTRACKED" == "1" ]]; then
+      reverted_scope_file="$RUN_DIR/round-${round}-scope-violations-reverted-untracked.txt"
+      revert_new_untracked_scope_violations "$pre_fix_hashes" "$scope_violations_file" "$reverted_scope_file"
+      reverted_scope_count="$(count_nonempty_lines "$reverted_scope_file")"
+      if [[ "$reverted_scope_count" -gt 0 ]]; then
+        echo "Reverted new untracked out-of-scope files:"
+        print_indented_list "$reverted_scope_file"
+      fi
+    fi
+    if [[ "$FAIL_ON_SCOPE_VIOLATION" == "1" ]]; then
+      print_phase "❌ Scope policy violated in round ${round}. Aborting."
+      exit 4
+    fi
+  fi
+
   if [[ "$findings_parsed" -gt 0 ]]; then
     echo "Findings targeted in this fix:"
     print_indented_list "$findings_file"

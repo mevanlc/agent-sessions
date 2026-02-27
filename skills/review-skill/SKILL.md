@@ -25,9 +25,18 @@ From repo root:
 Defaults:
 - Scope: uncommitted changes
 - Max rounds: 6
+- Loop mode: `conservative`
 - Review effort: high for rounds 1-2, xhigh for rounds 3+
 - Fix effort: high for rounds 1-4, xhigh for rounds 5+
 - Artifacts: `.codex-review-artifacts/<timestamp>/`
+
+`conservative` mode defaults:
+- excludes untracked files from allowed scope (unless explicitly enabled)
+- fails when fix output runs build/test/package-manager commands
+- fails when fix touches files outside computed scope
+- attempts safe cleanup of new untracked out-of-scope files before abort
+
+If you want broader behavior, use `--loop-mode balanced`.
 
 ## Live steering
 
@@ -50,10 +59,18 @@ Review prompt behavior:
 - Heartbeats print plain-language one-line summaries (default every 60s; configurable via `--heartbeat-seconds`).
 - When recommendation changes to a non-routine action (for example `steer` or `stop`), the loop prints an `ALERT` line immediately.
 
+Authentication resilience:
+- The loop runs a `codex login status` preflight before round 1.
+- Auth failures (for example `refresh_token_reused`) are detected from live output and fail fast instead of waiting for timeout.
+- The loop retries auth failures a bounded number of times (`AUTH_FAILURE_RETRIES`, default `1`) and then exits with artifacts + remediation text.
+- If this keeps happening, run `codex logout` then `codex login` before starting the loop.
+- For CI/automation reliability, prefer API-key auth (`printenv OPENAI_API_KEY | codex login --with-api-key`).
+
 ## Safety
 
 - Fix runs use `--full-auto` with `--sandbox workspace-write` (headless with sandboxed automation).
 - Avoid `--yolo` unless you are already inside a hardened sandbox VM.
+- In conservative mode, fixes should stay in-file and avoid invoking heavy build/test/package commands.
 
 ## Outputs
 

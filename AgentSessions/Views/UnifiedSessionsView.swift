@@ -1,17 +1,15 @@
 import SwiftUI
 import AppKit
 
-enum UnifiedSelectionPolicy {
-    static func shouldPreserveSelectionOnEmptyTableMutation(
-        oldSelection: Set<String>,
-        newSelection: Set<String>,
-        isProgrammaticUpdate: Bool,
-        isIndexing: Bool,
-        cachedRowCount: Int
+enum UnifiedTableSelectionPolicy {
+    static func shouldClearCanonicalSelectionOnTableDeselection(
+        isDatasetChurning: Bool,
+        currentSelectionID: String?,
+        visibleRowIDs: Set<String>
     ) -> Bool {
-        guard !isProgrammaticUpdate else { return false }
-        guard !oldSelection.isEmpty, newSelection.isEmpty else { return false }
-        return isIndexing || cachedRowCount == 0
+        guard !isDatasetChurning else { return false }
+        guard let currentSelectionID else { return false }
+        return visibleRowIDs.contains(currentSelectionID)
     }
 }
 
@@ -173,6 +171,7 @@ struct UnifiedSessionsView: View {
     @ObservedObject var openclawIndexer: OpenClawSessionIndexer
     @EnvironmentObject var codexUsageModel: CodexUsageModel
     @EnvironmentObject var claudeUsageModel: ClaudeUsageModel
+    @EnvironmentObject var activeCodexSessions: CodexActiveSessionsModel
     @EnvironmentObject var updaterController: UpdaterController
     @EnvironmentObject var columnVisibility: ColumnVisibilityStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -183,14 +182,15 @@ struct UnifiedSessionsView: View {
     let onToggleLayout: () -> Void
 
     @State private var selection: String?
-    @State private var tableSelection: Set<String> = []
+    @State private var selectionSource: SessionSource? = nil
     @State private var lastSelectedSource: SessionSource = .codex
-	@State private var sortOrder: [KeyPathComparator<Session>] = []
-	@State private var cachedRows: [Session] = []
+		@State private var sortOrder: [KeyPathComparator<Session>] = []
+		@State private var cachedRows: [Session] = []
 	@State private var columnLayoutID: UUID = UUID()
 	@AppStorage("UnifiedShowSourceColumn") private var showSourceColumn: Bool = true
 	@AppStorage("UnifiedShowStarColumn") private var showStarColumn: Bool = true
 	@AppStorage("UnifiedShowSizeColumn") private var showSizeColumn: Bool = true
+    @AppStorage("UnifiedShowActiveSessionsOnly") private var showActiveSessionsOnly: Bool = false
 	@AppStorage("StripMonochromeMeters") private var stripMonochrome: Bool = false
 	@AppStorage("ModifiedDisplay") private var modifiedDisplayRaw: String = SessionIndexer.ModifiedDisplay.relative.rawValue
 	@AppStorage("AppAppearance") private var appAppearanceRaw: String = AppAppearance.system.rawValue
@@ -201,12 +201,11 @@ struct UnifiedSessionsView: View {
 	@AppStorage(PreferencesKey.Agents.geminiEnabled) private var geminiAgentEnabled: Bool = true
 	@AppStorage(PreferencesKey.Agents.openCodeEnabled) private var openCodeAgentEnabled: Bool = true
 	@AppStorage(PreferencesKey.Agents.copilotEnabled) private var copilotAgentEnabled: Bool = true
-    @AppStorage(PreferencesKey.Agents.droidEnabled) private var droidAgentEnabled: Bool = true
-    @AppStorage(PreferencesKey.Agents.openClawEnabled) private var openClawAgentEnabled: Bool = AgentEnablement.isAvailable(.openclaw)
-    @State private var autoSelectEnabled: Bool = true
-    @State private var programmaticSelectionUpdate: Bool = false
-    @State private var pendingTableSelection: Set<String>? = nil
-    @State private var isAutoSelectingFromSearch: Bool = false
+	    @AppStorage(PreferencesKey.Agents.droidEnabled) private var droidAgentEnabled: Bool = true
+	    @AppStorage(PreferencesKey.Agents.openClawEnabled) private var openClawAgentEnabled: Bool = AgentEnablement.isAvailable(.openclaw)
+	    @State private var autoSelectEnabled: Bool = true
+	    @State private var isDatasetChurning: Bool = false
+	    @State private var isAutoSelectingFromSearch: Bool = false
     @State private var hasEverHadSessions: Bool = false
     @State private var hasUserManuallySelected: Bool = false
     @State private var showAnalyticsWarmupNotice: Bool = false
@@ -222,13 +221,17 @@ struct UnifiedSessionsView: View {
     @State private var selectionChangeSource: SelectionChangeSource? = nil
     @State private var autoJumpWorkItem: DispatchWorkItem? = nil
     private var rows: [Session] {
+        let baseRows: [Session]
         let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if !q.isEmpty || searchCoordinator.isRunning {
             // Apply current UI filters and sort to search results
-            return unified.applyFiltersAndSort(to: searchCoordinator.results)
+            baseRows = unified.applyFiltersAndSort(to: searchCoordinator.results)
         } else {
-            return unified.sessions
+            baseRows = unified.sessions
         }
+
+        guard showActiveSessionsOnly else { return baseRows }
+        return baseRows.filter { isSessionActive($0) }
     }
 
     init(unified: UnifiedSessionIndexer,
@@ -329,18 +332,16 @@ struct UnifiedSessionsView: View {
 
 		let lifecycle = AnyView(
 			base
-                .onAppear {
-                    updateFooterUsageVisibility()
-                    if sortOrder.isEmpty { sortOrder = [KeyPathComparator(\Session.modifiedAt, order: .reverse)] }
-                    updateCachedRows()
-                    updateSelectionBridge()
-                    unified.setAppActive(NSApp.isActive)
-                    updateFocusedSessionIfNeeded(selectedSession)
-                    if let session = selectedSession {
-                        lastSelectedSource = session.source
-                    }
-                    searchCoordinator.setAppActive(NSApp.isActive)
-                }
+	                .onAppear {
+	                    updateFooterUsageVisibility()
+	                    if sortOrder.isEmpty { sortOrder = [KeyPathComparator(\Session.modifiedAt, order: .reverse)] }
+	                    updateCachedRows()
+	                    ensureDefaultSelectionIfNeeded()
+	                    unified.setAppActive(NSApp.isActive)
+	                    updateFocusedSessionIfNeeded(selectedSession)
+	                    refreshSelectionSourceFromCachedRows()
+	                    searchCoordinator.setAppActive(NSApp.isActive)
+	                }
                 .onDisappear {
                     codexUsageModel.setStripVisible(false)
                     claudeUsageModel.setStripVisible(false)
@@ -383,16 +384,24 @@ struct UnifiedSessionsView: View {
 		let afterOpenClaw = afterDroid
 			.onChange(of: unified.includeOpenClaw) { _, _ in restartSearchIfRunning() }
 
-			let afterUsage = afterOpenClaw
+        let afterActiveOnly = afterOpenClaw
+            .onChange(of: showActiveSessionsOnly) { _, _ in
+                updateCachedRows()
+                ensureDefaultSelectionIfNeeded()
+                refreshSelectionSourceFromCachedRows()
+                updateFocusedSessionIfNeeded(selectedSession)
+            }
+
+			let afterUsage = afterActiveOnly
 				.onChange(of: codexUsageEnabled) { _, _ in updateFooterUsageVisibility() }
 				.onChange(of: claudeUsageEnabled) { _, _ in updateFooterUsageVisibility() }
-				.onChange(of: searchState.query) { _, newValue in
-					if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-						cancelAutoJump()
-                        updateCachedRows()
-                        updateSelectionBridge()
+					.onChange(of: searchState.query) { _, newValue in
+						if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+							cancelAutoJump()
+	                        updateCachedRows()
+	                        ensureDefaultSelectionIfNeeded()
+						}
 					}
-				}
 
 		let afterAgents = afterUsage
 			.onChange(of: codexAgentEnabled) { _, _ in
@@ -427,15 +436,14 @@ struct UnifiedSessionsView: View {
 					focusCoordinator.perform(.openTranscriptFind)
 				}
 
-		let afterNavigateFromImages = afterTranscriptFind
-				.onReceive(NotificationCenter.default.publisher(for: .navigateToSessionFromImages)) { n in
-					guard let id = n.object as? String else { return }
-					let eventID = n.userInfo?["eventID"] as? String
-					let userPromptIndex = n.userInfo?["userPromptIndex"] as? Int
-					selection = id
-					let desired: Set<String> = [id]
-					scheduleTableSelectionUpdate(desired)
-					CodexImagesWindowController.shared.sendToBack()
+			let afterNavigateFromImages = afterTranscriptFind
+					.onReceive(NotificationCenter.default.publisher(for: .navigateToSessionFromImages)) { n in
+						guard let id = n.object as? String else { return }
+						let eventID = n.userInfo?["eventID"] as? String
+						let userPromptIndex = n.userInfo?["userPromptIndex"] as? Int
+						let source = cachedRows.first(where: { $0.id == id })?.source
+						setActiveSelection(id, source: source, userInitiated: true)
+						CodexImagesWindowController.shared.sendToBack()
 					NSApp.activate(ignoringOtherApps: true)
 					if let main = NSApp.windows.first(where: { $0.isVisible && $0.title == "Agent Sessions" }) ?? NSApp.mainWindow {
 						main.makeKeyAndOrderFront(nil)
@@ -463,13 +471,12 @@ struct UnifiedSessionsView: View {
 					}
 
 				let afterShowImagesForInlineImage = afterShowImages
-					.onReceive(NotificationCenter.default.publisher(for: .showImagesForInlineImage)) { n in
-						guard let id = n.object as? String else { return }
-						let requestedItemID = n.userInfo?["selectedItemID"] as? String
+						.onReceive(NotificationCenter.default.publisher(for: .showImagesForInlineImage)) { n in
+							guard let id = n.object as? String else { return }
+							let requestedItemID = n.userInfo?["selectedItemID"] as? String
 
-						selection = id
-						let desired: Set<String> = [id]
-						scheduleTableSelectionUpdate(desired)
+							let source = cachedRows.first(where: { $0.id == id })?.source
+							setActiveSelection(id, source: source, userInitiated: true)
 
 						guard let session = selectedSession else {
 							NSSound.beep()
@@ -488,6 +495,13 @@ struct UnifiedSessionsView: View {
 							)
 						}
 					}
+                    .onReceive(activeCodexSessions.$activeMembershipVersion) { _ in
+                        guard showActiveSessionsOnly else { return }
+                        updateCachedRows()
+                        ensureDefaultSelectionIfNeeded()
+                        refreshSelectionSourceFromCachedRows()
+                        updateFocusedSessionIfNeeded(selectedSession)
+                    }
 
 				return AnyView(afterShowImagesForInlineImage)
 			}
@@ -565,8 +579,8 @@ struct UnifiedSessionsView: View {
 	        let showModified = columnVisibility.showModifiedColumn
         let showProject = columnVisibility.showProjectColumn
         let showMsgs = columnVisibility.showMsgsColumn
-        return ZStack(alignment: .bottom) {
-	        Table(cachedRows, selection: $tableSelection, sortOrder: $sortOrder) {
+	        return ZStack(alignment: .bottom) {
+		        Table(cachedRows, selection: tableSingleSelection, sortOrder: $sortOrder) {
             TableColumn("★") { cellFavorite(for: $0) }
                 .width(min: showStarColumn ? 36 : 0,
                        ideal: showStarColumn ? 40 : 0,
@@ -577,19 +591,16 @@ struct UnifiedSessionsView: View {
                        ideal: showSourceColumn ? 100 : 0,
                        max: showSourceColumn ? 120 : 0)
 
-            TableColumn("Session", value: \Session.title) { s in
-                SessionTitleCell(session: s, geminiIndexer: geminiIndexer)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        selectionChangeSource = .mouse
-                        // Explicitly select the tapped row to avoid relying solely on Table's mouse handling.
-                        selection = s.id
-                        let desired: Set<String> = [s.id]
-                        scheduleTableSelectionUpdate(desired)
-                        hasUserManuallySelected = true
-                        autoSelectEnabled = false
-                        NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
-                    }
+	            TableColumn("Session", value: \Session.title) { s in
+	                SessionTitleCell(session: s, geminiIndexer: geminiIndexer)
+	                    .contentShape(Rectangle())
+	                    .onTapGesture {
+	                        selectionChangeSource = .mouse
+	                        // Explicitly select the tapped row to avoid relying solely on Table's mouse handling.
+	                        setActiveSelection(s.id, source: s.source, userInitiated: true)
+	                        autoSelectEnabled = false
+	                        NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+	                    }
             }
             .width(min: showTitle ? 160 : 0,
                    ideal: showTitle ? 320 : 0,
@@ -658,20 +669,44 @@ struct UnifiedSessionsView: View {
 		        })
 		        }
 		        .contextMenu(forSelectionType: String.self) { ids in
-		            if ids.count == 1, let id = ids.first, let s = cachedRows.first(where: { $0.id == id }) {
-		                Button(s.isFavorite ? "Remove from Saved" : "Save") { unified.toggleFavorite(s) }
-		                Divider()
-                if s.source == .codex || s.source == .claude {
-                    Button("Resume in \(s.source == .codex ? "Codex CLI" : "Claude Code") (\(CodexLaunchMode.selectedResumeTerminalTitle()))") { resume(s) }
-                        .keyboardShortcut("r", modifiers: [.command, .control])
-                        .help("Resume the selected session in its original CLI (⌃⌘R)")
-                    Divider()
-                }
-                Button("Open Working Directory") { openDir(s) }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
-                    .help("Reveal working directory in Finder (⌘⇧O)")
-                Button("Reveal Session Log") { revealSessionFile(s) }
-                    .keyboardShortcut("l", modifiers: [.command, .option])
+			            if ids.count == 1, let id = ids.first, let s = cachedRows.first(where: { $0.id == id }) {
+			                Button(s.isFavorite ? "Remove from Saved" : "Save") { unified.toggleFavorite(s) }
+			                Divider()
+	                if s.source == .codex || s.source == .claude {
+	                    Button("Resume in \(s.source == .codex ? "Codex CLI" : "Claude Code") (\(CodexLaunchMode.selectedResumeTerminalTitle()))") { resume(s) }
+	                        .keyboardShortcut("r", modifiers: [.command, .control])
+	                        .help("Resume the selected session in its original CLI (⌃⌘R)")
+	                    Divider()
+	                }
+	                    if s.source == .codex {
+	                        let presence = activeCodexSessions.presence(for: s)
+	                        let focusURL = presence?.revealURL
+	                        let canFocus = CodexActiveSessionsModel.canAttemptITerm2Focus(
+	                            itermSessionId: presence?.terminal?.itermSessionId,
+	                            tty: presence?.tty,
+	                            termProgram: presence?.terminal?.termProgram
+	                        ) || focusURL != nil
+	                        let helpText: String = {
+	                            if canFocus { return "Focus the existing iTerm2 tab/window for this session." }
+	                            if activeCodexSessions.isActive(s) { return "Focus is unavailable for this terminal session." }
+	                            return "This session is not currently active."
+	                        }()
+	                        Button("Focus in iTerm2") {
+	                            let didFocus = CodexActiveSessionsModel.tryFocusITerm2(
+	                                itermSessionId: presence?.terminal?.itermSessionId,
+	                                tty: presence?.tty
+	                            )
+	                            if !didFocus, let focusURL { NSWorkspace.shared.open(focusURL) }
+	                        }
+	                        .disabled(!canFocus)
+	                        .help(helpText)
+	                        Divider()
+	                    }
+	                Button("Open Working Directory") { openDir(s) }
+	                    .keyboardShortcut("o", modifiers: [.command, .shift])
+	                    .help("Reveal working directory in Finder (⌘⇧O)")
+	                Button("Reveal Session Log") { revealSessionFile(s) }
+	                    .keyboardShortcut("l", modifiers: [.command, .option])
                     .help("Show session log file in Finder (⌥⌘L)")
                 Button("Copy Session ID") { copySessionID(id) }
                     .help("Copy the session ID to the clipboard")
@@ -717,54 +752,31 @@ struct UnifiedSessionsView: View {
                 unified.sortDescriptor = .init(key: key, ascending: first.order == .forward)
                 unified.recomputeNow()
             }
-            updateSelectionBridge()
             updateCachedRows()
+            refreshSelectionSourceFromCachedRows()
         }
-        .onChange(of: tableSelection) { oldSel, newSel in
-            if programmaticSelectionUpdate {
-                selection = newSel.first
-                programmaticSelectionUpdate = false
-                return
-            }
-
-            if UnifiedSelectionPolicy.shouldPreserveSelectionOnEmptyTableMutation(
-                oldSelection: oldSel,
-                newSelection: newSel,
-                isProgrammaticUpdate: programmaticSelectionUpdate,
-                isIndexing: unified.isIndexing,
-                cachedRowCount: cachedRows.count
-            ) {
-                return
-            }
-
-            selection = newSel.first
-
-            // SwiftUI Table sometimes emits an initial "empty selection" change during mount.
-            // Do not treat that as user interaction or it disables initial auto-select.
-            if oldSel.isEmpty, newSel.isEmpty { return }
-
-            // User interacted with the table; mark as manually selected
-            hasUserManuallySelected = true
-            autoSelectEnabled = false
-            NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
-        }
-			.onChange(of: unified.isIndexing) { wasIndexing, isIndexing in
-				// When indexing finishes, reconcile selection in case a deferred
-				// clear was skipped (the guard in updateCachedRows).
-				if wasIndexing, !isIndexing {
-					updateCachedRows()
-					updateSelectionBridge()
+				.onChange(of: unified.isIndexing) { wasIndexing, isIndexing in
+					// When indexing finishes, reconcile selection in case a deferred
+					// clear was skipped (the guard in updateCachedRows).
+					if wasIndexing, !isIndexing {
+						updateCachedRows()
+						ensureDefaultSelectionIfNeeded()
+						refreshSelectionSourceFromCachedRows()
+					}
 				}
-			}
-			.onChange(of: unified.sessions) { _, _ in
-				// Update cached rows first, then reconcile selection so auto-select uses fresh data.
-				updateCachedRows()
-				updateSelectionBridge()
-				updateFocusedSessionIfNeeded(selectedSession)
-                if let session = selectedSession {
-                    lastSelectedSource = session.source
-                }
-			}
+				.onChange(of: unified.sessions) { _, _ in
+					// Update cached rows first, then reconcile canonical selection with fresh data.
+					selectionTrace("sessions changed begin selection=\(selection ?? "nil") cachedRows=\(cachedRows.count)")
+					isDatasetChurning = true
+					updateCachedRows()
+					ensureDefaultSelectionIfNeeded()
+					refreshSelectionSourceFromCachedRows()
+					updateFocusedSessionIfNeeded(selectedSession)
+					DispatchQueue.main.async {
+						isDatasetChurning = false
+						selectionTrace("sessions changed end selection=\(selection ?? "nil") cachedRows=\(cachedRows.count)")
+					}
+				}
         .onChange(of: columnVisibility.changeToken) { _, _ in refreshColumnLayout() }
         .onChange(of: showSourceColumn) { _, _ in refreshColumnLayout() }
         .onChange(of: showSizeColumn) { _, _ in refreshColumnLayout() }
@@ -773,26 +785,21 @@ struct UnifiedSessionsView: View {
             updateCachedRows()
             let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
             if q.isEmpty {
-                updateSelectionBridge()
+                ensureDefaultSelectionIfNeeded()
+                refreshSelectionSourceFromCachedRows()
             }
         }
         .onChange(of: searchCoordinator.results) { _, _ in
             updateCachedRows()
-            let q = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !q.isEmpty, cachedRows.isEmpty {
-                scheduleTableSelectionUpdate([])
-                return
-            }
             // If we have search results but no valid selection (none selected or selected not in results),
             // auto-select the first match without stealing focus
-            if selectedSession == nil, let first = cachedRows.first {
+            if selection == nil, let first = cachedRows.first {
                 isAutoSelectingFromSearch = true
-                selection = first.id
-                let desired: Set<String> = [first.id]
-                scheduleTableSelectionUpdate(desired)
+                setActiveSelection(first.id, source: first.source, userInitiated: false)
                 // Reset the flag on the next runloop to ensure onChange handlers have observed it
                 DispatchQueue.main.async { isAutoSelectingFromSearch = false }
             }
+            refreshSelectionSourceFromCachedRows()
 	        }
 	    }
 
@@ -877,12 +884,12 @@ struct UnifiedSessionsView: View {
         pasteboard.setString(id, forType: .string)
     }
 
-    private var transcriptPane: some View {
-        ZStack {
-            // Base host is always mounted to keep a stable split subview identity
-            TranscriptHostView(kind: selectedSession?.source ?? lastSelectedSource,
-                               selection: selection,
-                               codexIndexer: codexIndexer,
+	    private var transcriptPane: some View {
+	        ZStack {
+	            // Base host is always mounted to keep a stable split subview identity
+	            TranscriptHostView(kind: selectionSource ?? lastSelectedSource,
+	                               selection: selection,
+	                               codexIndexer: codexIndexer,
                                claudeIndexer: claudeIndexer,
                                geminiIndexer: geminiIndexer,
                                opencodeIndexer: opencodeIndexer,
@@ -962,6 +969,9 @@ struct UnifiedSessionsView: View {
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .principal) {
             HStack(spacing: 12) {
+                ActiveSessionsOnlyToggle(isOn: $showActiveSessionsOnly)
+                    .help("Show only active sessions in the list")
+
                 if codexAgentEnabled {
                     AgentTabToggle(title: "Codex", color: Color.agentCodex, isMonochrome: stripMonochrome, isOn: $unified.includeCodex)
                         .help("Show or hide Codex sessions in the list (⌘1)")
@@ -1107,7 +1117,46 @@ struct UnifiedSessionsView: View {
         }
     }
 
-    private var selectedSession: Session? { selection.flatMap { id in cachedRows.first(where: { $0.id == id }) } }
+	    private var selectedSession: Session? { selection.flatMap { id in cachedRows.first(where: { $0.id == id }) } }
+
+	    private var visibleRowIDs: Set<String> {
+	        Set(cachedRows.map(\.id))
+	    }
+
+	    private var tableSingleSelection: Binding<String?> {
+	        Binding(
+	            get: {
+	                guard let id = selection, visibleRowIDs.contains(id) else { return nil }
+	                return id
+	            },
+	            set: { newID in
+	                if let newID {
+	                    let source = cachedRows.first(where: { $0.id == newID })?.source
+	                    selectionTrace("table set newID=\(newID) source=\(source?.rawValue ?? "nil")")
+	                    setActiveSelection(newID, source: source, userInitiated: true)
+	                    autoSelectEnabled = false
+	                    NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+	                    return
+	                }
+
+	                let shouldClearSelection = UnifiedTableSelectionPolicy
+	                    .shouldClearCanonicalSelectionOnTableDeselection(
+	                        isDatasetChurning: isDatasetChurning,
+	                        currentSelectionID: selection,
+	                        visibleRowIDs: visibleRowIDs
+	                    )
+	                let userInitiated = isLikelyUserInitiatedTableDeselection()
+	                selectionTrace(
+	                    "table clear-request current=\(selection ?? "nil") shouldClear=\(shouldClearSelection) userInitiated=\(userInitiated) churning=\(isDatasetChurning) visibleCount=\(visibleRowIDs.count)"
+	                )
+	                guard userInitiated else { return }
+	                guard shouldClearSelection else { return }
+	                setActiveSelection(nil, userInitiated: true)
+	                autoSelectEnabled = false
+	                NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+	            }
+	        )
+	    }
 
     private var imagesToolbarHelpText: String {
         return "Show images for the selected session"
@@ -1119,40 +1168,68 @@ struct UnifiedSessionsView: View {
         return AppDateFormatting.dateTimeShort(date)
     }
 
-    private func updateSelectionBridge() {
-        // Auto-select first row when sessions become available and user hasn't manually selected
-        if !hasUserManuallySelected, let first = cachedRows.first, selection == nil {
-            selection = first.id
-        }
-        // Keep single-selection Set in sync with selection id when the selected row is visible.
-        let desired: Set<String>
-        if let selectedID = selection, cachedRows.contains(where: { $0.id == selectedID }) {
-            desired = [selectedID]
-        } else {
-            desired = []
-        }
-        scheduleTableSelectionUpdate(desired)
-    }
+	    @MainActor
+	    private func setActiveSelection(_ id: String?, source: SessionSource? = nil, userInitiated: Bool) {
+	        selectionTrace("setActiveSelection id=\(id ?? "nil") source=\(source?.rawValue ?? "nil") userInitiated=\(userInitiated)")
+	        if userInitiated {
+	            hasUserManuallySelected = true
+	        }
+	        selection = id
 
-    private func scheduleTableSelectionUpdate(_ desired: Set<String>) {
-        if let pending = pendingTableSelection {
-            guard pending != desired else { return }
-        } else if tableSelection == desired {
-            return
-        }
-        programmaticSelectionUpdate = true
-        pendingTableSelection = desired
-        DispatchQueue.main.async {
-            if let pending = pendingTableSelection {
-                if tableSelection != pending {
-                    tableSelection = pending
-                } else if programmaticSelectionUpdate {
-                    programmaticSelectionUpdate = false
-                }
-                pendingTableSelection = nil
-            }
-        }
-    }
+	        guard let id else { return }
+
+	        if let source {
+	            selectionSource = source
+	            lastSelectedSource = source
+	            return
+	        }
+
+	        if let row = cachedRows.first(where: { $0.id == id }) {
+	            selectionSource = row.source
+	            lastSelectedSource = row.source
+	        }
+	    }
+
+	    @MainActor
+	    private func ensureDefaultSelectionIfNeeded() {
+	        guard selection == nil, !hasUserManuallySelected else { return }
+	        guard let first = cachedRows.first else { return }
+	        setActiveSelection(first.id, source: first.source, userInitiated: false)
+	    }
+
+	    @MainActor
+	    private func refreshSelectionSourceFromCachedRows() {
+	        guard let id = selection else { return }
+	        guard let row = cachedRows.first(where: { $0.id == id }) else { return }
+	        selectionSource = row.source
+	        lastSelectedSource = row.source
+	        selectionTrace("refreshSelectionSource id=\(id) source=\(row.source.rawValue)")
+	    }
+
+	    private func isLikelyUserInitiatedTableDeselection() -> Bool {
+	        guard let event = NSApp.currentEvent else { return false }
+	        switch event.type {
+	        case .leftMouseDown, .leftMouseUp,
+	             .rightMouseDown, .rightMouseUp,
+	             .otherMouseDown, .otherMouseUp,
+	             .keyDown:
+	            return true
+	        default:
+	            return false
+	        }
+	    }
+
+	    private var selectionTraceEnabled: Bool {
+	        ProcessInfo.processInfo.environment["AGENTSESSIONS_TRACE_SELECTION"] == "1"
+	            || UserDefaults.standard.bool(forKey: "DebugTraceSelection")
+	    }
+
+	    private func selectionTrace(_ message: @autoclosure () -> String) {
+	        #if DEBUG
+	        guard selectionTraceEnabled else { return }
+	        print("🧭[Selection] \(message())")
+	        #endif
+	    }
 
     private func showImagesForSelectedSession(showNoSelectionAlert: Bool) {
         guard let session = selectedSession else {
@@ -1174,13 +1251,14 @@ struct UnifiedSessionsView: View {
         }
     }
 
-    private func handleSelectionChange(_ id: String?) {
-        guard let id, let s = cachedRows.first(where: { $0.id == id }) else {
-            cancelAutoJump()
-            updateFocusedSessionIfNeeded(nil)
-            return
-        }
-        lastSelectedSource = s.source
+	    private func handleSelectionChange(_ id: String?) {
+	        guard let id, let s = cachedRows.first(where: { $0.id == id }) else {
+	            cancelAutoJump()
+	            updateFocusedSessionIfNeeded(nil)
+	            return
+	        }
+	        selectionSource = s.source
+	        lastSelectedSource = s.source
 
         if !searchState.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let immediate = consumeImmediateSelectionJump()
@@ -1231,6 +1309,7 @@ struct UnifiedSessionsView: View {
 
     private func handleWindowWillClose() {
         isWindowKey = false
+        unified.setFocusedSession(nil)
     }
 
     private func updateFocusedSessionIfNeeded(_ session: Session?) {
@@ -1238,9 +1317,9 @@ struct UnifiedSessionsView: View {
         unified.setFocusedSession(session)
     }
 
-    private func updateCachedRows() {
-        let nextRows: [Session]
-        if FeatureFlags.coalesceListResort {
+	    private func updateCachedRows() {
+	        let nextRows: [Session]
+	        if FeatureFlags.coalesceListResort {
             // unified.sessions is already sorted by the view model's descriptor
             nextRows = rows
         } else {
@@ -1252,23 +1331,25 @@ struct UnifiedSessionsView: View {
             !query.isEmpty
             && searchCoordinator.isRunning
             && nextRows.isEmpty
+            && !showActiveSessionsOnly
             && !cachedRows.isEmpty
 
-        if !shouldHoldRowsDuringRunningSearch {
-            cachedRows = nextRows
+	        if !shouldHoldRowsDuringRunningSearch {
+	            cachedRows = nextRows
+	        }
+
+        if let selectedID = selection,
+           !cachedRows.contains(where: { $0.id == selectedID }) {
+            if let first = cachedRows.first {
+                setActiveSelection(first.id, source: first.source, userInitiated: false)
+            } else {
+                setActiveSelection(nil, userInitiated: false)
+            }
         }
 
-        // If current selection disappeared from list, auto-select first row.
-        // Don't clear during transient indexing gaps — the session may reappear momentarily.
-        if let sel = selection,
-           !cachedRows.contains(where: { $0.id == sel }),
-           !unified.isIndexing,
-           !searchCoordinator.isRunning {
-            selection = cachedRows.first?.id
-            let desired: Set<String> = selection.map { [$0] } ?? []
-            scheduleTableSelectionUpdate(desired)
-        }
-    }
+	        ensureDefaultSelectionIfNeeded()
+	        refreshSelectionSourceFromCachedRows()
+	    }
 
     private func scheduleAutoJump(for sessionID: String, immediate: Bool) {
         cancelAutoJump()
@@ -1302,11 +1383,12 @@ struct UnifiedSessionsView: View {
         }
     }
 
-    private func refreshColumnLayout() {
-        columnLayoutID = UUID()
-        updateCachedRows()
-        updateSelectionBridge()
-    }
+	    private func refreshColumnLayout() {
+	        columnLayoutID = UUID()
+	        updateCachedRows()
+	        ensureDefaultSelectionIfNeeded()
+	        refreshSelectionSourceFromCachedRows()
+	    }
 
     private func handleAnalyticsWarmupTap() {
         if showAnalyticsWarmupNotice { return }
@@ -1331,7 +1413,7 @@ struct UnifiedSessionsView: View {
     }
 
     private var shouldShowLaunchOverlay: Bool {
-        unified.sessions.isEmpty && !hasEverHadSessions
+        false
     }
 
     private var launchAnimationView: some View {
@@ -1359,6 +1441,16 @@ struct UnifiedSessionsView: View {
 
     private func cellSource(for session: Session) -> some View {
         let label: String
+        let isSelected = selection == session.id
+        let isSessionActive = session.source == .codex && activeCodexSessions.isActive(session)
+        let rowTextColor: Color = {
+            if isSelected { return .white }
+            return !stripMonochrome ? sourceAccent(session) : .secondary
+        }()
+        let rowDotColor: Color = {
+            if isSelected { return .white.opacity(0.95) }
+            return !stripMonochrome ? sourceAccent(session) : .primary
+        }()
         switch session.source {
         case .codex: label = "Codex"
         case .claude: label = "Claude"
@@ -1371,7 +1463,13 @@ struct UnifiedSessionsView: View {
         return HStack(spacing: 6) {
             Text(label)
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
-                .foregroundStyle(!stripMonochrome ? sourceAccent(session) : .secondary)
+                .foregroundStyle(rowTextColor)
+            if isSessionActive {
+                Circle()
+                    .fill(rowDotColor)
+                    .frame(width: 6, height: 6)
+                    .accessibilityLabel(Text("\(label) active session"))
+            }
             Spacer(minLength: 4)
         }
     }
@@ -1507,6 +1605,11 @@ struct UnifiedSessionsView: View {
         }
     }
 
+    private func isSessionActive(_ session: Session) -> Bool {
+        guard session.source == .codex else { return false }
+        return activeCodexSessions.isActive(session)
+    }
+
 	    private func progressLineText(_ p: SearchCoordinator.Progress) -> String {
 	        switch p.phase {
 	        case .idle:
@@ -1548,17 +1651,14 @@ private struct AgentTabToggle: View {
     @Binding var isOn: Bool
 
     private var activeColor: Color { isMonochrome ? .primary : color }
-    private var dotColor: Color { isOn ? activeColor : activeColor.opacity(0.35) }
-    private var textColor: Color { isOn ? activeColor : .primary }
+    private var textColor: Color {
+        if isOn { return activeColor }
+        return isMonochrome ? .secondary : .primary
+    }
 
     var body: some View {
         Button(action: { isOn.toggle() }) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(dotColor)
-                    .frame(width: UnifiedSessionsStyle.agentDotSize, height: UnifiedSessionsStyle.agentDotSize)
-                Text(title)
-            }
+            Text(title)
             .font(UnifiedSessionsStyle.agentTabFont)
             .foregroundStyle(textColor)
             .padding(.horizontal, 10)
@@ -1575,6 +1675,40 @@ private struct AgentTabToggle: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(Text(title))
+        .accessibilityValue(Text(isOn ? "On" : "Off"))
+    }
+}
+
+private struct ActiveSessionsOnlyToggle: View {
+    @Binding var isOn: Bool
+
+    private let dotSize: CGFloat = 7.8
+
+    private var dotColor: Color {
+        isOn ? UnifiedSessionsStyle.selectionAccent : Color.secondary.opacity(0.5)
+    }
+
+    var body: some View {
+        Button(action: { isOn.toggle() }) {
+            HStack(spacing: 0) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: dotSize, height: dotSize)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(UnifiedSessionsStyle.agentPillFill)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(UnifiedSessionsStyle.agentPillStroke, lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Active sessions only"))
         .accessibilityValue(Text(isOn ? "On" : "Off"))
     }
 }
@@ -1704,35 +1838,37 @@ private struct TranscriptHostView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
     }
-}
+	}
 
-// Session title cell with inline Gemini refresh affordance (hover-only)
-private struct SessionTitleCell: View {
-    let session: Session
-    @ObservedObject var geminiIndexer: GeminiSessionIndexer
-    @State private var hover: Bool = false
+		// Session title cell with inline Gemini refresh affordance (hover-only)
+		private struct SessionTitleCell: View {
+		    let session: Session
+		    @ObservedObject var geminiIndexer: GeminiSessionIndexer
+		    @State private var hover: Bool = false
 
-    var body: some View {
-        ZStack(alignment: .trailing) {
-            Text(session.title)
-                .font(.system(size: 13, weight: .regular, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .background(Color.clear)
-            if session.source == .gemini, geminiIndexer.isPreviewStale(id: session.id) {
-                Button(action: { geminiIndexer.refreshPreview(id: session.id) }) {
-                    Text("Refresh")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                }
-                .buttonStyle(.bordered)
-                .tint(.teal)
-                .opacity(hover ? 1 : 0)
-                .help("Update this session's preview to reflect the latest file contents")
-            }
-        }
-        .onHover { hover = $0 }
-    }
-}
+	    var body: some View {
+	        HStack(spacing: 8) {
+	            Text(session.title)
+	                .font(.system(size: 13, weight: .regular, design: .monospaced))
+	                .lineLimit(1)
+	                .truncationMode(.tail)
+	                .background(Color.clear)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+	            if session.source == .gemini, geminiIndexer.isPreviewStale(id: session.id) {
+	                Button(action: { geminiIndexer.refreshPreview(id: session.id) }) {
+	                    Text("Refresh")
+	                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+	                }
+	                .buttonStyle(.bordered)
+	                .tint(.teal)
+	                .opacity(hover ? 1 : 0)
+	                .help("Update this session's preview to reflect the latest file contents")
+	            }
+	        }
+	        .onHover { hover = $0 }
+	    }
+	}
 
 // Stable cell to prevent Table reuse glitches in Project column
 private struct ProjectCellView: View {

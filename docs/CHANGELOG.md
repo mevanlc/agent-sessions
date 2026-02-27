@@ -4,19 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Cockpit: Added a Cockpit window for active Codex sessions with iTerm2 focus, plus active-session indicators in the Unified sessions list.
+- Sessions (Unified): Added a small active-status dot in the `CLI Agent` column for live Codex sessions.
+- Sessions (Unified): Added a blue-dot toolbar filter toggle (dot-only control) before the agent toggles to show only active sessions in the list.
+
 ### Fixed
+- Claude usage probe: Login-shell path and `PATH` resolution now strips injected OSC escape sequences (for example from iTerm2 shell integration), respects custom Claude binary overrides, and hardens tmux startup/trust-prompt handling to avoid false `tmux_not_found` and premature probe failures.
+- Cockpit/Sessions (Unified): Active Codex sessions are now joined by Codex internal `session_id` when log-path metadata is unavailable, restoring active indicators and Focus-in-iTerm2 availability.
+- Sessions (Unified): `Active-only` filtering now immediately applies during in-flight searches and re-seats selection when the previously selected row drops out of the filtered list.
+- Sessions (Unified): Agent toolbar filter pills now show a clear enabled/disabled state in monochrome mode.
+
+### Changed
+- Preferences (Unified Window): Reordered sections so `Columns` and `Filters` appear before `Rich Transcript`.
+- Preferences (OpenClaw): Moved `Include deleted OpenClaw sessions` from Advanced to the OpenClaw pane as a standalone checkbox.
+- Sessions (Unified): Removed the leading dot from agent pill toggles in the main toolbar.
+
+## [2.12] - 2026-02-24
+
+### Fixed
+- Onboarding (updates): Auto-onboarding is now suppressed for upgrades from `2.11.x` to `2.12`; update onboarding continues for users upgrading from older major/minor versions.
+- Codex usage tracking: JSONL backward scans now continue extracting token-usage fields while searching for the preferred `codex` rate-limit stream, preventing stale token values when newer non-codex limit buckets are present.
+- Sessions (OpenClaw): Tool format scanning now recognizes underscore/case variants for tool-call and tool-result blocks, and `is_error` tool-result flags are now classified as errors in transcript events.
+- Transcript (Session view): Code-fence opening detection now requires line-start fences, preventing inline triple-backtick snippets from consuming later fenced blocks and misclassifying narrative text as code.
+- Transcript (Session view): Codex review-card parsing now skips malformed fenced JSON candidates and continues scanning later candidates, so one invalid payload block no longer suppresses a valid review summary.
+- Transcript (Session view): `path:line:column` file references now preserve their column target when linkified, avoiding overlap with `path:line` parsing that could drop column navigation.
+- Transcript (Session view): Opening file links in Cursor/VS Code no longer blocks transcript interaction while the editor CLI starts; CLI launches now run asynchronously with fallback behavior preserved.
+- Transcript (Session view): Multiple Cursor/VS Code file-link opens now run concurrently, so slow/unavailable editor CLIs no longer serialize later clicks behind earlier timeout waits.
+- Session view (Unified): Jump-to-latest arrow visibility is now driven by transcript position for every agent/session type, so it appears whenever the viewport is away from the end (including immediately after switching sessions) and no longer depends on active-session refresh paths.
+- Session view (Unified): The floating jump-to-latest control now uses a smaller compact circle and now appears immediately after session selection whenever the transcript is not at the tail (no initial scroll required).
+- Session view (Unified): Clicking the floating jump-to-latest control now hides it immediately after programmatic scroll-to-end, without requiring additional manual up/down scrolling.
+- Session view (Unified/Codex): When new output arrives while reading away from the tail, a floating down-arrow now appears in Session/Text modes to jump to the latest transcript output and resume sticky follow-to-bottom behavior.
+- Sessions (Unified): Key-window resign no longer clears focused session state, preventing missed active-transcript updates after returning to the app/window.
+- Sessions (Unified): Focused active-session monitoring is now capability-driven per source, with one key-window-selected session monitored at high cadence and deterministic stop/start behavior across window/app activation changes.
+- Sessions (Gemini/OpenCode/Copilot/Droid/OpenClaw): Focused-session reloads now use in-flight dedupe, unchanged-file fast-skip, and monitor-safe reload behavior that avoids loading-overlay flicker for already-rendered transcripts.
+- Session view (Unified): Replaced the table-selection bridge with canonical ID-driven selection so transient row churn no longer clears active transcript selection, and transcript host routing now stays pinned to canonical source resolution.
 - Session view (Unified): Active session selection now stays sticky during background refresh/search churn, preventing transient table-selection clears from detaching the transcript pane and showing the empty placeholder while the session still exists.
 - Search fields (Unified global search + transcript Find): `Esc` now clears the active field directly when that field has focus, eliminating the system beep and making clear behavior consistent from the keyboard.
 - Transcript Find (`Esc`): pressing `Esc` with an empty Find field now closes the Find bar again (`Close Find (⎋)`), restoring keyboard-only close behavior.
+- Claude Usage: tmux `/usage` probes now use a larger runtime timeout envelope (derived from script boot timeout) so successful but slower probes no longer fail with premature `Script timed out` (`exitCode 124`) errors.
 - Session view (Unified): table selection synchronization now keeps programmatic updates out of manual-selection handling, preventing auto-selection from being disabled by internal selection coalescing.
 - Session view (Unified): Removed the transient "Selected session is hidden by the current search/filter" notice and its `Show in List` / `Keep Hidden` actions.
 - Session view (Unified): Transcript tail-append now verifies the previous tail event content (not only ID), forcing a full rebuild when a live update rewrites the prior tail event in place.
 - Session view (Unified): Transcript view now rebuilds on `eventCount`, `fileSize`, and `endTime` metadata updates for loaded sessions, so in-place live parsing changes without `events.count` growth no longer leave stale text.
+- Session view (Unified): Transcript rebuild triggering is now keyed off a stable session render signature (`id`, `eventCount`, `events.count`, `fileSize`, `endTime`, `isFavorite`) so same-ID live updates and favorite toggles always re-evaluate rendering.
+- Session view (Unified): Transcript rendering now keeps the last non-empty resolved session snapshot when refresh briefly republishes the same session ID as lightweight/empty, preventing transient blank transcript drops during live refresh.
 - Session view (Unified): Transcript tail-append now writes appended output to the in-view build-key cache, preventing stale transcript regressions when switching modes during live updates.
 - Session view (Unified): Active transcript tail-append updates now keep readiness state in sync with the current build key, so Unified Search auto-jump still triggers after append-only live updates.
 - Session view (Unified): Transcript tail-append now requires render-option parity with the previously rendered buffer, so toggles like `Skip preamble` force a full rebuild instead of appending into stale formatting.
 - Session view (Unified): User-triggered manual refreshes now always show loading feedback for the selected session, even when transcript text is already visible.
 - Session view (Unified): Loading animation now stays visible when the selected session is still loading but the on-screen transcript buffer belongs to a different session, preventing stale-content flashes without feedback.
+- Session view (Unified/Terminal): Loading overlay now remains until the first terminal render completes, preventing brief blank panes and 0/0 navigation states on large sessions.
+- Session view (Unified/Terminal): Transcript toolbar semantic navigation now detects code/diff content inside tool-output blocks, and semantic counter totals no longer collapse to `0/0` from semantic-filter state alone.
+- Session view (Unified/Terminal): Transcript toolbar now hides navigation chips with no matching items (errors/images/code/diffs/reviews), uses compact marker+count chips when labels cannot fit, and on very narrow widths moves extra chips into a chevron overflow menu.
+- Session view (Unified/Terminal): Toolbar fit mode now re-evaluates on width/layout transitions, preventing stale compact/overflow rendering after switching split layouts.
+- Session view (Unified): Removed loading spinners from the transcript UI to avoid spinner-on-empty states while sessions load.
 - Session view (Unified): Async transcript/JSON renders now persist the originating view mode in render state, preventing transcript-tail append from attaching to buffers built for another mode after mode switches.
 - Sessions (Codex/Session view): Active-session transcript updates now append tail content in Session view instead of replacing the full rendered buffer on each monitor refresh, eliminating periodic flicker and preserving in-session reading/navigation context.
 - Sessions (Codex): Focused monitor/background refresh reloads no longer surface loading overlays when transcript content is already visible, avoiding repeated loading flashes during near-live tail updates.
@@ -24,9 +66,12 @@ All notable changes to this project will be documented in this file.
 - Session view (Unified/Session mode): Terminal find/unified-find auto-scroll now runs only for explicit navigation requests (token-driven) so passive live refreshes no longer yank scroll position; canceled JSON rebuild tasks now reliably clear loading state for the active generation.
 - Session view (Unified): Selected transcript content now keeps the last resolved session buffer during transient reindex gaps, and list-side programmatic selection updates are coalesced to avoid table reentrant delegate churn that could leave the transcript pane blank until reselection.
 - Session view (Unified): Table-driven transient empty-selection events (during indexing/list churn) now preserve the active session selection instead of treating them as user deselects, and transcript host source/type now stays pinned to the last resolved selected session to prevent blank placeholder fallbacks.
+- Sessions (Codex/Claude): Active-session transcripts no longer flash empty during periodic auto-refresh when a lightweight pass temporarily replaces fully parsed session data.
 - Stability: Hardened Claude indexing refresh state synchronization (refresh token, file-stat cache, prewarm signatures) and made progress throttling thread-safe to reduce intermittent `EXC_BAD_ACCESS` crashes during concurrent indexing tasks.
 - Usage tracking/menu bar: Codex and Claude polling now continues when usage is visible (including active in-app strip visibility), while inactive/background polling remains tied to that specific agent being shown in the menu bar; Codex menu-background polling also now re-seeds to newer JSONL session files instead of stalling on an older file.
 - Sessions (Codex): Active selected sessions now refresh tails faster (focused-file monitoring with adaptive 5s/15s cadence), and `Refresh Sessions` now forces a full reload of the selected Codex transcript so newest prompts/outputs appear without reselection.
+- Sessions (Claude): Focused selected sessions now use the same focused-file monitor path as Codex, forcing selected-session reloads when the active JSONL changes so live Claude output keeps the transcript pane populated.
+- Sessions (Unified/Codex/Claude): Focused-session monitor cadence is now source-aware (Codex faster than Claude) with distinct active/inactive and AC/battery intervals, and monitor interval policy is now defined for every agent source to simplify future focused-monitor support expansion.
 - Sessions (Codex): Fixed a forced-reload dedupe race for active-session monitoring so follow-up tail reloads are not skipped when JSONL files change during parsing.
 - Startup stability: Hardened launch-time observer/task lifecycle for analytics/onboarding and made updater-controller startup ownership explicit to reduce intermittent launch EXC_BAD_ACCESS crashes.
 - Analytics: Kept the analytics-toggle observer active across main-window close/reopen so menu/shortcut toggles continue working for the full app session.
@@ -40,6 +85,9 @@ All notable changes to this project will be documented in this file.
 - Crash reporting reliability: Seen-ID persistence now happens only after pending clear succeeds; failed/partial clear attempts no longer suppress future crash prompts.
 
 ### Changed
+- Transcript (Session view): Added semantic transcript rendering for plans, code blocks, diffs, and Codex review summaries, including distinct block accents and improved block grouping boundaries.
+- Transcript (Session view): Added clickable local file references (for example `Foo.swift:56`, `Foo.swift#L56`) with configurable editor open behavior (System default, Cursor, VS Code) and optional CLI path override.
+- Preferences (Unified Window): Added Rich Transcript controls for review cards, file linkification, code/diff line numbers, and preferred editor target.
 - Preferences/About: Added a new Diagnostics section for crash reporting with local pending queue controls (`Email Crash Report`, `Export Report`, `Clear Pending`) and a direct support email link.
 - Crash reporting: Crash diagnostics are queued locally on launch and shared only through an explicit pre-filled email draft action; no automatic startup/background upload occurs.
 - Crash reporting UX: Crash capture is always on (toggle removed), and when a new crash report is detected at launch the app now prompts to either `Email Crash Report` or `Export + Open GitHub Issue`.
@@ -51,6 +99,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Preferences/Updates: Added an `Auto-Update` checkbox in Settings → About (next to `Check for Updates...`) and enabled Sparkle auto-update by default for new installs while keeping user opt-out.
+
+### Fixed
+- Cockpit: Active Codex session detection now keeps mixed registry/probe sessions visible, and Focus in iTerm2 is only enabled when iTerm-targetable metadata is present.
 
 ## [2.11.1] - 2026-02-08
 

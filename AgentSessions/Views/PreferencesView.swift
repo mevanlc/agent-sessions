@@ -21,6 +21,9 @@ struct PreferencesView: View {
     @AppStorage(PreferencesKey.codexUsageEnabled) var codexUsageEnabled: Bool = false
     // Codex auto-probe pref (secondary tmux-based /status probe when stale)
     @AppStorage(PreferencesKey.codexAllowStatusProbe) var codexAllowStatusProbe: Bool = false
+    // Cockpit: active-session registry + iTerm focus
+    @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) var codexActiveSessionsEnabled: Bool = true
+    @AppStorage(PreferencesKey.Cockpit.codexActiveRegistryRootOverride) var codexActiveRegistryRootOverride: String = ""
     // Codex probe cleanup prefs
     @AppStorage(PreferencesKey.codexProbeCleanupMode) var codexProbeCleanupMode: String = "none" // none | auto
     @State var showConfirmCodexAutoDelete: Bool = false
@@ -71,6 +74,11 @@ struct PreferencesView: View {
     @AppStorage(PreferencesKey.hideLowMessageSessions) var hideLowMessageSessionsPref: Bool = true
     @AppStorage(PreferencesKey.showHousekeepingSessions) var showHousekeepingSessions: Bool = false
     @AppStorage("InlineSessionImageThumbnailsEnabled") var inlineSessionImageThumbnailsEnabled: Bool = true
+    @AppStorage(PreferencesKey.Transcript.preferredIDETarget) var transcriptPreferredIDETargetRaw: String = IDEOpener.Target.systemDefault.rawValue
+    @AppStorage(PreferencesKey.Transcript.ideBinaryOverridePath) var transcriptIDEBinaryOverridePath: String = ""
+    @AppStorage(PreferencesKey.Transcript.enableReviewCards) var transcriptEnableReviewCards: Bool = true
+    @AppStorage(PreferencesKey.Transcript.enableCodeDiffLineNumbers) var transcriptEnableCodeDiffLineNumbers: Bool = true
+    @AppStorage(PreferencesKey.Transcript.enableLinkification) var transcriptEnableLinkification: Bool = true
     // Per-agent polling intervals
     @AppStorage(PreferencesKey.codexPollingInterval) var codexPollingInterval: Int = 300   // 1/5/15 min options, default 5m
     @AppStorage(PreferencesKey.claudePollingInterval) var claudePollingInterval: Int = 900 // 3/15/30 min options, default 15m
@@ -111,6 +119,8 @@ struct PreferencesView: View {
     @State var resolvedCodexPath: String? = nil
     @State var codexPathDebounce: DispatchWorkItem? = nil
     @State var codexProbeDebounce: DispatchWorkItem? = nil
+    @State var codexActiveRegistryRootValid: Bool = true
+    @State var codexActiveRegistryRootDebounce: DispatchWorkItem? = nil
 
     // Claude CLI probe state (for Resume tab)
     @State var claudeProbeState: ProbeState = .idle
@@ -407,6 +417,7 @@ struct PreferencesView: View {
     func loadCurrentSettings() {
         codexPath = indexer.sessionsRootOverride
         validateCodexPath()
+        validateCodexActiveRegistryRootOverride()
         // Load Claude sessions override from defaults
         let cp = UserDefaults.standard.string(forKey: PreferencesKey.Paths.claudeSessionsRootOverride) ?? ""
         claudePath = cp
@@ -434,6 +445,17 @@ struct PreferencesView: View {
         codexPathValid = FileManager.default.fileExists(atPath: codexPath, isDirectory: &isDir) && isDir.boolValue
     }
 
+    func validateCodexActiveRegistryRootOverride() {
+        guard !codexActiveRegistryRootOverride.isEmpty else {
+            codexActiveRegistryRootValid = true
+            return
+        }
+        let expanded = (codexActiveRegistryRootOverride as NSString).expandingTildeInPath
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir)
+        codexActiveRegistryRootValid = exists && isDir.boolValue
+    }
+
     func commitCodexPathIfValid() {
         guard codexPathValid else { return }
         // Persist and refresh index once
@@ -453,6 +475,33 @@ struct PreferencesView: View {
                 codexPath = url.path
                 validateCodexPath()
                 commitCodexPathIfValid()
+            }
+        }
+    }
+
+    func pickCodexActiveRegistryFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Codex Active Registry Directory"
+        panel.message = "Choose the folder that contains active-session presence JSON files."
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+
+        if !codexActiveRegistryRootOverride.isEmpty {
+            let expanded = (codexActiveRegistryRootOverride as NSString).expandingTildeInPath
+            panel.directoryURL = URL(fileURLWithPath: expanded)
+        } else if let env = ProcessInfo.processInfo.environment["CODEX_HOME"], !env.isEmpty {
+            let expanded = (env as NSString).expandingTildeInPath
+            panel.directoryURL = URL(fileURLWithPath: expanded).appendingPathComponent("active")
+        } else if let homeDir = FileManager.default.homeDirectoryForCurrentUser as URL? {
+            panel.directoryURL = homeDir.appendingPathComponent(".codex/active")
+        }
+
+        panel.begin { response in
+            if response == .OK, let url = panel.url {
+                codexActiveRegistryRootOverride = url.path
+                validateCodexActiveRegistryRootOverride()
             }
         }
     }
