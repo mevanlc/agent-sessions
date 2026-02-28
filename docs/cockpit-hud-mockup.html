@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Agent Cockpit — HUD Mockup</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: 60px 40px;
+  transition: background 0.2s;
+}
+
+/* ── Theme tokens ─────────────────────────────────────────────────────── */
+body.dark {
+  --bg:                #141416;
+  --hud-bg:            rgba(24,24,26,0.97);
+  --header-bg:         rgba(36,36,38,0.98);
+  --footer-bg:         rgba(30,30,32,0.9);
+  --shadow:            0 0 0 0.5px rgba(255,255,255,0.12), 0 0 0 1px rgba(0,0,0,0.6), 0 28px 64px rgba(0,0,0,0.8), 0 8px 20px rgba(0,0,0,0.5);
+  --border:            rgba(255,255,255,0.07);
+  --divider:           rgba(255,255,255,0.04);
+  --row-hover:         rgba(255,255,255,0.04);
+  --row-sel:           rgba(10,132,255,0.11);
+  --search-bg:         rgba(255,255,255,0.05);
+  --search-bd:         rgba(255,255,255,0.09);
+  --search-focus-bd:   rgba(10,132,255,0.5);
+  --search-focus-bg:   rgba(10,132,255,0.04);
+  --search-focus-ring: 0 0 0 2.5px rgba(10,132,255,0.14);
+  --toggle-bg:         rgba(255,255,255,0.04);
+  --toggle-bd:         rgba(255,255,255,0.08);
+  --toggle-on-bg:      rgba(10,132,255,0.14);
+  --toggle-on-bd:      rgba(10,132,255,0.35);
+  --foot-btn-bg:       rgba(255,255,255,0.04);
+  --foot-btn-bd:       rgba(255,255,255,0.07);
+  --tab-bg:            rgba(255,255,255,0.03);
+  --tab-bd:            rgba(255,255,255,0.08);
+  --tab-sep:           rgba(255,255,255,0.06);
+  --text-pri:          #e8e8ed;
+  --text-sec:          #48484a;
+  --text-ter:          #3a3a3c;
+  --text-dim:          #2a2a2c;
+  --rnum:              #2a2a2c;
+  --rnum-hover:        #48484a;
+  --dot-idle:          #2e2e30;
+  --preview-active:    #48484a;
+  --preview-idle:      #242426;
+  --badge-cx-bg:       rgba(94,92,230,0.16); --badge-cx-fg: #8f8df5; --badge-cx-bd: rgba(94,92,230,0.22);
+  --badge-cc-bg:       rgba(255,149,0,0.13);  --badge-cc-fg: #ff9f00; --badge-cc-bd: rgba(255,149,0,0.20);
+  --badge-sh-bg:       rgba(255,255,255,0.04);--badge-sh-fg: #3a3a3c; --badge-sh-bd: rgba(255,255,255,0.07);
+  --chip-idle-bg:      rgba(255,255,255,0.05);--chip-idle-fg: #48484a;
+  --chip-active-bg:    rgba(48,209,88,0.12);  --chip-active-fg: #30d158;
+  --chip-off-bg:       rgba(255,255,255,0.03);--chip-off-fg: #2e2e30;
+  --grp-name:          #48484a;
+  --grp-badge-bg:      rgba(255,255,255,0.04);--grp-badge-fg: #3a3a3c;
+  --grp-badge-g-bg:    rgba(48,209,88,0.10);  --grp-badge-g-fg: #30d158;
+  --grp-rule:          rgba(255,255,255,0.04);
+  --kbd-bg:            rgba(255,255,255,0.03); --kbd-bd: rgba(255,255,255,0.06); --kbd-fg: #242426;
+  --kbd-h-bg:          rgba(255,255,255,0.06); --kbd-h-bd: rgba(255,255,255,0.10); --kbd-h-fg: #48484a;
+  --accent:            #0a84ff; --accent-text: #4fa8f5;
+  --green:             #30d158;
+  --idle-op:           0.55;
+  --mode-bg:           rgba(255,255,255,0.07); --mode-bd: rgba(255,255,255,0.10); --mode-fg: #636366;
+  --sbranch-color:     #3a3a3c;
+}
+
+body.light {
+  --bg:                #dde0e6;
+  --hud-bg:            rgba(255,255,255,0.98);
+  --header-bg:         rgba(246,246,248,0.99);
+  --footer-bg:         rgba(242,242,244,0.97);
+  --shadow:            0 0 0 0.5px rgba(0,0,0,0.12), 0 20px 56px rgba(0,0,0,0.16), 0 4px 14px rgba(0,0,0,0.08);
+  --border:            rgba(0,0,0,0.08);
+  --divider:           rgba(0,0,0,0.06);
+  --row-hover:         rgba(0,0,0,0.03);
+  --row-sel:           rgba(0,113,227,0.07);
+  --search-bg:         rgba(0,0,0,0.05);
+  --search-bd:         rgba(0,0,0,0.10);
+  --search-focus-bd:   rgba(0,113,227,0.5);
+  --search-focus-bg:   rgba(0,113,227,0.03);
+  --search-focus-ring: 0 0 0 2.5px rgba(0,113,227,0.11);
+  --toggle-bg:         rgba(0,0,0,0.04);
+  --toggle-bd:         rgba(0,0,0,0.09);
+  --toggle-on-bg:      rgba(0,113,227,0.10);
+  --toggle-on-bd:      rgba(0,113,227,0.30);
+  --foot-btn-bg:       rgba(0,0,0,0.04);
+  --foot-btn-bd:       rgba(0,0,0,0.09);
+  --tab-bg:            rgba(0,0,0,0.02);
+  --tab-bd:            rgba(0,0,0,0.10);
+  --tab-sep:           rgba(0,0,0,0.07);
+  --text-pri:          #1d1d1f;
+  --text-sec:          #6e6e73;
+  --text-ter:          #8e8e93;
+  --text-dim:          #aeaeb2;
+  --rnum:              #c7c7cc;
+  --rnum-hover:        #8e8e93;
+  --dot-idle:          #c7c7cc;
+  --preview-active:    #6e6e73;
+  --preview-idle:      #aeaeb2;
+  --badge-cx-bg:       rgba(94,92,230,0.09); --badge-cx-fg: #5856d6; --badge-cx-bd: rgba(94,92,230,0.16);
+  --badge-cc-bg:       rgba(255,149,0,0.09);  --badge-cc-fg: #c47700; --badge-cc-bd: rgba(255,149,0,0.16);
+  --badge-sh-bg:       rgba(0,0,0,0.05);      --badge-sh-fg: #8e8e93; --badge-sh-bd: rgba(0,0,0,0.10);
+  --chip-idle-bg:      rgba(0,0,0,0.05);      --chip-idle-fg: #8e8e93;
+  --chip-active-bg:    rgba(26,158,63,0.10);  --chip-active-fg: #1a8e3f;
+  --chip-off-bg:       rgba(0,0,0,0.03);      --chip-off-fg: #c7c7cc;
+  --grp-name:          #8e8e93;
+  --grp-badge-bg:      rgba(0,0,0,0.05);      --grp-badge-fg: #aeaeb2;
+  --grp-badge-g-bg:    rgba(26,158,63,0.09);  --grp-badge-g-fg: #1a8e3f;
+  --grp-rule:          rgba(0,0,0,0.07);
+  --kbd-bg:            rgba(0,0,0,0.04); --kbd-bd: rgba(0,0,0,0.09); --kbd-fg: #c7c7cc;
+  --kbd-h-bg:          rgba(0,0,0,0.06); --kbd-h-bd: rgba(0,0,0,0.12); --kbd-h-fg: #8e8e93;
+  --accent:            #0071e3; --accent-text: #0071e3;
+  --green:             #1a8e3f;
+  --idle-op:           0.60;
+  --mode-bg:           rgba(0,0,0,0.06); --mode-bd: rgba(0,0,0,0.10); --mode-fg: #8e8e93;
+  --sbranch-color:     #aeaeb2;
+}
+
+/* ── Stage ────────────────────────────────────────────────────────────── */
+.stage { display: flex; flex-direction: column; align-items: center; gap: 22px; }
+
+/* ── Controls row ─────────────────────────────────────────────────────── */
+.ctrl-row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; justify-content: center; }
+
+.mode-btn {
+  padding: 5px 14px; border-radius: 7px;
+  font-size: 11px; font-weight: 600; cursor: pointer;
+  border: 0.5px solid var(--mode-bd);
+  background: var(--mode-bg); color: var(--mode-fg);
+  transition: all 0.15s; letter-spacing: 0.02em;
+}
+.mode-btn.on { background: var(--accent); color: #fff; border-color: transparent; }
+
+.state-tabs {
+  display: flex; border: 0.5px solid var(--tab-bd); border-radius: 7px;
+  overflow: hidden; background: var(--tab-bg);
+}
+.stab {
+  padding: 5px 15px; font-size: 11px; font-weight: 500; color: var(--text-sec);
+  cursor: pointer; border-right: 0.5px solid var(--tab-sep); transition: all 0.15s;
+}
+.stab:last-child { border-right: none; }
+.stab:hover { color: var(--text-pri); }
+.stab.on { color: var(--accent-text); }
+body.dark  .stab.on { background: rgba(10,132,255,0.15); }
+body.light .stab.on { background: rgba(0,113,227,0.09); }
+
+/* ── HUD ──────────────────────────────────────────────────────────────── */
+.hud {
+  width: 644px; border-radius: 12px; overflow: hidden;
+  background: var(--hud-bg);
+  backdrop-filter: blur(40px) saturate(1.8); -webkit-backdrop-filter: blur(40px) saturate(1.8);
+  box-shadow: var(--shadow);
+  display: flex; flex-direction: column; user-select: none;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+
+/* ── Header ───────────────────────────────────────────────────────────── */
+.hud-header {
+  background: var(--header-bg); border-bottom: 0.5px solid var(--border);
+  padding: 10px 14px; display: flex; flex-direction: column; gap: 8px;
+}
+.hud-topbar { display: flex; align-items: center; gap: 10px; }
+.hud-title {
+  font-size: 12px; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--text-sec); white-space: nowrap;
+}
+
+/* ── Count chips (interactive filters) ───────────────────────────────── */
+.chips { display: flex; gap: 5px; align-items: center; flex: 1; }
+.chip {
+  display: flex; align-items: center; gap: 4px;
+  padding: 2px 9px; border-radius: 20px;
+  font-size: 11px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s;
+  border: 0.5px solid transparent;
+}
+.chip.active-chip { background: var(--chip-active-bg); color: var(--chip-active-fg); }
+.chip.idle-chip   { background: var(--chip-idle-bg);   color: var(--chip-idle-fg); }
+.chip.off         { background: var(--chip-off-bg);    color: var(--chip-off-fg); opacity: 0.6; }
+.chip:hover       { filter: brightness(1.1); }
+.chip .cdot { width: 5px; height: 5px; border-radius: 50%; }
+.chip.active-chip .cdot { background: var(--green); animation: pulse 1.4s ease-in-out infinite; }
+.chip.idle-chip   .cdot { background: var(--dot-idle); }
+.chip.off         .cdot { background: var(--chip-off-fg); animation: none; }
+
+/* ── Filter bar ───────────────────────────────────────────────────────── */
+.filter-bar { display: flex; align-items: center; gap: 8px; }
+.search {
+  flex: 1; display: flex; align-items: center;
+  background: var(--search-bg); border: 0.5px solid var(--search-bd);
+  border-radius: 7px; padding: 5px 10px; gap: 6px;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.search.focused {
+  border-color: var(--search-focus-bd);
+  box-shadow: var(--search-focus-ring);
+  background: var(--search-focus-bg);
+}
+.search-icon { font-size: 12px; color: var(--text-ter); flex-shrink: 0; transition: color 0.15s; }
+.search.focused .search-icon { color: var(--accent); }
+.search input {
+  background: none; border: none; outline: none;
+  font-size: 12.5px; color: var(--text-pri); font-family: inherit; width: 100%;
+}
+.search input::placeholder { color: var(--text-ter); opacity: 0.6; }
+.kbd {
+  font-size: 9.5px; color: var(--text-ter);
+  background: var(--kbd-bg); border: 0.5px solid var(--kbd-bd);
+  border-radius: 3px; padding: 1px 5px;
+  font-family: "SF Mono", monospace; white-space: nowrap; flex-shrink: 0;
+}
+
+.proj-toggle {
+  display: flex; align-items: center; gap: 5px;
+  padding: 5px 11px; border-radius: 7px;
+  background: var(--toggle-bg); border: 0.5px solid var(--toggle-bd);
+  cursor: pointer; transition: all 0.15s; flex-shrink: 0;
+}
+.proj-toggle:hover { filter: brightness(0.95); }
+.proj-toggle.on { background: var(--toggle-on-bg); border-color: var(--toggle-on-bd); }
+.proj-toggle span { font-size: 11px; font-weight: 600; color: var(--text-ter); }
+.proj-toggle .icon { font-size: 11px; }
+.proj-toggle.on span, .proj-toggle.on .icon { color: var(--accent); }
+
+/* ── Body ─────────────────────────────────────────────────────────────── */
+.hud-body { overflow-y: auto; max-height: 380px; }
+.hud-body::-webkit-scrollbar { width: 3px; }
+.hud-body::-webkit-scrollbar-thumb { background: var(--divider); border-radius: 2px; }
+
+/* Group header */
+.grp-hdr {
+  display: flex; align-items: center;
+  padding: 7px 14px 3px; gap: 8px; cursor: pointer;
+}
+.grp-hdr:hover .grp-name { color: var(--text-pri); }
+.grp-name { font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--grp-name); transition: color 0.1s; }
+.grp-badge { font-size: 9.5px; font-weight: 600; padding: 1px 7px; border-radius: 8px; background: var(--grp-badge-bg); color: var(--grp-badge-fg); }
+.grp-badge.g { background: var(--grp-badge-g-bg); color: var(--grp-badge-g-fg); }
+.grp-rule { flex: 1; height: 0.5px; background: var(--grp-rule); }
+.grp-chevron { font-size: 8px; color: var(--text-ter); transition: transform 0.15s; }
+.grp-hdr.collapsed .grp-chevron { transform: rotate(-90deg); }
+
+/* Session row */
+.srow {
+  display: grid;
+  grid-template-columns: 22px 9px auto 120px 110px 1fr auto 56px;
+  align-items: center;
+  padding: 6px 14px; gap: 9px;
+  border-bottom: 0.5px solid var(--divider);
+  cursor: pointer; transition: background 0.1s;
+}
+.srow:last-child { border-bottom: none; }
+.srow:hover { background: var(--row-hover); }
+.srow.sel { background: var(--row-sel); }
+.srow.grouped { padding-left: 26px; }
+.srow.idle-row { opacity: var(--idle-op); }
+/* highlight matched text */
+.srow mark { background: none; font-weight: 700; color: var(--accent-text); }
+
+.flat-div { height: 0.5px; background: var(--divider); margin: 3px 0; }
+
+/* Cells */
+.rnum { font-size: 9.5px; font-weight: 700; color: var(--rnum); font-family: "SF Mono", monospace; text-align: center; transition: color 0.1s; }
+.srow:hover .rnum { color: var(--rnum-hover); }
+.srow.sel   .rnum { color: var(--accent); }
+
+.sdot { width: 7px; height: 7px; border-radius: 50%; justify-self: center; flex-shrink: 0; }
+.sdot.active { background: var(--green); animation: pulse 1.4s ease-in-out infinite; }
+.sdot.idle   { background: var(--dot-idle); }
+
+.badge {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.04em;
+  padding: 1.5px 5px; border-radius: 4px; flex-shrink: 0;
+  font-family: "SF Mono", monospace; white-space: nowrap;
+}
+.cx { background: var(--badge-cx-bg); color: var(--badge-cx-fg); border: 0.5px solid var(--badge-cx-bd); }
+.cc { background: var(--badge-cc-bg); color: var(--badge-cc-fg); border: 0.5px solid var(--badge-cc-bd); }
+.sh { background: var(--badge-sh-bg); color: var(--badge-sh-fg); border: 0.5px solid var(--badge-sh-bd); }
+
+.sname { font-size: 12.5px; font-weight: 600; color: var(--text-pri); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sbranch { font-size: 10.5px; color: var(--sbranch-color); font-family: "SF Mono", monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spreview { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spreview.a { color: var(--preview-active); }
+.spreview.i { color: var(--preview-idle); }
+.stime { font-size: 10.5px; color: var(--text-ter); font-family: "SF Mono", monospace; white-space: nowrap; text-align: right; }
+.skbd {
+  font-size: 9.5px; font-weight: 700; font-family: "SF Mono", monospace;
+  color: var(--kbd-fg); background: var(--kbd-bg); border: 0.5px solid var(--kbd-bd);
+  border-radius: 4px; padding: 2px 6px; white-space: nowrap; text-align: center;
+  transition: all 0.1s;
+}
+.srow:hover .skbd { color: var(--kbd-h-fg); border-color: var(--kbd-h-bd); background: var(--kbd-h-bg); }
+.srow.sel   .skbd { color: var(--accent); border-color: rgba(10,132,255,0.28); }
+body.light .srow.sel .skbd { border-color: rgba(0,113,227,0.22); }
+
+/* ── Footer ───────────────────────────────────────────────────────────── */
+.hud-footer {
+  border-top: 0.5px solid var(--border); background: var(--footer-bg);
+  display: flex; align-items: center; padding: 6px 14px; gap: 10px;
+}
+.foot-btn {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 500; color: var(--text-ter);
+  background: var(--foot-btn-bg); border: 0.5px solid var(--foot-btn-bd);
+  border-radius: 6px; padding: 3px 10px; cursor: pointer; transition: all 0.12s;
+}
+.foot-btn:hover { color: var(--text-pri); }
+.foot-spacer { flex: 1; }
+.freshness { font-size: 10px; color: var(--text-dim); font-family: "SF Mono", monospace; }
+
+/* ── Pulse ────────────────────────────────────────────────────────────── */
+@keyframes pulse {
+  0%,100% { opacity:1; transform:scale(1);    box-shadow:0 0 0 0   rgba(48,209,88,0.4); }
+  50%      { opacity:.8; transform:scale(1.35); box-shadow:0 0 0 4px rgba(48,209,88,0);   }
+}
+</style>
+</head>
+<body class="dark">
+
+<div class="stage">
+
+  <!-- Controls -->
+  <div class="ctrl-row">
+    <div class="mode-btn on"  id="btnDark"  onclick="setMode('dark')">● Dark</div>
+    <div class="mode-btn"     id="btnLight" onclick="setMode('light')">○ Light</div>
+
+    <div class="state-tabs">
+      <div class="stab on"  data-state="default">Default</div>
+      <div class="stab"     data-state="filter">Filtering</div>
+      <div class="stab"     data-state="grouped">By Project</div>
+    </div>
+  </div>
+
+  <!-- HUD -->
+  <div class="hud">
+
+    <!-- Header -->
+    <div class="hud-header">
+      <div class="hud-topbar">
+        <div class="hud-title">Agent Cockpit</div>
+        <div class="chips">
+          <!-- Chips are interactive filters -->
+          <div class="chip active-chip" id="chipActive" onclick="toggleChip('active')">
+            <div class="cdot"></div><span id="chipActiveLabel">3 active</span>
+          </div>
+          <div class="chip idle-chip" id="chipIdle" onclick="toggleChip('idle')">
+            <div class="cdot"></div><span id="chipIdleLabel">2 idle</span>
+          </div>
+        </div>
+      </div>
+      <div class="filter-bar">
+        <div class="search" id="searchBox">
+          <span class="search-icon">⌕</span>
+          <input id="filterInput" placeholder="Filter sessions…" spellcheck="false">
+          <span class="kbd" id="escHint" style="display:none;">esc</span>
+          <span class="kbd">⌘K</span>
+        </div>
+        <div class="proj-toggle" id="projToggle" onclick="toggleGroup()">
+          <span class="icon">⊞</span>
+          <span>By Project</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Body -->
+    <div class="hud-body">
+
+      <!-- DEFAULT / FLAT VIEW -->
+      <div id="viewDefault">
+
+        <!-- Active -->
+        <div class="srow" tabindex="0" data-state-type="active">
+          <span class="rnum">1</span><div class="sdot active"></div>
+          <span class="badge cx">Codex</span>
+          <span class="sname">storefront</span>
+          <span class="sbranch">feat/cart-v2</span>
+          <span class="spreview a">Refactoring checkout flow, extracting PaymentStep…</span>
+          <span class="stime">12m</span><span class="skbd">⌘1</span>
+        </div>
+        <div class="srow" tabindex="0" data-state-type="active">
+          <span class="rnum">2</span><div class="sdot active"></div>
+          <span class="badge cx">Codex</span>
+          <span class="sname">my-api</span>
+          <span class="sbranch">fix/rate-limit</span>
+          <span class="spreview a">Running test suite — 44 / 120 passed…</span>
+          <span class="stime">3m</span><span class="skbd">⌘2</span>
+        </div>
+        <div class="srow" tabindex="0" data-state-type="active">
+          <span class="rnum">3</span><div class="sdot active"></div>
+          <span class="badge cc">Claude</span>
+          <span class="sname">design-sys</span>
+          <span class="sbranch">main</span>
+          <span class="spreview a">Updating token exports, writing tokens/spacing.ts…</span>
+          <span class="stime">8m</span><span class="skbd">⌘3</span>
+        </div>
+
+        <div class="flat-div"></div>
+
+        <!-- Idle -->
+        <div class="srow idle-row" tabindex="0" data-state-type="idle">
+          <span class="rnum">4</span><div class="sdot idle"></div>
+          <span class="badge cx">Codex</span>
+          <span class="sname">mobile-app</span>
+          <span class="sbranch">feat/onboarding</span>
+          <span class="spreview i">Last active 47 minutes ago</span>
+          <span class="stime">47m</span><span class="skbd">⌘4</span>
+        </div>
+        <div class="srow idle-row" tabindex="0" data-state-type="idle">
+          <span class="rnum">5</span><div class="sdot idle"></div>
+          <span class="badge sh">Shell</span>
+          <span class="sname">infra-mono</span>
+          <span class="sbranch">main</span>
+          <span class="spreview i">Last active 2 hours ago</span>
+          <span class="stime">2h</span><span class="skbd">⌘5</span>
+        </div>
+
+      </div>
+
+      <!-- FILTER VIEW -->
+      <div id="viewFilter" style="display:none;">
+        <div class="srow sel" tabindex="0">
+          <span class="rnum" style="color:var(--accent);">1</span><div class="sdot active"></div>
+          <span class="badge cx">Codex</span>
+          <span class="sname"><mark>my</mark>-<mark>api</mark></span>
+          <span class="sbranch">fix/rate-limit</span>
+          <span class="spreview a">Running test suite — 44 / 120 passed…</span>
+          <span class="stime">3m</span>
+          <span class="skbd" style="color:var(--accent);">↩</span>
+        </div>
+      </div>
+
+      <!-- GROUPED VIEW -->
+      <div id="viewGrouped" style="display:none;">
+
+        <div class="grp-hdr" tabindex="0">
+          <span class="grp-name">my-api</span>
+          <span class="grp-badge g">1 active · 1 idle</span>
+          <div class="grp-rule"></div>
+          <span class="grp-chevron">▾</span>
+        </div>
+        <div class="srow grouped" tabindex="0">
+          <span class="rnum">1</span><div class="sdot active"></div>
+          <span class="badge cx">Codex</span>
+          <span class="sname">fix/rate-limit</span><span class="sbranch"></span>
+          <span class="spreview a">Running test suite — 44 / 120 passed…</span>
+          <span class="stime">3m</span><span class="skbd">⌘1</span>
+        </div>
+        <div class="srow grouped idle-row" tabindex="0">
+          <span class="rnum">2</span><div class="sdot idle"></div>
+          <span class="badge cc">Claude</span>
+          <span class="sname">fix/auth-refactor</span><span class="sbranch"></span>
+          <span class="spreview i">Last active 22 minutes ago</span>
+          <span class="stime">22m</span><span class="skbd">⌘2</span>
+        </div>
+
+        <div class="grp-hdr" tabindex="0" style="margin-top:4px;">
+          <span class="grp-name">storefront</span>
+          <span class="grp-badge g">1 active</span>
+          <div class="grp-rule"></div>
+          <span class="grp-chevron">▾</span>
+        </div>
+        <div class="srow grouped" tabindex="0">
+          <span class="rnum">3</span><div class="sdot active"></div>
+          <span class="badge cx">Codex</span>
+          <span class="sname">feat/cart-v2</span><span class="sbranch"></span>
+          <span class="spreview a">Refactoring checkout flow, extracting PaymentStep…</span>
+          <span class="stime">12m</span><span class="skbd">⌘3</span>
+        </div>
+
+        <div class="grp-hdr" tabindex="0" style="margin-top:4px;">
+          <span class="grp-name">design-sys</span>
+          <span class="grp-badge g">1 active</span>
+          <div class="grp-rule"></div>
+          <span class="grp-chevron">▾</span>
+        </div>
+        <div class="srow grouped" tabindex="0">
+          <span class="rnum">4</span><div class="sdot active"></div>
+          <span class="badge cc">Claude</span>
+          <span class="sname">main</span><span class="sbranch"></span>
+          <span class="spreview a">Updating token exports, writing tokens/spacing.ts…</span>
+          <span class="stime">8m</span><span class="skbd">⌘4</span>
+        </div>
+
+        <div class="grp-hdr" tabindex="0" style="margin-top:4px;">
+          <span class="grp-name">infra-mono</span>
+          <span class="grp-badge">1 idle</span>
+          <div class="grp-rule"></div>
+          <span class="grp-chevron">▾</span>
+        </div>
+        <div class="srow grouped idle-row" tabindex="0">
+          <span class="rnum">5</span><div class="sdot idle"></div>
+          <span class="badge sh">Shell</span>
+          <span class="sname">main</span><span class="sbranch"></span>
+          <span class="spreview i">Last active 2 hours ago</span>
+          <span class="stime">2h</span><span class="skbd">⌘5</span>
+        </div>
+
+      </div>
+
+    </div><!-- /hud-body -->
+
+    <!-- Footer -->
+    <div class="hud-footer">
+      <div class="foot-btn">⊟ Full window</div>
+      <div class="foot-spacer"></div>
+      <div class="freshness" id="freshness">just now</div>
+    </div>
+
+  </div><!-- /hud -->
+
+  <!-- Chip filter note -->
+  <div style="font-size:10px; color: var(--text-ter); letter-spacing:0.03em; opacity:0.7;">
+    Tap a chip to filter · Tap again to clear
+  </div>
+
+</div><!-- /stage -->
+
+<script>
+  let mode       = 'dark';
+  let state      = 'default';
+  let grouped    = false;
+  let chipFilter = null;  // null | 'active' | 'idle'
+
+  const views = {
+    default: document.getElementById('viewDefault'),
+    filter:  document.getElementById('viewFilter'),
+    grouped: document.getElementById('viewGrouped'),
+  };
+
+  // ── Mode ────────────────────────────────────────────────────────────────
+  function setMode(m) {
+    mode = m;
+    document.body.className = m;
+    document.getElementById('btnDark').classList.toggle('on',  m === 'dark');
+    document.getElementById('btnLight').classList.toggle('on', m === 'light');
+  }
+
+  // ── State ───────────────────────────────────────────────────────────────
+  function setState(s) {
+    state = s;
+    document.querySelectorAll('.stab').forEach(t => t.classList.toggle('on', t.dataset.state === s));
+    Object.entries(views).forEach(([k, el]) => el.style.display = k === s ? 'block' : 'none');
+
+    const fi = document.getElementById('filterInput');
+    const sb = document.getElementById('searchBox');
+    const eh = document.getElementById('escHint');
+
+    if (s === 'filter') {
+      fi.value = 'my-api'; sb.classList.add('focused'); eh.style.display = 'inline'; fi.focus();
+    } else {
+      fi.value = ''; sb.classList.remove('focused'); eh.style.display = 'none';
+    }
+
+    if (s === 'grouped') { grouped = true;  document.getElementById('projToggle').classList.add('on'); }
+    if (s === 'default') { grouped = false; document.getElementById('projToggle').classList.remove('on'); }
+  }
+
+  document.querySelectorAll('.stab').forEach(t => t.addEventListener('click', () => setState(t.dataset.state)));
+
+  // ── Grouping ────────────────────────────────────────────────────────────
+  function toggleGroup() {
+    grouped = !grouped;
+    document.getElementById('projToggle').classList.toggle('on', grouped);
+    setState(grouped ? 'grouped' : 'default');
+  }
+
+  // ── Chip filter ─────────────────────────────────────────────────────────
+  function toggleChip(type) {
+    // Only works in default/grouped view
+    if (state === 'filter') return;
+    chipFilter = chipFilter === type ? null : type;
+    applyChipFilter();
+  }
+
+  function applyChipFilter() {
+    const ca = document.getElementById('chipActive');
+    const ci = document.getElementById('chipIdle');
+
+    if (chipFilter === 'active') {
+      ca.classList.remove('off');
+      ci.classList.add('off');
+    } else if (chipFilter === 'idle') {
+      ci.classList.remove('off');
+      ca.classList.add('off');
+    } else {
+      ca.classList.remove('off');
+      ci.classList.remove('off');
+    }
+
+    // Show/hide rows based on filter
+    const allRows = document.querySelectorAll('.srow[data-state-type]');
+    let visibleIdx = 1;
+    allRows.forEach(row => {
+      const rowType = row.dataset.stateType;
+      const visible = !chipFilter || rowType === chipFilter;
+      row.style.display = visible ? '' : 'none';
+      if (visible) {
+        row.querySelector('.rnum').textContent = visibleIdx++;
+      }
+    });
+
+    // Show/hide the flat divider
+    const div = document.querySelector('#viewDefault .flat-div');
+    if (div) div.style.display = chipFilter ? 'none' : '';
+  }
+
+  // ── Search field ────────────────────────────────────────────────────────
+  const fi = document.getElementById('filterInput');
+  const sb = document.getElementById('searchBox');
+  const eh = document.getElementById('escHint');
+
+  fi.addEventListener('focus', () => sb.classList.add('focused'));
+  fi.addEventListener('blur',  () => { if (!fi.value) sb.classList.remove('focused'); });
+  fi.addEventListener('input', () => {
+    eh.style.display = fi.value ? 'inline' : 'none';
+    if (fi.value && state !== 'filter') { setState('filter'); fi.focus(); }
+    else if (!fi.value) setState(grouped ? 'grouped' : 'default');
+  });
+  fi.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { fi.value = ''; setState(grouped ? 'grouped' : 'default'); }
+  });
+
+  // ── Collapsible group headers ────────────────────────────────────────────
+  document.querySelectorAll('.grp-hdr').forEach(hdr => {
+    hdr.addEventListener('click', () => {
+      hdr.classList.toggle('collapsed');
+      let next = hdr.nextElementSibling;
+      while (next && next.classList.contains('srow')) {
+        next.style.display = hdr.classList.contains('collapsed') ? 'none' : '';
+        next = next.nextElementSibling;
+      }
+    });
+  });
+
+  // ── Freshness ticker ─────────────────────────────────────────────────────
+  let secs = 0;
+  const freshEl = document.getElementById('freshness');
+  setInterval(() => {
+    secs++;
+    freshEl.textContent = secs < 5 ? 'just now' : secs < 60 ? `${secs}s ago` : `${Math.floor(secs/60)}m ago`;
+  }, 1000);
+
+  setState('default');
+</script>
+</body>
+</html>

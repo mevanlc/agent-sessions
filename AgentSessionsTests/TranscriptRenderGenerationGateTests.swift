@@ -85,6 +85,75 @@ final class UnifiedTableSelectionPolicyTests: XCTestCase {
     }
 }
 
+final class UnifiedRowsStabilityPolicyTests: XCTestCase {
+    func testHoldsRowsDuringRunningSearchWhenResultsTransientlyEmpty() {
+        XCTAssertTrue(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringRunningSearch(
+                isSearchRunning: true,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false
+            )
+        )
+    }
+
+    func testDoesNotHoldRowsDuringRunningSearchWhenCacheIsEmpty() {
+        XCTAssertFalse(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringRunningSearch(
+                isSearchRunning: true,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: true
+            )
+        )
+    }
+
+    func testHoldsRowsDuringTransientBusyRefreshWhenSelectionExists() {
+        XCTAssertTrue(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+                query: "",
+                isSearchRunning: false,
+                isDatasetChurning: true,
+                isIndexing: false,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false,
+                hasSelection: true
+            )
+        )
+    }
+
+    func testHoldsRowsDuringIndexingWhenSelectionExists() {
+        XCTAssertTrue(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+                query: "",
+                isSearchRunning: false,
+                isDatasetChurning: false,
+                isIndexing: true,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false,
+                hasSelection: true
+            )
+        )
+    }
+
+    func testDoesNotHoldRowsForStableTrueEmptyDataset() {
+        XCTAssertFalse(
+            UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+                query: "",
+                isSearchRunning: false,
+                isDatasetChurning: false,
+                isIndexing: false,
+                nextRowsEmpty: true,
+                showActiveSessionsOnly: false,
+                cachedRowsEmpty: false,
+                hasSelection: true
+            )
+        )
+    }
+}
+
 final class TranscriptSessionRenderKeyTests: XCTestCase {
     func testRenderKeyChangesWhenEventCountChanges() {
         let base = makeSession(eventCount: 10, events: [makeEvent(id: "e1")], isFavorite: false)
@@ -168,7 +237,7 @@ final class TranscriptSessionResolutionPolicyTests: XCTestCase {
     }
 
     func testPrefersLiveEmptyWhenNotLoading() {
-        let live = makeSession(id: "session-1", events: [])
+        let live = makeSession(id: "session-1", events: [], eventCount: 0, fileSizeBytes: 0)
         let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
 
         let preferred = TranscriptSessionResolutionPolicy.preferredSession(
@@ -184,7 +253,7 @@ final class TranscriptSessionResolutionPolicyTests: XCTestCase {
     }
 
     func testPrefersLiveEmptyWhenDifferentSessionIsLoading() {
-        let live = makeSession(id: "session-1", events: [])
+        let live = makeSession(id: "session-1", events: [], eventCount: 0, fileSizeBytes: 0)
         let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
 
         let preferred = TranscriptSessionResolutionPolicy.preferredSession(
@@ -214,6 +283,22 @@ final class TranscriptSessionResolutionPolicyTests: XCTestCase {
         XCTAssertEqual(preferred?.events.first?.id, "e-live")
     }
 
+    func testPrefersCachedWhenLiveLooksTransientlyLightweightOutsideLoading() {
+        let live = makeSession(id: "session-1", events: [], eventCount: 4)
+        let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
+
+        let preferred = TranscriptSessionResolutionPolicy.preferredSession(
+            live: live,
+            cached: cached,
+            sessionID: "session-1",
+            isLoadingSession: false,
+            loadingSessionID: nil
+        )
+
+        XCTAssertEqual(preferred?.events.count, 1)
+        XCTAssertEqual(preferred?.id, "session-1")
+    }
+
     func testUsesCachedWhenLiveMissing() {
         let cached = makeSession(id: "session-1", events: [makeEvent(id: "e1")])
 
@@ -229,7 +314,10 @@ final class TranscriptSessionResolutionPolicyTests: XCTestCase {
         XCTAssertEqual(preferred?.id, "session-1")
     }
 
-    private func makeSession(id: String, events: [SessionEvent]) -> Session {
+    private func makeSession(id: String,
+                             events: [SessionEvent],
+                             eventCount: Int? = nil,
+                             fileSizeBytes: Int? = 1024) -> Session {
         Session(
             id: id,
             source: .claude,
@@ -237,8 +325,8 @@ final class TranscriptSessionResolutionPolicyTests: XCTestCase {
             endTime: Date(timeIntervalSince1970: 100),
             model: "claude-test",
             filePath: "/tmp/\(id).jsonl",
-            fileSizeBytes: 1024,
-            eventCount: max(events.count, 1),
+            fileSizeBytes: fileSizeBytes,
+            eventCount: eventCount ?? max(events.count, 1),
             events: events
         )
     }

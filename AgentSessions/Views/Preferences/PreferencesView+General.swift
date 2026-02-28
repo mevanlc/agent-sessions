@@ -76,17 +76,65 @@ extension PreferencesView {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            sectionHeader("Git Context")
+            sectionHeader("Live Sessions + Cockpit BETA")
             VStack(alignment: .leading, spacing: 12) {
-                Toggle("Show Git Context button", isOn: Binding(
-                    get: { UserDefaults.standard.bool(forKey: PreferencesKey.Advanced.enableGitInspector) },
-                    set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Advanced.enableGitInspector) }
-                ))
-                .help("Show the Git Context toolbar button in Sessions (⌘⇧G)")
+                Toggle("Enable live session detection + Cockpit (Beta)", isOn: $codexActiveSessionsEnabled)
+                    .help("Beta feature. Tracks live/open Codex and Claude sessions, enables Cockpit live rows, and powers live dots/focus actions in Sessions.")
 
-                Text("Adds a Git Context button to the Sessions toolbar and context menus.")
+                HStack(spacing: 12) {
+                    TextField("Active registry directory (optional)", text: $codexActiveRegistryRootOverride)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 360)
+                        .onSubmit { validateCodexActiveRegistryRootOverride() }
+                        .onChange(of: codexActiveRegistryRootOverride) { _, _ in
+                            validateCodexActiveRegistryRootOverride()
+                            codexActiveRegistryRootDebounce?.cancel()
+                            let work = DispatchWorkItem { validateCodexActiveRegistryRootOverride() }
+                            codexActiveRegistryRootDebounce = work
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+                        }
+                        .help("Override the directory used for active-session presence files. Leave blank to use $CODEX_HOME/active or ~/.codex/active.")
+
+                    Button(action: pickCodexActiveRegistryFolder) {
+                        Label("Choose…", systemImage: "folder")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Browse for a directory containing active-session presence JSON files")
+                }
+
+                if !codexActiveRegistryRootValid {
+                    Label("Path must point to an existing folder", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Text("Status: Beta. Scope in this release: Codex + Claude live/open detection.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Text("Default: $CODEX_HOME/active or ~/.codex/active")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            sectionHeader("Saved Sessions")
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Save also keeps locally", isOn: $starPinsSessions)
+                    .help("When enabled, saving a session also archives its source files into Agent Sessions storage so it cannot disappear when the upstream CLI prunes history.")
+                HStack(spacing: 12) {
+                    Text("Stop syncing after inactivity")
+                    Picker("", selection: $stopSyncAfterInactivityMinutes) {
+                        Text("10 min").tag(10)
+                        Text("30 min").tag(30)
+                        Text("60 min").tag(60)
+                    }
+                    .labelsHidden()
+                    .frame(width: 120)
+                }
+                .help("After a saved session stops changing upstream for this long, Agent Sessions stops syncing the local copy. If it changes later, syncing resumes.")
+                Toggle("Remove from Saved deletes local copy", isOn: $unstarRemovesArchive)
+                    .help("When enabled, removing a session from Saved also deletes the local archive copy. By default, removing from Saved is non-destructive.")
             }
 
             sectionHeader("Search")
@@ -116,23 +164,17 @@ extension PreferencesView {
                     .foregroundStyle(.secondary)
             }
 
-            sectionHeader("Saved Sessions")
+            sectionHeader("Git Context")
             VStack(alignment: .leading, spacing: 12) {
-                Toggle("Save also keeps locally", isOn: $starPinsSessions)
-                    .help("When enabled, saving a session also archives its source files into Agent Sessions storage so it cannot disappear when the upstream CLI prunes history.")
-                HStack(spacing: 12) {
-                    Text("Stop syncing after inactivity")
-                    Picker("", selection: $stopSyncAfterInactivityMinutes) {
-                        Text("10 min").tag(10)
-                        Text("30 min").tag(30)
-                        Text("60 min").tag(60)
-                    }
-                    .labelsHidden()
-                    .frame(width: 120)
-                }
-                .help("After a saved session stops changing upstream for this long, Agent Sessions stops syncing the local copy. If it changes later, syncing resumes.")
-                Toggle("Remove from Saved deletes local copy", isOn: $unstarRemovesArchive)
-                    .help("When enabled, removing a session from Saved also deletes the local archive copy. By default, removing from Saved is non-destructive.")
+                Toggle("Show Git Context button", isOn: Binding(
+                    get: { UserDefaults.standard.bool(forKey: PreferencesKey.Advanced.enableGitInspector) },
+                    set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Advanced.enableGitInspector) }
+                ))
+                .help("Show the Git Context toolbar button in Sessions (⌘⇧G)")
+
+                Text("Adds a Git Context button to the Sessions toolbar and context menus.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

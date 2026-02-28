@@ -6,19 +6,68 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - Cockpit: Added a Cockpit window for active Codex sessions with iTerm2 focus, plus active-session indicators in the Unified sessions list.
+- Sessions (Cockpit/Unified): Live session detection now includes Claude in addition to Codex, with mixed-source live rows in Cockpit and source-aware live filtering in Unified Sessions.
 - Sessions (Unified): Added a small active-status dot in the `CLI Agent` column for live Codex sessions.
 - Sessions (Unified): Added a blue-dot toolbar filter toggle (dot-only control) before the agent toggles to show only active sessions in the list.
+- Sessions (Cockpit/Unified): Codex live-session status now distinguishes `active` (working) from `open` (idle). Active rows use a pulsing dot and open rows use a solid dot.
+- Sessions (Cockpit): Added a live-session filter segmented control with `Both`, `Active`, and `Open`; default is `Both`.
+- Sessions (Unified): Added `CLI Agent` cell double-click terminal focusing in the Sessions list (same focus path as `Focus in iTerm2`), with explicit alert feedback when no focusable live terminal is available.
 
 ### Fixed
+- Usage tracking (menu bar): The menu bar quota tracker now shows an in-progress spinner while Codex or Claude usage probes are running, matching the in-app usage strip behavior even when reset indicators are hidden.
+- Session view (Unified): Selected transcript rendering now keeps the last non-empty session snapshot when refresh churn briefly republishes lightweight/empty data for the same session ID, preventing flicker/empty transcript flashes during live updates.
+- Sessions (Cockpit): Cockpit now hides only low-confidence unresolved live placeholders (missing join keys and fallback identity signals like tty/pid/source/workspace), preventing ghost rows while keeping valid fallback-detected live sessions visible.
+- Sessions (Unified/Cockpit): Unified session-list live-status dots now refresh on Codex active-membership updates even when `Active sessions only` is off, keeping active/open indicators aligned with Cockpit state transitions.
 - Claude usage probe: Login-shell path and `PATH` resolution now strips injected OSC escape sequences (for example from iTerm2 shell integration), respects custom Claude binary overrides, and hardens tmux startup/trust-prompt handling to avoid false `tmux_not_found` and premature probe failures.
 - Cockpit/Sessions (Unified): Active Codex sessions are now joined by Codex internal `session_id` when log-path metadata is unavailable, restoring active indicators and Focus-in-iTerm2 availability.
 - Sessions (Unified): `Active-only` filtering now immediately applies during in-flight searches and re-seats selection when the previously selected row drops out of the filtered list.
 - Sessions (Unified): Agent toolbar filter pills now show a clear enabled/disabled state in monochrome mode.
+- Sessions (Codex active indicators): Active-session path normalization now uses cached canonical (symlink-aware) paths so equivalent roots (for example `/var/...` and `/private/var/...`) still join correctly, process fallback probing now shifts to slower completeness sweeps when registry data is already present, and background polling/probing now backs off while the app is inactive.
+- Sessions (Codex active indicators): Active-session polling visibility now tracks Unified/Cockpit consumers per window instance, so closing one of multiple open windows no longer drops refresh cadence for the windows that remain visible.
+- Sessions (Codex active indicators): Re-enabling active-session detection now preserves existing visible-window consumer registrations, so polling/probing immediately returns to foreground cadence without requiring window reopen.
+- Sessions (Codex active indicators): Active lookups now avoid event-derived session-id fallback on row render paths, codex internal-id hint backfill now progresses in rotating background batches (instead of a fixed small cap), and active-only list rendering skips redundant per-row active checks.
+- Sessions (Codex active indicators): iTerm tail classification now ignores stale historical `Worked for` output and only treats near-tail live markers as active; transient iTerm tail-capture failures now default to `open` instead of promoting sessions to false-active via mtime fallback.
+- Sessions (Codex active indicators): Cockpit/Unified now reconcile tty-only iTerm fallback presences with existing keyed presences by TTY before publishing rows, preventing duplicate live-session rows in mixed registry/process + iTerm discovery flows.
+- Sessions (Cockpit/Unified): Claude/OpenCode command fallback detection now matches executable command positions only (argv0/wrapper target/shell `-c` head), preventing argument/path-name false positives from creating phantom live rows.
+- Sessions (Unified): Claude/OpenCode live fallback matching now assigns up to `N` newest candidate sessions for `N` unresolved presences (workspace-scoped or source-scoped), so concurrent same-repo terminals stay visible in live dots and `Live sessions only`.
+- Sessions (Unified): Claude/OpenCode fallback ranking now excludes sessions already directly joined by `sessionId`/log path, preventing mixed direct+fallback states from dropping valid live dots and `Live sessions only` rows.
+- Sessions (Unified): Claude/OpenCode fallback presence caching now keys by source + session ID, preventing cross-provider ID collisions from showing incorrect live dots or `Live sessions only` rows.
+- Sessions (Cockpit): Unresolved registry-only placeholders are now hidden unless they are focusable or workspace-joinable, preventing ghost sub-agent rows (for example `Active Codex CLI session` with empty project).
+- Sessions (Cockpit): Unresolved `subagent` presences are now always suppressed before join-key checks, preventing ghost rows that inherited `session_id` or `session_log_path`.
+- Sessions (Claude/OpenCode live-state): iTerm tail probing now remains eligible when a TTY is present even if terminal metadata reports wrappers like `tmux`, reducing false `open` classifications caused by skipped probes.
+- Sessions (Cockpit/Codex): Cockpit now hides unresolved Codex placeholders unless they join to an indexed session, preventing Cockpit-only ghost Codex rows while leaving Sessions list behavior unchanged.
+- Sessions (Claude/OpenCode live-state): Generic iTerm tail classification now treats strong near-bottom live markers (for example `Esc to interrupt`) as authoritative, while prompt-at-bottom clears only stale/weak markers; weak busy markers are limited to near-bottom output to avoid sticky false-`active` dots.
+- Sessions (Claude live-state): Claude now uses a dedicated iTerm-tail classifier and a wider mtime fallback window (`15s`) so active sessions are less likely to be shown as open when terminal output is active but JSONL writes are sparse.
+- Sessions (Claude live-state): Claude iTerm probing now uses iTerm session flags (`is processing` / `is at shell prompt`) before tail heuristics, and tail parsing now strips ANSI escape sequences so active markers (for example styled `Esc to interrupt`) are detected reliably.
+- Sessions (Cockpit/Claude/OpenCode): Unresolved non-Codex placeholders now require iTerm-backed focus identity (iTerm GUID/reveal URL or iTerm terminal metadata) or workspace joinability; `tmux`/TTY-only unresolved rows are suppressed to prevent Cockpit ghost sessions.
+- Sessions (Claude live-state): Claude fallback prompt detection now recognizes zsh-style `%` prompt lines (for example `user@host %`) while still treating percentage status lines (for example `78%`) as non-prompt output.
+- Sessions (Claude live-state): Claude probe conflict handling now prefers `is processing` over prompt metadata when both are true, and no-flag tails now classify as `active` only when no prompt markers are present near the bottom.
+- Sessions (Cockpit/Claude/OpenCode): Unresolved non-Codex TTY-only rows are now hidden unless they have direct join keys (`session_id`/log path), workspace joinability, or explicit iTerm identity (GUID/reveal URL/`TERM_PROGRAM` iTerm), reducing `tmux` ghost rows.
+- Sessions (Claude live-state): Claude tail classification now reserves `active` for strong live markers (for example `Esc to interrupt` / reconnect) so generic lexical history near a prompt does not stick sessions in false-active state.
+- Sessions (Claude live-state/Cockpit): TTY-backed Claude rows are now iTerm-attempt eligible even when `TERM_PROGRAM` reports wrappers like `tmux`; Claude tail classification now treats near-bottom weak busy markers as active when no prompt is present, and mtime fallback now uses registry `sourceFilePath` writes when `sessionLogPath` is missing.
+- Sessions (Claude live-state): iTerm probe metadata now emits/parses a real tab delimiter for processing/prompt flags, and Claude prompt matching now recognizes `❯ (No obvious next step)` style idle prompts to reduce false-active states.
+- Sessions (Cockpit/Claude/OpenCode): Cockpit unresolved fallback assignment now uses the same one-to-one workspace/source mapping as Unified Sessions, so concurrent same-workspace sessions no longer collapse to a single Cockpit row.
+- Sessions (Cockpit): Duplicate-row resolution for the same joined session now prefers freshest presence telemetry over stale `active` state, reducing sticky active dots until window reopen.
+- Sessions (Unified/Cockpit): Manual refresh now also triggers an immediate live-session probe refresh (bypassing probe throttle), so active/open state transitions update without waiting for background cadence.
+- Sessions (Unified): `CLI Agent` live-status cells now rebind on active-membership version changes so active/open dots repaint immediately even when the session row data itself is unchanged.
+- Session view (Unified): Session list refresh now holds the prior selection/rows during transient empty publishes while indexing/search churn is in flight, preventing momentary blank transcript placeholder flashes.
+- Claude usage probe cleanup: orphaned `as-cc-*` tmux label cleanup is now processed in bounded batches with delayed follow-up passes to avoid large single-pass CPU spikes, and cleanup now excludes the currently active probe label.
+- Sessions (Cockpit/Unified/Claude): Cockpit now suppresses unresolved live placeholders that are neither focusable nor joinable to indexed workspace sessions, dedupes unresolved rows by stable tty/workspace identity, and its `Refresh` action now refreshes both live presence and provider indexes; Claude refresh now auto-escalates recent-scope drift to full reconcile, and manual refreshes in both Unified and Cockpit now run Claude full reconcile so newly opened Claude sessions appear reliably in the main Sessions list.
 
 ### Changed
+- Preferences (Advanced): Reordered sections so `Saved Sessions` appears above `Search`.
+- Preferences (Advanced): Reordered sections so `Git Context` appears at the bottom, and renamed `Live Sessions + Cockpit` to `Live Sessions + Cockpit BETA`.
+- Preferences (Advanced): Live-session/Cockpit controls are now consolidated under `Live Sessions + Cockpit (Beta)` in Settings → Advanced as the single feature toggle location.
+- Sessions (Live/Cockpit): OpenCode active/open session detection is temporarily disabled for this release; live-state scope is now Codex + Claude only.
+- Cockpit/Sessions (Live controls): When `Live Sessions + Cockpit (Beta)` is disabled, Cockpit and live-filter controls remain visible but disabled with explanatory help text.
 - Preferences (Unified Window): Reordered sections so `Columns` and `Filters` appear before `Rich Transcript`.
 - Preferences (OpenClaw): Moved `Include deleted OpenClaw sessions` from Advanced to the OpenClaw pane as a standalone checkbox.
 - Sessions (Unified): Removed the leading dot from agent pill toggles in the main toolbar.
+- Sessions (Unified): `Active sessions only` now filters to live Codex sessions (`active` + `open`) instead of only actively working sessions.
+- Sessions (Unified): `Active sessions only` now filters to live Codex and Claude sessions (`active` + `open`).
+- Sessions (Cockpit): Removed `Copy Session ID` from Cockpit row context menus; session ID copy remains available in the Sessions list.
+- Sessions (Unified): `CLI Agent` live-status dots now render before the agent name for improved column alignment.
+- Cockpit: `View > Cockpit` now always opens/focuses a single Cockpit window instance.
 
 ## [2.12] - 2026-02-24
 

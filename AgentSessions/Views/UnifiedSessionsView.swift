@@ -13,6 +13,40 @@ enum UnifiedTableSelectionPolicy {
     }
 }
 
+enum UnifiedRowsStabilityPolicy {
+    static func shouldHoldRowsDuringRunningSearch(
+        isSearchRunning: Bool,
+        nextRowsEmpty: Bool,
+        showActiveSessionsOnly: Bool,
+        cachedRowsEmpty: Bool
+    ) -> Bool {
+        guard isSearchRunning else { return false }
+        guard nextRowsEmpty else { return false }
+        guard !showActiveSessionsOnly else { return false }
+        guard !cachedRowsEmpty else { return false }
+        return true
+    }
+
+    static func shouldHoldRowsDuringTransientEmptyRefresh(
+        query: String,
+        isSearchRunning: Bool,
+        isDatasetChurning: Bool,
+        isIndexing: Bool,
+        nextRowsEmpty: Bool,
+        showActiveSessionsOnly: Bool,
+        cachedRowsEmpty: Bool,
+        hasSelection: Bool
+    ) -> Bool {
+        guard query.isEmpty else { return false }
+        guard !isSearchRunning else { return false }
+        guard nextRowsEmpty else { return false }
+        guard !showActiveSessionsOnly else { return false }
+        guard !cachedRowsEmpty else { return false }
+        guard hasSelection else { return false }
+        return isDatasetChurning || isIndexing
+    }
+}
+
 private extension Notification.Name {
     static let collapseInlineSearchIfEmpty = Notification.Name("UnifiedSessionsCollapseInlineSearchIfEmpty")
 }
@@ -191,6 +225,7 @@ struct UnifiedSessionsView: View {
 	@AppStorage("UnifiedShowStarColumn") private var showStarColumn: Bool = true
 	@AppStorage("UnifiedShowSizeColumn") private var showSizeColumn: Bool = true
     @AppStorage("UnifiedShowActiveSessionsOnly") private var showActiveSessionsOnly: Bool = false
+    @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var liveSessionsFeatureEnabled: Bool = true
 	@AppStorage("StripMonochromeMeters") private var stripMonochrome: Bool = false
 	@AppStorage("ModifiedDisplay") private var modifiedDisplayRaw: String = SessionIndexer.ModifiedDisplay.relative.rawValue
 	@AppStorage("AppAppearance") private var appAppearanceRaw: String = AppAppearance.system.rawValue
@@ -211,6 +246,14 @@ struct UnifiedSessionsView: View {
     @State private var showAnalyticsWarmupNotice: Bool = false
     @State private var showAgentEnablementNotice: Bool = false
     @State private var isWindowKey: Bool = false
+    @State private var activeConsumerID = UUID()
+    @State private var cachedFallbackPresenceBySessionKey: [String: CodexActivePresence] = [:]
+#if DEBUG
+    @State private var debugActiveOnlyUpdateRowsCount: UInt64 = 0
+    @State private var debugActiveOnlyUpdateRowsTotalMs: Double = 0
+    @State private var debugActiveOnlyUpdateRowsMaxMs: Double = 0
+    @State private var debugActiveOnlyLastReportAt: Date = .distantPast
+#endif
 
     private enum SourceColorStyle: String, CaseIterable { case none, text, background } // deprecated
     private enum SelectionChangeSource { case mouse }
@@ -231,7 +274,7 @@ struct UnifiedSessionsView: View {
         }
 
         guard showActiveSessionsOnly else { return baseRows }
-        return baseRows.filter { isSessionActive($0) }
+        return baseRows.filter { isSessionLive($0) }
     }
 
     init(unified: UnifiedSessionIndexer,
@@ -330,22 +373,25 @@ struct UnifiedSessionsView: View {
 				)
 		)
 
-		let lifecycle = AnyView(
-			base
-	                .onAppear {
-	                    updateFooterUsageVisibility()
-	                    if sortOrder.isEmpty { sortOrder = [KeyPathComparator(\Session.modifiedAt, order: .reverse)] }
-	                    updateCachedRows()
-	                    ensureDefaultSelectionIfNeeded()
-	                    unified.setAppActive(NSApp.isActive)
-	                    updateFocusedSessionIfNeeded(selectedSession)
-	                    refreshSelectionSourceFromCachedRows()
-	                    searchCoordinator.setAppActive(NSApp.isActive)
-	                }
-                .onDisappear {
-                    codexUsageModel.setStripVisible(false)
-                    claudeUsageModel.setStripVisible(false)
-                }
+			let lifecycle = AnyView(
+				base
+				                .onAppear {
+				                    activeCodexSessions.setUnifiedConsumerVisible(true, consumerID: activeConsumerID)
+				                    updateFooterUsageVisibility()
+				                    if sortOrder.isEmpty { sortOrder = [KeyPathComparator(\Session.modifiedAt, order: .reverse)] }
+				                    if !liveSessionsFeatureEnabled { showActiveSessionsOnly = false }
+				                    updateCachedRows()
+				                    ensureDefaultSelectionIfNeeded()
+				                    unified.setAppActive(NSApp.isActive)
+			                    updateFocusedSessionIfNeeded(selectedSession)
+			                    refreshSelectionSourceFromCachedRows()
+		                    searchCoordinator.setAppActive(NSApp.isActive)
+			                }
+			                .onDisappear {
+			                    activeCodexSessions.setUnifiedConsumerVisible(false, consumerID: activeConsumerID)
+			                    codexUsageModel.setStripVisible(false)
+			                    claudeUsageModel.setStripVisible(false)
+			                }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                     unified.setAppActive(true)
                     searchCoordinator.setAppActive(true)
@@ -386,13 +432,25 @@ struct UnifiedSessionsView: View {
 
         let afterActiveOnly = afterOpenClaw
             .onChange(of: showActiveSessionsOnly) { _, _ in
+                if !liveSessionsFeatureEnabled {
+                    showActiveSessionsOnly = false
+                }
                 updateCachedRows()
                 ensureDefaultSelectionIfNeeded()
                 refreshSelectionSourceFromCachedRows()
                 updateFocusedSessionIfNeeded(selectedSession)
             }
 
-			let afterUsage = afterActiveOnly
+        let afterLiveFeature = afterActiveOnly
+            .onChange(of: liveSessionsFeatureEnabled) { _, enabled in
+                if !enabled { showActiveSessionsOnly = false }
+                updateCachedRows()
+                ensureDefaultSelectionIfNeeded()
+                refreshSelectionSourceFromCachedRows()
+                updateFocusedSessionIfNeeded(selectedSession)
+            }
+
+			let afterUsage = afterLiveFeature
 				.onChange(of: codexUsageEnabled) { _, _ in updateFooterUsageVisibility() }
 				.onChange(of: claudeUsageEnabled) { _, _ in updateFooterUsageVisibility() }
 					.onChange(of: searchState.query) { _, newValue in
@@ -496,7 +554,8 @@ struct UnifiedSessionsView: View {
 						}
 					}
                     .onReceive(activeCodexSessions.$activeMembershipVersion) { _ in
-                        guard showActiveSessionsOnly else { return }
+                        // Always refresh cached rows so CLI Agent live-state dots (active/open)
+                        // update promptly even when Active-only filtering is disabled.
                         updateCachedRows()
                         ensureDefaultSelectionIfNeeded()
                         refreshSelectionSourceFromCachedRows()
@@ -586,7 +645,16 @@ struct UnifiedSessionsView: View {
                        ideal: showStarColumn ? 40 : 0,
                        max: showStarColumn ? 44 : 0)
 
-            TableColumn("CLI Agent", value: \Session.sourceKey) { cellSource(for: $0) }
+            TableColumn("CLI Agent", value: \Session.sourceKey) { s in
+                cellSource(for: s)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        selectionChangeSource = .mouse
+                        setActiveSelection(s.id, source: s.source, userInitiated: true)
+                        autoSelectEnabled = false
+                        focusActiveTerminal(for: s)
+                    }
+            }
                 .width(min: showSourceColumn ? 90 : 0,
                        ideal: showSourceColumn ? 100 : 0,
                        max: showSourceColumn ? 120 : 0)
@@ -660,7 +728,7 @@ struct UnifiedSessionsView: View {
 
             // Removed separate Refresh column to avoid churn
 	        }
-	        .id(columnLayoutID)
+	        .id("unified-table-\(columnLayoutID.uuidString)-\(activeCodexSessions.activeMembershipVersion)")
 	        .tableStyle(.inset(alternatesRowBackgrounds: true))
             .tint(UnifiedSessionsStyle.selectionAccent)
 	        .environment(\.defaultMinListRowHeight, 28)
@@ -678,30 +746,15 @@ struct UnifiedSessionsView: View {
 	                        .help("Resume the selected session in its original CLI (⌃⌘R)")
 	                    Divider()
 	                }
-	                    if s.source == .codex {
-	                        let presence = activeCodexSessions.presence(for: s)
-	                        let focusURL = presence?.revealURL
-	                        let canFocus = CodexActiveSessionsModel.canAttemptITerm2Focus(
-	                            itermSessionId: presence?.terminal?.itermSessionId,
-	                            tty: presence?.tty,
-	                            termProgram: presence?.terminal?.termProgram
-	                        ) || focusURL != nil
-	                        let helpText: String = {
-	                            if canFocus { return "Focus the existing iTerm2 tab/window for this session." }
-	                            if activeCodexSessions.isActive(s) { return "Focus is unavailable for this terminal session." }
-	                            return "This session is not currently active."
-	                        }()
-	                        Button("Focus in iTerm2") {
-	                            let didFocus = CodexActiveSessionsModel.tryFocusITerm2(
-	                                itermSessionId: presence?.terminal?.itermSessionId,
-	                                tty: presence?.tty
-	                            )
-	                            if !didFocus, let focusURL { NSWorkspace.shared.open(focusURL) }
-	                        }
-	                        .disabled(!canFocus)
-	                        .help(helpText)
-	                        Divider()
-	                    }
+                    if activeCodexSessions.supportsLiveSessions(for: s.source) {
+                        let availability = terminalFocusAvailability(for: s)
+                        Button("Focus in iTerm2") {
+                            focusActiveTerminal(for: s)
+                        }
+                        .disabled(!availability.canFocus)
+                        .help(availability.helpText)
+                        Divider()
+                    }
 	                Button("Open Working Directory") { openDir(s) }
 	                    .keyboardShortcut("o", modifiers: [.command, .shift])
 	                    .help("Reveal working directory in Finder (⌘⇧O)")
@@ -768,12 +821,19 @@ struct UnifiedSessionsView: View {
 					// Update cached rows first, then reconcile canonical selection with fresh data.
 					selectionTrace("sessions changed begin selection=\(selection ?? "nil") cachedRows=\(cachedRows.count)")
 					isDatasetChurning = true
-					updateCachedRows()
+					let heldRows = updateCachedRows()
 					ensureDefaultSelectionIfNeeded()
 					refreshSelectionSourceFromCachedRows()
 					updateFocusedSessionIfNeeded(selectedSession)
 					DispatchQueue.main.async {
 						isDatasetChurning = false
+						if heldRows {
+							// Reconcile once churn flag drops only when the first pass held stale rows.
+							updateCachedRows()
+							ensureDefaultSelectionIfNeeded()
+							refreshSelectionSourceFromCachedRows()
+							updateFocusedSessionIfNeeded(selectedSession)
+						}
 						selectionTrace("sessions changed end selection=\(selection ?? "nil") cachedRows=\(cachedRows.count)")
 					}
 				}
@@ -970,7 +1030,12 @@ struct UnifiedSessionsView: View {
         ToolbarItem(placement: .principal) {
             HStack(spacing: 12) {
                 ActiveSessionsOnlyToggle(isOn: $showActiveSessionsOnly)
-                    .help("Show only active sessions in the list")
+                    .disabled(!liveSessionsFeatureEnabled)
+                    .help(
+                        liveSessionsFeatureEnabled
+                            ? "Show only live sessions in the list (Codex, Claude)"
+                            : "Enable Live sessions + Cockpit (Beta) in Settings → Advanced."
+                    )
 
                 if codexAgentEnabled {
                     AgentTabToggle(title: "Codex", color: Color.agentCodex, isMonochrome: stripMonochrome, isOn: $unified.includeCodex)
@@ -1072,6 +1137,7 @@ struct UnifiedSessionsView: View {
                     }
                 }
             } action: {
+                activeCodexSessions.refreshNow()
                 unified.refresh()
             }
             .keyboardShortcut("r", modifiers: .command)
@@ -1234,14 +1300,14 @@ struct UnifiedSessionsView: View {
     private func showImagesForSelectedSession(showNoSelectionAlert: Bool) {
         guard let session = selectedSession else {
             if showNoSelectionAlert {
-                showImagesAlert(message: "Select a session to view images.")
+                showActionAlert(message: "Select a session to view images.")
             }
             return
         }
         CodexImagesWindowController.shared.show(session: session, allSessions: unified.allSessions)
     }
 
-    private func showImagesAlert(message: String) {
+    private func showActionAlert(message: String) {
         let alert = NSAlert()
         alert.messageText = message
         if let window = NSApp.keyWindow {
@@ -1317,8 +1383,38 @@ struct UnifiedSessionsView: View {
         unified.setFocusedSession(session)
     }
 
-	    private func updateCachedRows() {
-	        let nextRows: [Session]
+	    @discardableResult
+	    private func updateCachedRows() -> Bool {
+        rebuildCachedFallbackPresences()
+#if DEBUG
+        let startedAt = Date()
+        defer {
+            if showActiveSessionsOnly {
+                let elapsedMs = Date().timeIntervalSince(startedAt) * 1000.0
+                debugActiveOnlyUpdateRowsCount &+= 1
+                debugActiveOnlyUpdateRowsTotalMs += elapsedMs
+                debugActiveOnlyUpdateRowsMaxMs = max(debugActiveOnlyUpdateRowsMaxMs, elapsedMs)
+
+                if elapsedMs > 25 {
+                    print("[UnifiedSessionsView][perf] updateCachedRows active-only took \(String(format: "%.1f", elapsedMs))ms rows=\(cachedRows.count)")
+                }
+
+                let now = Date()
+                if now.timeIntervalSince(debugActiveOnlyLastReportAt) >= 10, debugActiveOnlyUpdateRowsCount > 0 {
+                    let avgMs = debugActiveOnlyUpdateRowsTotalMs / Double(debugActiveOnlyUpdateRowsCount)
+                    print(
+                        "[UnifiedSessionsView][perf] active-only updateCachedRows " +
+                        "count=\(debugActiveOnlyUpdateRowsCount) avgMs=\(String(format: "%.1f", avgMs)) maxMs=\(String(format: "%.1f", debugActiveOnlyUpdateRowsMaxMs))"
+                    )
+                    debugActiveOnlyUpdateRowsCount = 0
+                    debugActiveOnlyUpdateRowsTotalMs = 0
+                    debugActiveOnlyUpdateRowsMaxMs = 0
+                    debugActiveOnlyLastReportAt = now
+                }
+            }
+        }
+#endif
+		        let nextRows: [Session]
 	        if FeatureFlags.coalesceListResort {
             // unified.sessions is already sorted by the view model's descriptor
             nextRows = rows
@@ -1327,19 +1423,30 @@ struct UnifiedSessionsView: View {
         }
 
         let query = unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let shouldHoldRowsDuringRunningSearch =
-            !query.isEmpty
-            && searchCoordinator.isRunning
-            && nextRows.isEmpty
-            && !showActiveSessionsOnly
-            && !cachedRows.isEmpty
+        let shouldHoldRowsDuringRunningSearch = UnifiedRowsStabilityPolicy.shouldHoldRowsDuringRunningSearch(
+            isSearchRunning: searchCoordinator.isRunning,
+            nextRowsEmpty: nextRows.isEmpty,
+            showActiveSessionsOnly: showActiveSessionsOnly,
+            cachedRowsEmpty: cachedRows.isEmpty
+        )
+	        let shouldHoldRowsDuringTransientEmptyRefresh = UnifiedRowsStabilityPolicy.shouldHoldRowsDuringTransientEmptyRefresh(
+            query: query,
+            isSearchRunning: searchCoordinator.isRunning,
+            isDatasetChurning: isDatasetChurning,
+            isIndexing: unified.isIndexing,
+            nextRowsEmpty: nextRows.isEmpty,
+            showActiveSessionsOnly: showActiveSessionsOnly,
+            cachedRowsEmpty: cachedRows.isEmpty,
+            hasSelection: selection != nil
+        )
 
-	        if !shouldHoldRowsDuringRunningSearch {
+	        if !(shouldHoldRowsDuringRunningSearch || shouldHoldRowsDuringTransientEmptyRefresh) {
 	            cachedRows = nextRows
 	        }
+        let heldRows = shouldHoldRowsDuringRunningSearch || shouldHoldRowsDuringTransientEmptyRefresh
 
-        if let selectedID = selection,
-           !cachedRows.contains(where: { $0.id == selectedID }) {
+	        if let selectedID = selection,
+	           !cachedRows.contains(where: { $0.id == selectedID }) {
             if let first = cachedRows.first {
                 setActiveSelection(first.id, source: first.source, userInitiated: false)
             } else {
@@ -1347,8 +1454,9 @@ struct UnifiedSessionsView: View {
             }
         }
 
-	        ensureDefaultSelectionIfNeeded()
-	        refreshSelectionSourceFromCachedRows()
+		        ensureDefaultSelectionIfNeeded()
+		        refreshSelectionSourceFromCachedRows()
+        return heldRows
 	    }
 
     private func scheduleAutoJump(for sessionID: String, immediate: Bool) {
@@ -1442,7 +1550,11 @@ struct UnifiedSessionsView: View {
     private func cellSource(for session: Session) -> some View {
         let label: String
         let isSelected = selection == session.id
-        let isSessionActive = session.source == .codex && activeCodexSessions.isActive(session)
+        let liveState: CodexLiveState? = {
+            guard activeCodexSessions.supportsLiveSessions(for: session.source) else { return nil }
+            guard let presence = livePresence(for: session) else { return nil }
+            return activeCodexSessions.liveState(for: presence)
+        }()
         let rowTextColor: Color = {
             if isSelected { return .white }
             return !stripMonochrome ? sourceAccent(session) : .secondary
@@ -1461,17 +1573,64 @@ struct UnifiedSessionsView: View {
         case .openclaw: label = "OpenClaw"
         }
         return HStack(spacing: 6) {
+            if let liveState {
+                CodexLiveStatusDot(state: liveState, color: rowDotColor, size: 6)
+                    .accessibilityLabel(Text("\(label) \(liveState == .activeWorking ? "active" : "open") session"))
+            }
             Text(label)
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
                 .foregroundStyle(rowTextColor)
-            if isSessionActive {
-                Circle()
-                    .fill(rowDotColor)
-                    .frame(width: 6, height: 6)
-                    .accessibilityLabel(Text("\(label) active session"))
-            }
             Spacer(minLength: 4)
         }
+        .id("source-cell-\(session.id)-\(activeCodexSessions.activeMembershipVersion)")
+    }
+
+    private struct TerminalFocusAvailability {
+        let canFocus: Bool
+        let helpText: String
+    }
+
+    private func terminalFocusAvailability(for session: Session) -> TerminalFocusAvailability {
+        guard activeCodexSessions.supportsLiveSessions(for: session.source) else {
+            return TerminalFocusAvailability(
+                canFocus: false,
+                helpText: "This agent does not support live terminal focus."
+            )
+        }
+
+        let presence = livePresence(for: session)
+        let canFocus = CodexActiveSessionsModel.canAttemptITerm2Focus(
+            itermSessionId: presence?.terminal?.itermSessionId,
+            tty: presence?.tty,
+            termProgram: presence?.terminal?.termProgram
+        ) || presence?.revealURL != nil
+        let helpText: String = {
+            if canFocus { return "Focus the existing iTerm2 tab/window for this session." }
+            if isSessionLive(session) { return "Focus is unavailable for this terminal session." }
+            return "This session is not currently live."
+        }()
+        return TerminalFocusAvailability(canFocus: canFocus, helpText: helpText)
+    }
+
+    private func focusActiveTerminal(for session: Session) {
+        let availability = terminalFocusAvailability(for: session)
+        guard availability.canFocus else {
+            showActionAlert(message: availability.helpText)
+            return
+        }
+
+        let presence = livePresence(for: session)
+        if CodexActiveSessionsModel.tryFocusITerm2(
+            itermSessionId: presence?.terminal?.itermSessionId,
+            tty: presence?.tty
+        ) {
+            return
+        }
+        if let focusURL = presence?.revealURL, NSWorkspace.shared.open(focusURL) {
+            return
+        }
+
+        showActionAlert(message: "Unable to focus the terminal for this session.")
     }
 
     private func openDir(_ s: Session) {
@@ -1605,9 +1764,179 @@ struct UnifiedSessionsView: View {
         }
     }
 
-    private func isSessionActive(_ session: Session) -> Bool {
-        guard session.source == .codex else { return false }
-        return activeCodexSessions.isActive(session)
+    private func isSessionLive(_ session: Session) -> Bool {
+        guard activeCodexSessions.supportsLiveSessions(for: session.source) else { return false }
+        return livePresence(for: session) != nil
+    }
+
+    private func livePresence(for session: Session) -> CodexActivePresence? {
+        if let direct = activeCodexSessions.presence(for: session) {
+            return direct
+        }
+        let fallbackKey = Self.fallbackPresenceKey(source: session.source, sessionID: session.id)
+        return cachedFallbackPresenceBySessionKey[fallbackKey]
+    }
+
+    private func rebuildCachedFallbackPresences() {
+        cachedFallbackPresenceBySessionKey = Self.buildFallbackPresenceMap(
+            sessions: unified.allSessions,
+            presences: activeCodexSessions.presences
+        ) { candidate in
+            activeCodexSessions.presence(for: candidate) != nil
+        }
+    }
+
+    static func buildFallbackPresenceMap(sessions: [Session],
+                                         presences: [CodexActivePresence],
+                                         hasDirectJoin: (Session) -> Bool) -> [String: CodexActivePresence] {
+        let supportedSources: Set<SessionSource> = [.claude]
+        var fallbackBySessionKey: [String: CodexActivePresence] = [:]
+        var fallbackEligibleBySource: [SessionSource: [Session]] = [:]
+        var fallbackEligibleByWorkspace: [String: [Session]] = [:]
+
+        for session in sessions where supportedSources.contains(session.source) {
+            guard !hasDirectJoin(session) else { continue }
+            fallbackEligibleBySource[session.source, default: []].append(session)
+
+            guard let cwdRaw = session.cwd?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !cwdRaw.isEmpty else { continue }
+            let normalizedCWD = CodexActiveSessionsModel.normalizePath(cwdRaw)
+            guard !normalizedCWD.isEmpty else { continue }
+            let workspaceKey = fallbackWorkspaceKey(source: session.source, normalizedCWD: normalizedCWD)
+            fallbackEligibleByWorkspace[workspaceKey, default: []].append(session)
+        }
+
+        var claimableWorkspacePresences: [String: [CodexActivePresence]] = [:]
+        var unresolvedPresencesBySource: [SessionSource: [CodexActivePresence]] = [:]
+
+        for presence in presences where supportedSources.contains(presence.source) {
+            if !presenceHasSessionSpecificJoinSignals(presence),
+               let workspaceRaw = presence.workspaceRoot?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !workspaceRaw.isEmpty {
+                let normalizedWorkspace = CodexActiveSessionsModel.normalizePath(workspaceRaw)
+                if !normalizedWorkspace.isEmpty {
+                    let workspaceKey = fallbackWorkspaceKey(source: presence.source, normalizedCWD: normalizedWorkspace)
+                    claimableWorkspacePresences[workspaceKey, default: []].append(presence)
+                }
+            }
+
+            guard !presenceHasStrongJoinSignals(presence) else { continue }
+            guard hasFallbackIdentitySignals(presence) else { continue }
+            unresolvedPresencesBySource[presence.source, default: []].append(presence)
+        }
+
+        for (workspaceKey, candidateSessions) in fallbackEligibleByWorkspace {
+            guard let workspacePresences = claimableWorkspacePresences[workspaceKey], !workspacePresences.isEmpty else {
+                continue
+            }
+            let orderedSessions = candidateSessions.sorted(by: fallbackSessionSort)
+            let orderedPresences = workspacePresences.sorted(by: fallbackPresenceSort)
+            let limit = min(orderedSessions.count, orderedPresences.count)
+            guard limit > 0 else { continue }
+            for index in 0..<limit {
+                let key = fallbackPresenceKey(
+                    source: orderedSessions[index].source,
+                    sessionID: orderedSessions[index].id
+                )
+                guard fallbackBySessionKey[key] == nil else { continue }
+                fallbackBySessionKey[key] = orderedPresences[index]
+            }
+        }
+
+        for source in supportedSources {
+            guard let sourceSessions = fallbackEligibleBySource[source], !sourceSessions.isEmpty else { continue }
+            guard let unresolvedPresences = unresolvedPresencesBySource[source], !unresolvedPresences.isEmpty else { continue }
+
+            let remainingSessions = sourceSessions.filter {
+                let key = fallbackPresenceKey(source: $0.source, sessionID: $0.id)
+                return fallbackBySessionKey[key] == nil
+            }
+            guard !remainingSessions.isEmpty else { continue }
+
+            let orderedSessions = remainingSessions.sorted(by: fallbackSessionSort)
+            let orderedPresences = unresolvedPresences.sorted(by: fallbackPresenceSort)
+            let limit = min(orderedSessions.count, orderedPresences.count)
+            guard limit > 0 else { continue }
+            for index in 0..<limit {
+                let key = fallbackPresenceKey(
+                    source: orderedSessions[index].source,
+                    sessionID: orderedSessions[index].id
+                )
+                guard fallbackBySessionKey[key] == nil else { continue }
+                fallbackBySessionKey[key] = orderedPresences[index]
+            }
+        }
+
+        return fallbackBySessionKey
+    }
+
+    static func fallbackPresenceKey(source: SessionSource, sessionID: String) -> String {
+        "\(source.rawValue)|session:\(sessionID)"
+    }
+
+    private static func fallbackWorkspaceKey(source: SessionSource, normalizedCWD: String) -> String {
+        "\(source.rawValue)|cwd:\(normalizedCWD)"
+    }
+
+    private static func hasFallbackIdentitySignals(_ presence: CodexActivePresence) -> Bool {
+        let hasTTY = presence.tty?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasPID = presence.pid != nil
+        let hasITermID = presence.terminal?.itermSessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        return hasTTY || hasPID || hasITermID
+    }
+
+    private static func presenceHasSessionSpecificJoinSignals(_ presence: CodexActivePresence) -> Bool {
+        let hasSessionID = presence.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasLogPath = presence.sessionLogPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        return hasSessionID || hasLogPath
+    }
+
+    static func fallbackClaimedPresence(for session: Session,
+                                        among candidateSessions: [Session],
+                                        using fallbackPresences: [CodexActivePresence]) -> CodexActivePresence? {
+        guard !candidateSessions.isEmpty, !fallbackPresences.isEmpty else { return nil }
+        let orderedSessions = candidateSessions.sorted(by: fallbackSessionSort)
+        guard let rank = orderedSessions.firstIndex(where: { $0.source == session.source && $0.id == session.id }) else {
+            return nil
+        }
+        let orderedPresences = fallbackPresences.sorted(by: fallbackPresenceSort)
+        guard rank < orderedPresences.count else { return nil }
+        return orderedPresences[rank]
+    }
+
+    static func fallbackEligibleSessions(from candidateSessions: [Session],
+                                         hasDirectJoin: (Session) -> Bool) -> [Session] {
+        candidateSessions.filter { !hasDirectJoin($0) }
+    }
+
+    static func fallbackSessionSort(_ lhs: Session, _ rhs: Session) -> Bool {
+        if lhs.modifiedAt != rhs.modifiedAt { return lhs.modifiedAt > rhs.modifiedAt }
+        if lhs.startTime != rhs.startTime { return (lhs.startTime ?? .distantPast) > (rhs.startTime ?? .distantPast) }
+        if lhs.filePath != rhs.filePath { return lhs.filePath < rhs.filePath }
+        return lhs.id < rhs.id
+    }
+
+    static func fallbackPresenceSort(_ lhs: CodexActivePresence, _ rhs: CodexActivePresence) -> Bool {
+        let leftSeen = lhs.lastSeenAt ?? .distantPast
+        let rightSeen = rhs.lastSeenAt ?? .distantPast
+        if leftSeen != rightSeen { return leftSeen > rightSeen }
+
+        let leftStarted = lhs.startedAt ?? .distantPast
+        let rightStarted = rhs.startedAt ?? .distantPast
+        if leftStarted != rightStarted { return leftStarted > rightStarted }
+
+        let leftKey = CodexActiveSessionsModel.presenceKey(for: lhs)
+        let rightKey = CodexActiveSessionsModel.presenceKey(for: rhs)
+        if leftKey != rightKey { return leftKey < rightKey }
+        return (lhs.pid ?? .min) < (rhs.pid ?? .min)
+    }
+
+    private static func presenceHasStrongJoinSignals(_ presence: CodexActivePresence) -> Bool {
+        let hasSessionID = presence.sessionId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasLogPath = presence.sessionLogPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasWorkspace = presence.workspaceRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasSourcePath = presence.sourceFilePath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        return hasSessionID || hasLogPath || hasWorkspace || hasSourcePath
     }
 
 	    private func progressLineText(_ p: SearchCoordinator.Progress) -> String {
@@ -1708,7 +2037,7 @@ private struct ActiveSessionsOnlyToggle: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(Text("Active sessions only"))
+        .accessibilityLabel(Text("Live sessions only"))
         .accessibilityValue(Text(isOn ? "On" : "Off"))
     }
 }
