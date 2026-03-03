@@ -1,13 +1,21 @@
 import SwiftUI
 import AppKit
 
+private enum CockpitStyle {
+    static let selectionAccent = Color(hex: "007acc")
+    static let rowHeight: CGFloat = 28
+    static let defaultVisibleRows: CGFloat = 8
+    static let defaultTableMinHeight: CGFloat = (rowHeight * defaultVisibleRows) + 2
+    static let defaultWindowMinHeight: CGFloat = defaultTableMinHeight + 84
+}
+
 struct CockpitView: View {
     @ObservedObject var codexIndexer: SessionIndexer
     @ObservedObject var claudeIndexer: ClaudeSessionIndexer
     @EnvironmentObject var activeCodex: CodexActiveSessionsModel
     @AppStorage("AppAppearance") private var appAppearanceRaw: String = AppAppearance.system.rawValue
     @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var activeEnabled: Bool = true
-    @AppStorage(PreferencesKey.Cockpit.codexLiveFilterMode) private var liveFilterModeRaw: String = LiveFilterMode.both.rawValue
+    @AppStorage private var liveFilterModeRaw: String
     @State private var selection: Set<String> = []
     @State private var activeConsumerID = UUID()
     private static let rowDateFormatter: DateFormatter = {
@@ -26,17 +34,15 @@ struct CockpitView: View {
     }()
 
     private enum LiveFilterMode: String, CaseIterable, Identifiable {
-        case both
         case active
-        case open
+        case live
 
         var id: String { rawValue }
 
         var title: String {
             switch self {
-            case .both: return "Both"
             case .active: return "Active"
-            case .open: return "Open"
+            case .live: return "Live"
             }
         }
     }
@@ -70,11 +76,31 @@ struct CockpitView: View {
     private struct LiveRowsSnapshot {
         let filteredRows: [Row]
         let activeCount: Int
-        let openCount: Int
+        let idleCount: Int
+    }
+
+    init(
+        codexIndexer: SessionIndexer,
+        claudeIndexer: ClaudeSessionIndexer,
+        liveFilterStorageKey: String = PreferencesKey.Cockpit.codexLiveFilterMode
+    ) {
+        self.codexIndexer = codexIndexer
+        self.claudeIndexer = claudeIndexer
+        _liveFilterModeRaw = AppStorage(
+            wrappedValue: LiveFilterMode.live.rawValue,
+            liveFilterStorageKey
+        )
     }
 
     private var liveFilterMode: LiveFilterMode {
-        LiveFilterMode(rawValue: liveFilterModeRaw) ?? .both
+        switch liveFilterModeRaw {
+        case LiveFilterMode.active.rawValue:
+            return .active
+        case LiveFilterMode.live.rawValue, "idle", "open", "both":
+            return .live
+        default:
+            return .live
+        }
     }
 
     private func makeLiveRowsSnapshot() -> LiveRowsSnapshot {
@@ -183,19 +209,17 @@ struct CockpitView: View {
         }
         let filteredRows: [Row]
         switch liveFilterMode {
-        case .both:
-            filteredRows = rows
         case .active:
             filteredRows = rows.filter { $0.liveState == .activeWorking }
-        case .open:
-            filteredRows = rows.filter { $0.liveState == .openIdle }
+        case .live:
+            filteredRows = rows
         }
         return LiveRowsSnapshot(
             filteredRows: filteredRows,
             activeCount: rows.reduce(into: 0) { partial, row in
                 if row.liveState == .activeWorking { partial += 1 }
             },
-            openCount: rows.reduce(into: 0) { partial, row in
+            idleCount: rows.reduce(into: 0) { partial, row in
                 if row.liveState == .openIdle { partial += 1 }
             }
         )
@@ -211,6 +235,10 @@ struct CockpitView: View {
             }
         }
         .onAppear {
+            let normalizedMode = liveFilterMode.rawValue
+            if liveFilterModeRaw != normalizedMode {
+                liveFilterModeRaw = normalizedMode
+            }
             activeCodex.setCockpitConsumerVisible(true, consumerID: activeConsumerID)
         }
         .onDisappear {
@@ -235,13 +263,13 @@ struct CockpitView: View {
             Table(snapshot.filteredRows, selection: $selection) {
                 TableColumn("CLI Agent") { row in
                     Text(sourceLabel(for: row.source))
-                        .foregroundStyle(Color.agentColor(for: row.source, monochrome: false))
+                        .foregroundStyle(rowAgentForeground(for: row))
                 }
                 .width(min: 86, ideal: 96, max: 112)
                 TableColumn("Name") { row in
                     HStack(spacing: 8) {
-                        CodexLiveStatusDot(state: row.liveState, color: Color.agentColor(for: row.source, monochrome: false), size: 7)
-                            .help(row.liveState == .activeWorking ? "Active (working)" : "Open (idle)")
+                        CodexLiveStatusDot(state: row.liveState, color: rowStatusDotColor(for: row), size: 7)
+                            .help(row.liveState == .activeWorking ? "Active (working)" : "Idle")
                         Text(row.title)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -249,20 +277,20 @@ struct CockpitView: View {
                 }
                 TableColumn("Project") { row in
                     Text(row.repo)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(rowSecondaryForeground(for: row))
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
                 TableColumn("Date") { row in
                     Text(row.dateLabel)
                         .font(.system(size: 12, weight: .regular, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(rowSecondaryForeground(for: row))
                         .help(row.dateLabel)
                 }
                 .width(min: 140, ideal: 150, max: 170)
                 TableColumn("Terminal") { row in
                     Text(row.terminal)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(rowSecondaryForeground(for: row))
                 }
                 TableColumn("Focus") { row in
                     Button("Focus") { focus(row) }
@@ -273,7 +301,10 @@ struct CockpitView: View {
                 .width(min: 78, ideal: 90, max: 100)
             }
             .id("cockpit-table-\(liveFilterModeRaw)-\(activeCodex.activeMembershipVersion)")
-            .frame(minHeight: 360)
+            .tableStyle(.inset(alternatesRowBackgrounds: true))
+            .tint(CockpitStyle.selectionAccent)
+            .environment(\.defaultMinListRowHeight, CockpitStyle.rowHeight)
+            .frame(minHeight: CockpitStyle.defaultTableMinHeight, maxHeight: .infinity)
             .disabled(!activeEnabled)
             .contextMenu(forSelectionType: String.self) { ids in
                 if ids.count == 1, let id = ids.first, let row = snapshot.filteredRows.first(where: { $0.id == id }) {
@@ -295,20 +326,20 @@ struct CockpitView: View {
 
             footer(snapshot: snapshot)
         }
-        .frame(width: 980, height: 520)
+        .frame(minWidth: 770, minHeight: CockpitStyle.defaultWindowMinHeight)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var header: some View {
         HStack(spacing: 10) {
-            Text("Cockpit")
-                .font(.system(size: 14, weight: .semibold))
-            Picker("Show", selection: $liveFilterModeRaw) {
+            Picker("", selection: $liveFilterModeRaw) {
                 ForEach(LiveFilterMode.allCases) { mode in
                     Text(mode.title).tag(mode.rawValue)
                 }
             }
+            .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 210)
+            .frame(width: 170)
             .controlSize(.small)
             .disabled(!activeEnabled)
             Spacer()
@@ -331,7 +362,23 @@ struct CockpitView: View {
     }
 
     private func footerText(snapshot: LiveRowsSnapshot) -> String {
-        "\(snapshot.filteredRows.count) shown • \(snapshot.activeCount) active • \(snapshot.openCount) open"
+        "\(snapshot.filteredRows.count) shown • \(snapshot.activeCount) active • \(snapshot.idleCount) idle"
+    }
+
+    private func rowIsSelected(_ row: Row) -> Bool {
+        selection.contains(row.id)
+    }
+
+    private func rowSecondaryForeground(for row: Row) -> Color {
+        rowIsSelected(row) ? .primary : .secondary
+    }
+
+    private func rowAgentForeground(for row: Row) -> Color {
+        rowIsSelected(row) ? .primary : Color.agentColor(for: row.source, monochrome: false)
+    }
+
+    private func rowStatusDotColor(for row: Row) -> Color {
+        rowAgentForeground(for: row)
     }
 
     private func refreshAllSources() {

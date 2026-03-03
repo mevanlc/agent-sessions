@@ -231,7 +231,7 @@ struct AgentSessionsApp: App {
                 Button("Image Browser") {
                     NotificationCenter.default.post(name: .showImagesFromMenu, object: nil)
                 }
-                OpenCockpitWindowButton()
+                OpenAgentCockpitWindowButton()
                 OpenPinnedSessionsWindowButton()
             }
             CommandGroup(after: .help) {
@@ -257,18 +257,26 @@ struct AgentSessionsApp: App {
             .environmentObject(archiveManager)
         }
 
-        Window("Cockpit", id: "Cockpit") {
-            CockpitView(
+        Window("Agent Cockpit", id: "AgentCockpit") {
+            AgentCockpitHUDView(
                 codexIndexer: indexer,
                 claudeIndexer: claudeIndexer
             )
                 .environmentObject(activeCodexSessions)
+        }
+        .defaultSize(width: 644, height: 320)
+
+        Window("Legacy Cockpit", id: "LegacyCockpit") {
+            CockpitView(
+                codexIndexer: indexer,
+                claudeIndexer: claudeIndexer,
+                liveFilterStorageKey: PreferencesKey.Cockpit.legacyCodexLiveFilterMode
+            )
+                .environmentObject(activeCodexSessions)
                 .background(WindowAutosave(name: "CockpitWindow"))
         }
-
-        // Legacy windows removed; Unified is the single window.
-        
-        // No additional scenes
+        .defaultSize(width: 980, height: 310)
+        .commandsRemoved()
     }
 }
 
@@ -324,17 +332,17 @@ private struct OpenPinnedSessionsWindowButton: View {
     }
 }
 
-private struct OpenCockpitWindowButton: View {
+private struct OpenAgentCockpitWindowButton: View {
     @Environment(\.openWindow) private var openWindow
     @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var liveSessionsFeatureEnabled: Bool = true
     var body: some View {
-        Button("Cockpit") {
-            openWindow(id: "Cockpit")
+        Button("Agent Cockpit") {
+            openWindow(id: "AgentCockpit")
         }
         .disabled(!liveSessionsFeatureEnabled)
         .help(
             liveSessionsFeatureEnabled
-                ? "Open Cockpit live sessions window."
+                ? "Open Agent Cockpit."
                 : "Enable Live sessions + Cockpit (Beta) in Settings → Advanced."
         )
         .keyboardShortcut("c", modifiers: [.command, .option, .shift])

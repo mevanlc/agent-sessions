@@ -14,11 +14,15 @@ All notable changes to this project will be documented in this file.
 - Sessions (Unified): Added `CLI Agent` cell double-click terminal focusing in the Sessions list (same focus path as `Focus in iTerm2`), with explicit alert feedback when no focusable live terminal is available.
 
 ### Fixed
+- Sessions (Agent Cockpit/Codex live detection): Pinned `Agent Cockpit` now uses a faster background refresh cadence (`3s`), foreground-return iTerm live-state probing now ramps in bounded batches to flatten short CPU spikes, and iTerm session discovery now reuses a single session-list fetch for Codex+Claude.
+- Sessions (Gemini): Session discovery now accepts named Gemini project directories under `~/.gemini/tmp` (for example `radio4j`), while still supporting both `chats/session-*.json` and direct `session-*.json` layouts.
 - Usage tracking (menu bar): The menu bar quota tracker now shows an in-progress spinner while Codex or Claude usage probes are running, matching the in-app usage strip behavior even when reset indicators are hidden.
+- Sessions (Cockpit): Selected-row text/dot colors now switch to selection-aware foreground styling and use the main Sessions-list selection accent/table style, improving readability when a Cockpit row is selected.
 - Session view (Unified): Selected transcript rendering now keeps the last non-empty session snapshot when refresh churn briefly republishes lightweight/empty data for the same session ID, preventing flicker/empty transcript flashes during live updates.
 - Sessions (Cockpit): Cockpit now hides only low-confidence unresolved live placeholders (missing join keys and fallback identity signals like tty/pid/source/workspace), preventing ghost rows while keeping valid fallback-detected live sessions visible.
 - Sessions (Unified/Cockpit): Unified session-list live-status dots now refresh on Codex active-membership updates even when `Active sessions only` is off, keeping active/open indicators aligned with Cockpit state transitions.
 - Claude usage probe: Login-shell path and `PATH` resolution now strips injected OSC escape sequences (for example from iTerm2 shell integration), respects custom Claude binary overrides, and hardens tmux startup/trust-prompt handling to avoid false `tmux_not_found` and premature probe failures.
+- Claude usage probe: Probe tmux cleanup now removes managed socket files at script exit and classifies socket liveness before issuing tmux commands, eliminating stale-label cleanup churn that caused high sustained CPU when Claude tracking was enabled.
 - Cockpit/Sessions (Unified): Active Codex sessions are now joined by Codex internal `session_id` when log-path metadata is unavailable, restoring active indicators and Focus-in-iTerm2 availability.
 - Sessions (Unified): `Active-only` filtering now immediately applies during in-flight searches and re-seats selection when the previously selected row drops out of the filtered list.
 - Sessions (Unified): Agent toolbar filter pills now show a clear enabled/disabled state in monochrome mode.
@@ -55,11 +59,18 @@ All notable changes to this project will be documented in this file.
 - Sessions (Cockpit/Unified/Claude): Cockpit now suppresses unresolved live placeholders that are neither focusable nor joinable to indexed workspace sessions, dedupes unresolved rows by stable tty/workspace identity, and its `Refresh` action now refreshes both live presence and provider indexes; Claude refresh now auto-escalates recent-scope drift to full reconcile, and manual refreshes in both Unified and Cockpit now run Claude full reconcile so newly opened Claude sessions appear reliably in the main Sessions list.
 
 ### Changed
+- Sessions (Agent Cockpit): Replaced the `Agent Cockpit` window UI with the new floating HUD layout (chips, inline filter, grouped mode, compact mode, pin mode, and keyboard row shortcuts) while keeping Legacy Cockpit available and reusing existing live-session backend logic.
+- Sessions (Agent Cockpit): Window title now includes the currently shown session count (`Agent Cockpit (N)`), the in-content `AGENT COCKPIT` label and footer row (`Session List` + freshness) were removed, and focused-window blue list focus ring styling was removed for a cleaner HUD appearance.
+- Menu/Cockpit windows: Renamed the existing Cockpit window/menu item to `Legacy Cockpit` (defaulting to the `Live` filter), added a new single-instance `Agent Cockpit` window/menu item, moved `⌘⌥⇧C` to `Agent Cockpit`, and removed the Legacy shortcut.
+- Menu/Cockpit windows: Removed `Legacy Cockpit` from the `View` menu so only `Agent Cockpit` is exposed in the primary window menu.
+- Menu/Cockpit windows: Removed `Legacy Cockpit` from the macOS `Window` menu while keeping the legacy scene code path available.
 - Preferences (Advanced): Reordered sections so `Saved Sessions` appears above `Search`.
 - Preferences (Advanced): Reordered sections so `Git Context` appears at the bottom, and renamed `Live Sessions + Cockpit` to `Live Sessions + Cockpit BETA`.
 - Preferences (Advanced): Live-session/Cockpit controls are now consolidated under `Live Sessions + Cockpit (Beta)` in Settings → Advanced as the single feature toggle location.
 - Sessions (Live/Cockpit): OpenCode active/open session detection is temporarily disabled for this release; live-state scope is now Codex + Claude only.
 - Cockpit/Sessions (Live controls): When `Live Sessions + Cockpit (Beta)` is disabled, Cockpit and live-filter controls remain visible but disabled with explanatory help text.
+- Sessions (Cockpit): Cockpit header controls now show only `Active` and `Live` filters (removed `Cockpit`/`Show` text); `Live` includes both active and idle sessions.
+- Sessions (Cockpit): Cockpit window layout no longer uses a fixed content frame; default new-window height is now tuned for about 8 visible rows and resizing now scales rows naturally in both directions.
 - Preferences (Unified Window): Reordered sections so `Columns` and `Filters` appear before `Rich Transcript`.
 - Preferences (OpenClaw): Moved `Include deleted OpenClaw sessions` from Advanced to the OpenClaw pane as a standalone checkbox.
 - Sessions (Unified): Removed the leading dot from agent pill toggles in the main toolbar.
