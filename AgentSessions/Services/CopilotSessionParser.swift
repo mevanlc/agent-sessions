@@ -3,7 +3,9 @@ import CryptoKit
 
 /// Parser for GitHub Copilot CLI agent session-state JSONL files.
 ///
-/// Observed format: ~/.copilot/session-state/<sessionId>.jsonl
+/// Observed formats:
+///   Legacy:  ~/.copilot/session-state/<sessionId>.jsonl
+///   Current: ~/.copilot/session-state/<sessionId>/events.jsonl
 /// Each line is an event envelope: { type, data, id, timestamp, parentId }.
 final class CopilotSessionParser {
     private static let previewScanLimit = 2_000
@@ -84,6 +86,7 @@ final class CopilotSessionParser {
         }
 
         let id = forcedID ?? sessionID ?? fallbackID(for: url)
+        let customTitle = readWorkspaceName(near: url)
         return Session(
             id: id,
             source: .copilot,
@@ -97,7 +100,8 @@ final class CopilotSessionParser {
             cwd: cwd,
             repoName: nil,
             lightweightTitle: title,
-            lightweightCommands: estimatedCommands
+            lightweightCommands: estimatedCommands,
+            customTitle: customTitle
         )
     }
 
@@ -284,105 +288,31 @@ final class CopilotSessionParser {
                 case "session.info":
                     if let infoType = data["infoType"] as? String,
                        let msg = data["message"] as? String {
-                        events.append(SessionEvent(
-                            id: baseID,
-                            timestamp: ts,
-                            kind: .meta,
-                            role: "meta",
-                            text: "[info/\(infoType)] \(msg)",
-                            toolName: nil,
-                            toolInput: nil,
-                            toolOutput: nil,
-                            messageID: messageID,
-                            parentID: parentID,
-                            isDelta: false,
-                            rawJSON: rawJSONBase64(obj)
-                        ))
+                        events.append(metaEvent(id: baseID, timestamp: ts, text: "[info/\(infoType)] \(msg)",
+                                                messageID: messageID, parentID: parentID, rawObj: obj))
                     }
 
                 case "session.truncation":
-                    events.append(SessionEvent(
-                        id: baseID,
-                        timestamp: ts,
-                        kind: .meta,
-                        role: "meta",
-                        text: "[truncation]",
-                        toolName: nil,
-                        toolInput: nil,
-                        toolOutput: nil,
-                        messageID: messageID,
-                        parentID: parentID,
-                        isDelta: false,
-                        rawJSON: rawJSONBase64(obj)
-                    ))
+                    events.append(metaEvent(id: baseID, timestamp: ts, text: "[truncation]",
+                                            messageID: messageID, parentID: parentID, rawObj: obj))
 
                 case "assistant.turn_start", "assistant.turn_end":
-                    // Marker only; keep as meta for raw view.
-                    events.append(SessionEvent(
-                        id: baseID,
-                        timestamp: ts,
-                        kind: .meta,
-                        role: "meta",
-                        text: "[\(type)]",
-                        toolName: nil,
-                        toolInput: nil,
-                        toolOutput: nil,
-                        messageID: messageID,
-                        parentID: parentID,
-                        isDelta: false,
-                        rawJSON: rawJSONBase64(obj)
-                    ))
+                    events.append(metaEvent(id: baseID, timestamp: ts, text: "[\(type)]",
+                                            messageID: messageID, parentID: parentID, rawObj: obj))
 
                 case "session.start":
-                    events.append(SessionEvent(
-                        id: baseID,
-                        timestamp: ts,
-                        kind: .meta,
-                        role: "meta",
-                        text: "[session.start]",
-                        toolName: nil,
-                        toolInput: nil,
-                        toolOutput: nil,
-                        messageID: messageID,
-                        parentID: parentID,
-                        isDelta: false,
-                        rawJSON: rawJSONBase64(obj)
-                    ))
+                    events.append(metaEvent(id: baseID, timestamp: ts, text: "[session.start]",
+                                            messageID: messageID, parentID: parentID, rawObj: obj))
 
                 case "session.model_change":
                     if let m = data["newModel"] as? String {
-                        events.append(SessionEvent(
-                            id: baseID,
-                            timestamp: ts,
-                            kind: .meta,
-                            role: "meta",
-                            text: "[model] \(m)",
-                            toolName: nil,
-                            toolInput: nil,
-                            toolOutput: nil,
-                            messageID: messageID,
-                            parentID: parentID,
-                            isDelta: false,
-                            rawJSON: rawJSONBase64(obj)
-                        ))
+                        events.append(metaEvent(id: baseID, timestamp: ts, text: "[model] \(m)",
+                                                messageID: messageID, parentID: parentID, rawObj: obj))
                     }
 
                 default:
-                    // Unknown/unsupported event types: preserve as meta.
-                    events.append(SessionEvent(
-                        id: baseID,
-                        timestamp: ts,
-                        kind: .meta,
-                        role: "meta",
-                        text: "[\(type)]",
-                        toolName: nil,
-                        toolInput: nil,
-                        toolOutput: nil,
-                        messageID: messageID,
-                        parentID: parentID,
-                        isDelta: false,
-                        rawJSON: rawJSONBase64(obj)
-                    ))
+                    events.append(metaEvent(id: baseID, timestamp: ts, text: "[\(type)]",
+                                            messageID: messageID, parentID: parentID, rawObj: obj))
                 }
             }
         } catch {
@@ -391,6 +321,7 @@ final class CopilotSessionParser {
 
         let id = forcedID ?? sessionID ?? fallbackID(for: url)
         let nonMetaCount = events.filter { $0.kind != .meta }.count
+        let customTitle = readWorkspaceName(near: url)
         return Session(
             id: id,
             source: .copilot,
@@ -403,7 +334,8 @@ final class CopilotSessionParser {
             events: events,
             cwd: cwd,
             repoName: nil,
-            lightweightTitle: nil
+            lightweightTitle: nil,
+            customTitle: customTitle
         )
     }
 
@@ -417,15 +349,22 @@ final class CopilotSessionParser {
         return obj
     }
 
+    private static let isoFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static let isoBasic: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
     private static func decodeDate(_ any: Any?) -> Date? {
         guard let any else { return nil }
         if let s = any as? String {
-            let f = ISO8601DateFormatter()
-            f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let d = f.date(from: s) { return d }
-            let f2 = ISO8601DateFormatter()
-            f2.formatOptions = [.withInternetDateTime]
-            return f2.date(from: s)
+            return isoFractional.date(from: s) ?? isoBasic.date(from: s)
         }
         if let t = any as? TimeInterval { return Date(timeIntervalSince1970: t) }
         if let n = any as? NSNumber { return Date(timeIntervalSince1970: n.doubleValue) }
@@ -447,6 +386,11 @@ final class CopilotSessionParser {
 
     private static func fallbackID(for url: URL) -> String {
         let base = url.deletingPathExtension().lastPathComponent
+        // Current layout: events.jsonl inside a UUID directory — use the directory name
+        if base == "events" {
+            let parent = url.deletingLastPathComponent().lastPathComponent
+            if !parent.isEmpty { return parent }
+        }
         if !base.isEmpty { return base }
         return sha256(path: url.path)
     }
@@ -468,6 +412,15 @@ final class CopilotSessionParser {
         return nil
     }
 
+    private static func metaEvent(id: String, timestamp: Date?, text: String,
+                                    messageID: String?, parentID: String?,
+                                    rawObj: [String: Any]) -> SessionEvent {
+        SessionEvent(id: id, timestamp: timestamp, kind: .meta, role: "meta",
+                     text: text, toolName: nil, toolInput: nil, toolOutput: nil,
+                     messageID: messageID, parentID: parentID, isDelta: false,
+                     rawJSON: rawJSONBase64(rawObj))
+    }
+
     private static func sanitizeToolComplete(obj: [String: Any], toolCallId: String, outputBytes: Int) -> [String: Any] {
         var root = obj
         guard var data = root["data"] as? [String: Any] else { return root }
@@ -478,4 +431,32 @@ final class CopilotSessionParser {
         root["data"] = data
         return root
     }
+}
+
+// MARK: - Workspace YAML title support
+
+/// Reads the top-level `name` field from workspace.yaml in the same per-session directory as events.jsonl.
+/// Copilot writes this field only when the user runs `/rename`.
+/// Only applies to the current directory-based layout (`<uuid>/events.jsonl`), NOT legacy flat `.jsonl` files,
+/// to avoid reading a shared `workspace.yaml` from the parent `session-state/` directory.
+private func readWorkspaceName(near eventsURL: URL) -> String? {
+    // Only read workspace.yaml for directory-based layout (events.jsonl inside a per-session UUID dir).
+    guard eventsURL.lastPathComponent == "events.jsonl" else { return nil }
+    let dir = eventsURL.deletingLastPathComponent()
+    let ws = dir.appendingPathComponent("workspace.yaml")
+    guard let raw = try? String(contentsOf: ws, encoding: .utf8) else { return nil }
+    for line in raw.components(separatedBy: .newlines) {
+        // Top-level only: line must start with `name:` (no leading whitespace)
+        guard line.hasPrefix("name:") else { continue }
+        var value = String(line.dropFirst("name:".count))
+            .trimmingCharacters(in: .whitespaces)
+        // Strip surrounding quotes if present
+        if value.count >= 2,
+           (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+           (value.hasPrefix("'") && value.hasSuffix("'")) {
+            value = String(value.dropFirst().dropLast())
+        }
+        if !value.isEmpty { return value }
+    }
+    return nil
 }

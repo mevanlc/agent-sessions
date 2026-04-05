@@ -24,6 +24,12 @@ struct PreferencesView: View {
     // Cockpit: active-session registry + iTerm focus
     @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) var codexActiveSessionsEnabled: Bool = true
     @AppStorage(PreferencesKey.Cockpit.codexActiveRegistryRootOverride) var codexActiveRegistryRootOverride: String = ""
+    @AppStorage(PreferencesKey.Cockpit.hudShowAgentNameInCompact) var cockpitShowAgentNameInCompact: Bool = true
+    @AppStorage(PreferencesKey.Cockpit.hudCompactBaselineRows) var cockpitCompactBaselineRows: Int = 4
+    @AppStorage(PreferencesKey.Cockpit.hudCompactAutoFitEnabled) var cockpitCompactAutoFitEnabled: Bool = false
+    @AppStorage(PreferencesKey.Cockpit.showTabSubtitleInFullMode) var cockpitShowTabSubtitleInFullMode: Bool = true
+    @AppStorage(PreferencesKey.Cockpit.hudShowLimits) var cockpitShowLimitsFooter: Bool = true
+    @AppStorage(PreferencesKey.Cockpit.hudReduceTransparency) var cockpitReduceTransparency: Bool = true
     // Codex probe cleanup prefs
     @AppStorage(PreferencesKey.codexProbeCleanupMode) var codexProbeCleanupMode: String = "none" // none | auto
     @State var showConfirmCodexAutoDelete: Bool = false
@@ -34,6 +40,7 @@ struct PreferencesView: View {
     @AppStorage(PreferencesKey.claudeProbeCleanupMode) var claudeProbeCleanupMode: String = "none" // none | auto
     // Debug: show probe sessions in lists
     @AppStorage(PreferencesKey.showSystemProbeSessions) var showSystemProbeSessions: Bool = false
+    @AppStorage(PreferencesKey.Cockpit.showProbeSessionsInHUD) var showProbeSessionsInHUD: Bool = false
     @State var showConfirmAutoDelete: Bool = false
     @State var showConfirmDeleteNow: Bool = false
     @State var showClaudeCleanupResult: Bool = false
@@ -62,7 +69,7 @@ struct PreferencesView: View {
     @AppStorage(PreferencesKey.Agents.openCodeEnabled) var openCodeAgentEnabled: Bool = true
     @AppStorage(PreferencesKey.Agents.copilotEnabled) var copilotAgentEnabled: Bool = true
     @AppStorage(PreferencesKey.Agents.droidEnabled) var droidAgentEnabled: Bool = true
-    @AppStorage(PreferencesKey.Agents.openClawEnabled) var openClawAgentEnabled: Bool = AgentEnablement.isAvailable(.openclaw)
+    @AppStorage(PreferencesKey.Agents.openClawEnabled) var openClawAgentEnabled: Bool = false
     // Menu bar prefs
     @AppStorage(PreferencesKey.menuBarEnabled) var menuBarEnabled: Bool = false
     @AppStorage(PreferencesKey.menuBarScope) var menuBarScopeRaw: String = MenuBarScope.both.rawValue
@@ -97,6 +104,7 @@ struct PreferencesView: View {
     @State var showCrashClearConfirm: Bool = false
     @State var showCrashExportError: Bool = false
     @State var crashExportErrorMessage: String = ""
+    @State var showCoreIndexRebuildConfirm: Bool = false
 
     init(initialTab: PreferencesTab = .general) {
         self.initialTabArg = initialTab
@@ -299,6 +307,14 @@ struct PreferencesView: View {
             Privacy: Only reads usage percentages, no conversation data accessed.
             """)
         }
+        .alert("Rebuild Core Index?", isPresented: $showCoreIndexRebuildConfirm) {
+            Button("Rebuild", role: .destructive) {
+                NotificationCenter.default.post(name: .requestCoreIndexRebuild, object: nil)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This rebuild purges cached core index data for all providers (including disabled ones), then rebuilds enabled providers. It can use significant CPU and may reduce responsiveness until complete.")
+        }
     }
 
     // MARK: Layout chrome
@@ -318,6 +334,8 @@ struct PreferencesView: View {
                 unifiedTab
             case .advanced:
                 advancedTab
+            case .agentCockpit:
+                agentCockpitTab
             case .codexCLI:
                 codexCLITab
             case .claudeResume:
@@ -656,6 +674,8 @@ struct PreferencesView: View {
         validateDroidProjectsPath()
         validateOpenClawSessionsPath()
 
+        cockpitReduceTransparency = true
+
         // Reset usage strip preferences
         UserDefaults.standard.set(false, forKey: PreferencesKey.showClaudeUsageStrip)
         ClaudeUsageModel.shared.setEnabled(false)
@@ -944,6 +964,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
     case menuBar
     case unified
     case advanced
+    case agentCockpit
     case codexCLI
     case claudeResume
     case opencode
@@ -963,6 +984,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
         case .menuBar: return "Menu Bar"
         case .unified: return "Unified Window"
         case .advanced: return "Advanced"
+        case .agentCockpit: return "Agent Cockpit"
         case .codexCLI: return "Codex CLI"
         case .claudeResume: return "Claude Code"
         case .opencode: return "OpenCode"
@@ -982,6 +1004,7 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
         case .menuBar: return "menubar.rectangle"
         case .unified: return "square.grid.2x2"
         case .advanced: return "gearshape.2"
+        case .agentCockpit: return "rectangle.3.group"
         case .codexCLI: return "terminal"
         case .claudeResume: return "c.square"
         case .opencode: return "chevron.left.slash.chevron.right"
@@ -995,8 +1018,8 @@ enum PreferencesTab: String, CaseIterable, Identifiable {
 }
 
 private extension PreferencesView {
-    // Sidebar order: General → Unified Window → Usage Tracking → Usage Probes → Menu Bar → Agents → About
-    var visibleTabs: [PreferencesTab] { [.general, .unified, .usageTracking, .usageProbes, .menuBar, .advanced, .codexCLI, .claudeResume, .opencode, .geminiCLI, .copilotCLI, .droidCLI, .openClawCLI, .about] }
+    // Sidebar order: General → Agent Cockpit → Unified Window → Usage Tracking → Usage Probes → Menu Bar → Agents → About
+    var visibleTabs: [PreferencesTab] { [.general, .agentCockpit, .unified, .usageTracking, .usageProbes, .menuBar, .advanced, .codexCLI, .claudeResume, .opencode, .geminiCLI, .copilotCLI, .droidCLI, .openClawCLI, .about] }
 }
 
 // MARK: - Probe helpers
@@ -1148,7 +1171,7 @@ extension PreferencesView {
             if droidVersionString == nil && droidProbeState != .probing { probeDroid() }
         case .openClawCLI:
             if openClawVersionString == nil && openClawProbeState != .probing { probeOpenClaw() }
-        case .menuBar, .usageProbes, .general, .unified, .advanced, .about:
+        case .menuBar, .usageProbes, .general, .unified, .advanced, .agentCockpit, .about:
             break
         }
     }

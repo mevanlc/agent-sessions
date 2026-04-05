@@ -51,6 +51,13 @@ private extension Notification.Name {
     static let collapseInlineSearchIfEmpty = Notification.Name("UnifiedSessionsCollapseInlineSearchIfEmpty")
 }
 
+private enum CockpitNavigationUserInfoKey {
+    static let source = "source"
+    static let runtimeSessionID = "runtimeSessionID"
+    static let logPath = "logPath"
+    static let workingDirectory = "workingDirectory"
+}
+
 private enum UnifiedSessionsStyle {
     static let selectionAccent = Color(hex: "007acc")
     static let timestampColor = Color(hex: "8E8E93")
@@ -210,9 +217,12 @@ struct UnifiedSessionsView: View {
     @EnvironmentObject var columnVisibility: ColumnVisibilityStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var systemColorScheme
+    @Environment(\.openWindow) private var openWindow
 
     let layoutMode: LayoutMode
     let analyticsReady: Bool
+    let analyticsPhase: AnalyticsIndexPhase
+    let analyticsIsStale: Bool
     let onToggleLayout: () -> Void
 
     @State private var selection: String?
@@ -220,11 +230,14 @@ struct UnifiedSessionsView: View {
     @State private var lastSelectedSource: SessionSource = .codex
 		@State private var sortOrder: [KeyPathComparator<Session>] = []
 		@State private var cachedRows: [Session] = []
+    @State private var collapsedParents: Set<String> = []
+    @State private var hierarchyRowMeta: [String: SubagentRowMeta] = [:]
 	@State private var columnLayoutID: UUID = UUID()
 	@AppStorage("UnifiedShowSourceColumn") private var showSourceColumn: Bool = true
 	@AppStorage("UnifiedShowStarColumn") private var showStarColumn: Bool = true
 	@AppStorage("UnifiedShowSizeColumn") private var showSizeColumn: Bool = true
     @AppStorage("UnifiedShowActiveSessionsOnly") private var showActiveSessionsOnly: Bool = false
+    @AppStorage(PreferencesKey.Unified.showSubagentHierarchy) private var showSubagentHierarchy: Bool = true
     @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var liveSessionsFeatureEnabled: Bool = true
 	@AppStorage("StripMonochromeMeters") private var stripMonochrome: Bool = false
 	@AppStorage("ModifiedDisplay") private var modifiedDisplayRaw: String = SessionIndexer.ModifiedDisplay.relative.rawValue
@@ -237,13 +250,12 @@ struct UnifiedSessionsView: View {
 	@AppStorage(PreferencesKey.Agents.openCodeEnabled) private var openCodeAgentEnabled: Bool = true
 	@AppStorage(PreferencesKey.Agents.copilotEnabled) private var copilotAgentEnabled: Bool = true
 	    @AppStorage(PreferencesKey.Agents.droidEnabled) private var droidAgentEnabled: Bool = true
-	    @AppStorage(PreferencesKey.Agents.openClawEnabled) private var openClawAgentEnabled: Bool = AgentEnablement.isAvailable(.openclaw)
+	    @AppStorage(PreferencesKey.Agents.openClawEnabled) private var openClawAgentEnabled: Bool = false
 	    @State private var autoSelectEnabled: Bool = true
 	    @State private var isDatasetChurning: Bool = false
 	    @State private var isAutoSelectingFromSearch: Bool = false
     @State private var hasEverHadSessions: Bool = false
     @State private var hasUserManuallySelected: Bool = false
-    @State private var showAnalyticsWarmupNotice: Bool = false
     @State private var showAgentEnablementNotice: Bool = false
     @State private var isWindowKey: Bool = false
     @State private var activeConsumerID = UUID()
@@ -286,6 +298,8 @@ struct UnifiedSessionsView: View {
          droidIndexer: DroidSessionIndexer,
          openclawIndexer: OpenClawSessionIndexer,
          analyticsReady: Bool,
+         analyticsPhase: AnalyticsIndexPhase,
+         analyticsIsStale: Bool,
          layoutMode: LayoutMode,
          onToggleLayout: @escaping () -> Void) {
         self.unified = unified
@@ -297,6 +311,8 @@ struct UnifiedSessionsView: View {
         self.droidIndexer = droidIndexer
         self.openclawIndexer = openclawIndexer
         self.analyticsReady = analyticsReady
+        self.analyticsPhase = analyticsPhase
+        self.analyticsIsStale = analyticsIsStale
         self.layoutMode = layoutMode
         self.onToggleLayout = onToggleLayout
         let store = SearchSessionStore(adapters: [
@@ -318,7 +334,13 @@ struct UnifiedSessionsView: View {
             .opencode: .init(
                 transcriptCache: opencodeIndexer.searchTranscriptCache,
                 update: { opencodeIndexer.updateSession($0) },
-                parseFull: { url, _ in OpenCodeSessionParser.parseFileFull(at: url) }
+                parseFull: { [opencodeIndexer] url, forcedID in
+                    if url.lastPathComponent == "opencode.db", !forcedID.isEmpty {
+                        let customRoot = opencodeIndexer.sessionsRootOverride.isEmpty ? nil : opencodeIndexer.sessionsRootOverride
+                        return OpenCodeSqliteReader.loadFullSession(customRoot: customRoot, sessionID: forcedID)
+                    }
+                    return OpenCodeSessionParser.parseFileFull(at: url)
+                }
             ),
             .copilot: .init(
                 transcriptCache: copilotIndexer.searchTranscriptCache,
@@ -385,6 +407,7 @@ struct UnifiedSessionsView: View {
 				                    unified.setAppActive(NSApp.isActive)
 			                    updateFocusedSessionIfNeeded(selectedSession)
 			                    refreshSelectionSourceFromCachedRows()
+                                tryHandlePendingCockpitNavigationIfNeeded()
 		                    searchCoordinator.setAppActive(NSApp.isActive)
 			                }
 			                .onDisappear {
@@ -402,14 +425,7 @@ struct UnifiedSessionsView: View {
                 }
 		)
 
-		let afterAnalytics = lifecycle
-			.onChange(of: analyticsReady) { _, ready in
-				if ready {
-					withAnimation { showAnalyticsWarmupNotice = false }
-				}
-			}
-
-		let afterSelection = afterAnalytics
+		let afterSelection = lifecycle
 			.onChange(of: selection) { _, id in
 				handleSelectionChange(id)
 			}
@@ -449,6 +465,16 @@ struct UnifiedSessionsView: View {
                 refreshSelectionSourceFromCachedRows()
                 updateFocusedSessionIfNeeded(selectedSession)
             }
+            .onChange(of: showSubagentHierarchy) { _, newValue in
+                if newValue {
+                    // Reset collapsed state so all parents start expanded
+                    collapsedParents.removeAll()
+                }
+                updateCachedRows()
+            }
+            .onChange(of: collapsedParents) { _, _ in
+                updateCachedRows()
+            }
 
 			let afterUsage = afterLiveFeature
 				.onChange(of: codexUsageEnabled) { _, _ in updateFooterUsageVisibility() }
@@ -479,6 +505,7 @@ struct UnifiedSessionsView: View {
 				if !sessions.isEmpty {
 					hasEverHadSessions = true
 				}
+                tryHandlePendingCockpitNavigationIfNeeded()
 			}
 
 		let afterSessionSearch = afterSessions
@@ -523,7 +550,12 @@ struct UnifiedSessionsView: View {
 					}
 				}
 
-				let afterShowImages = afterNavigateFromImages
+				let afterNavigateFromCockpit = afterNavigateFromImages
+					.onReceive(NotificationCenter.default.publisher(for: .navigateToSessionFromCockpit)) { n in
+						handleNavigateToSessionFromCockpit(n)
+					}
+
+				let afterShowImages = afterNavigateFromCockpit
 					.onReceive(NotificationCenter.default.publisher(for: .showImagesFromMenu)) { _ in
 						showImagesForSelectedSession(showNoSelectionAlert: true)
 					}
@@ -567,18 +599,6 @@ struct UnifiedSessionsView: View {
 
 	private var topTrailingNotices: some View {
 		VStack(alignment: .trailing, spacing: 8) {
-			if showAnalyticsWarmupNotice {
-				HStack(spacing: 8) {
-					ProgressView()
-						.controlSize(.small)
-					Text("Analytics is warming up… try again in ~1–2 minutes")
-						.font(.footnote)
-				}
-				.padding(10)
-				.background(.regularMaterial)
-				.clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-				.transition(.move(edge: .top).combined(with: .opacity))
-			}
 			if showAgentEnablementNotice {
 				Text("Showing active agents only")
 					.font(.footnote)
@@ -659,8 +679,20 @@ struct UnifiedSessionsView: View {
                        ideal: showSourceColumn ? 100 : 0,
                        max: showSourceColumn ? 120 : 0)
 
-	            TableColumn("Session", value: \Session.title) { s in
-	                SessionTitleCell(session: s, geminiIndexer: geminiIndexer)
+	            TableColumn("Session", value: \Session.listTitle) { s in
+	                SessionTitleCell(
+                        session: s,
+                        geminiIndexer: geminiIndexer,
+                        rowMeta: hierarchyRowMeta[s.id],
+                        isExpanded: !collapsedParents.contains(s.id),
+                        onToggleExpand: { id in
+                            if collapsedParents.contains(id) {
+                                collapsedParents.remove(id)
+                            } else {
+                                collapsedParents.insert(id)
+                            }
+                        }
+                    )
 	                    .contentShape(Rectangle())
 	                    .onTapGesture {
 	                        selectionChangeSource = .mouse
@@ -740,8 +772,10 @@ struct UnifiedSessionsView: View {
 			            if ids.count == 1, let id = ids.first, let s = cachedRows.first(where: { $0.id == id }) {
 			                Button(s.isFavorite ? "Remove from Saved" : "Save") { unified.toggleFavorite(s) }
 			                Divider()
-	                if s.source == .codex || s.source == .claude {
-	                    Button("Resume in \(s.source == .codex ? "Codex CLI" : "Claude Code") (\(CodexLaunchMode.selectedResumeTerminalTitle()))") { resume(s) }
+	                // Derive Gemini CLI session ID once to avoid repeated disk reads
+	                let geminiCLISessionID = (s.source == .gemini) ? GeminiSessionIDHelper.deriveSessionID(from: s) : nil
+	                if canResumeSession(s, geminiCLISessionID: geminiCLISessionID) {
+	                    Button("Resume in \(resumeAgentLabel(s.source)) (\(CodexLaunchMode.selectedResumeTerminalTitle()))") { resume(s) }
 	                        .keyboardShortcut("r", modifiers: [.command, .control])
 	                        .help("Resume the selected session in its original CLI (⌃⌘R)")
 	                    Divider()
@@ -763,6 +797,9 @@ struct UnifiedSessionsView: View {
                     .help("Show session log file in Finder (⌥⌘L)")
                 Button("Copy Session ID") { copySessionID(id) }
                     .help("Copy the session ID to the clipboard")
+                Button("Copy Resume Command") { copyResumeCommand(s, geminiCLISessionID: geminiCLISessionID) }
+                    .disabled(!canCopyResumeCommand(s, geminiCLISessionID: geminiCLISessionID))
+                    .help("Copy a terminal-agnostic resume command to the clipboard")
                 // Git Context Inspector (Codex + Claude; feature-flagged)
                 if isGitInspectorEnabled, (s.source == .codex || s.source == .claude) {
                     Divider()
@@ -787,6 +824,9 @@ struct UnifiedSessionsView: View {
                 Button("Copy Session ID") {}
                     .disabled(true)
                     .help("Select exactly one session to copy its ID")
+                Button("Copy Resume Command") {}
+                    .disabled(true)
+                    .help("Select exactly one session to copy its resume command")
                 Button("Filter by Project") {}
                     .disabled(true)
                     .help("Select a session with project metadata to filter")
@@ -800,7 +840,7 @@ struct UnifiedSessionsView: View {
                 else if first.keyPath == \Session.repoDisplay { key = .repo }
                 else if first.keyPath == \Session.fileSizeSortKey { key = .size }
                 else if first.keyPath == \Session.sourceKey { key = .agent }
-                else if first.keyPath == \Session.title { key = .title }
+                else if first.keyPath == \Session.listTitle { key = .title }
                 else { key = .title }
                 unified.sortDescriptor = .init(key: key, ascending: first.order == .forward)
                 unified.recomputeNow()
@@ -874,8 +914,31 @@ struct UnifiedSessionsView: View {
 	        if unified.launchState.overallPhase < .ready {
 	            return unified.launchState.overallPhase.statusDescription
 	        }
-	        if unified.isIndexing || unified.isProcessingTranscripts {
-	            return unified.isProcessingTranscripts ? "Processing sessions…" : "Indexing sessions…"
+	        if unified.coreIndexingDisplayMode == .syncing {
+	            let progress = unified.coreIndexingProgress
+	            if progress.total > 0, let percent = progress.percent {
+	                return "Syncing updates \(progress.processed)/\(progress.total) (\(percent)%)…"
+	            }
+	            if progress.processed > 0 {
+	                return "Syncing updates (\(progress.processed))…"
+	            }
+	            return "Syncing updates…"
+	        }
+	        if unified.coreIndexingDisplayMode == .indexing || unified.isIndexing {
+	            let progress = unified.coreIndexingProgress
+	            if progress.total > 0 {
+	                if let percent = progress.percent {
+	                    return "Indexing \(progress.processed)/\(progress.total) sessions (\(percent)%)…"
+	                }
+	                return "Indexing \(progress.processed)/\(progress.total) sessions…"
+	            }
+	            if progress.processed > 0 {
+	                return "Indexing \(progress.processed) sessions…"
+	            }
+	            return "Indexing sessions…"
+	        }
+	        if unified.isProcessingTranscripts {
+	            return "Processing transcripts (core index)…"
 	        }
 	        if searchCoordinator.isRunning {
 	            return "Searching…"
@@ -942,6 +1005,98 @@ struct UnifiedSessionsView: View {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(id, forType: .string)
+    }
+
+    private func canCopyResumeCommand(_ session: Session, geminiCLISessionID: String? = nil) -> Bool {
+        switch session.source {
+        case .claude:
+            return true // falls back to --continue
+        case .codex:
+            return session.codexInternalSessionID != nil || session.codexFilenameUUID != nil
+        case .opencode:
+            return true // session.id is the SQLite session ID; falls back to --continue
+        case .copilot:
+            return true // session.id from session.start; falls back to --continue
+        case .gemini:
+            return (geminiCLISessionID ?? GeminiSessionIDHelper.deriveSessionID(from: session)) != nil
+        default:
+            return false
+        }
+    }
+
+    private func copyResumeCommand(_ session: Session, geminiCLISessionID: String? = nil) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+
+        switch session.source {
+        case .claude:
+            let settings = ClaudeResumeSettings.shared
+            let sid = ClaudeSessionIDHelper.deriveSessionID(from: session)
+            let wd = ClaudeSessionIDHelper.projectRoot(for: session)
+            let binary = settings.binaryPath.isEmpty ? "claude" : settings.binaryPath
+            let builder = ClaudeResumeCommandBuilder()
+            let core: String
+            if let id = sid, !id.isEmpty {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --resume \(builder.shellQuoteIfNeeded(id))"
+            } else {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --continue"
+            }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            pb.setString(command, forType: .string)
+
+        case .codex:
+            let settings = CodexResumeSettings.shared
+            guard let sid = session.codexInternalSessionID ?? session.codexFilenameUUID else { return }
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryOverride.isEmpty ? "codex" : settings.binaryOverride
+            let builder = CodexResumeCommandBuilder()
+            let core = "\(builder.shellQuoteIfNeeded(binary)) resume \(builder.shellQuoteIfNeeded(sid))"
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0)) && \(core)" } ?? core
+            pb.setString(command, forType: .string)
+
+        case .opencode:
+            let settings = OpenCodeSettings.shared
+            let sid = session.id
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryPath.isEmpty ? "opencode" : settings.binaryPath
+            let builder = OpenCodeResumeCommandBuilder()
+            let core: String
+            if !sid.isEmpty {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --session \(builder.shellQuoteIfNeeded(sid))"
+            } else {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --continue"
+            }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            pb.setString(command, forType: .string)
+
+        case .copilot:
+            let settings = CopilotSettings.shared
+            let sid = session.id
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryPath.isEmpty ? "copilot" : settings.binaryPath
+            let builder = CopilotResumeCommandBuilder()
+            let core: String
+            if !sid.isEmpty {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --resume=\(builder.shellQuoteIfNeeded(sid))"
+            } else {
+                core = "\(builder.shellQuoteIfNeeded(binary)) --continue"
+            }
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            pb.setString(command, forType: .string)
+
+        case .gemini:
+            let settings = GeminiCLISettings.shared
+            guard let sid = geminiCLISessionID ?? GeminiSessionIDHelper.deriveSessionID(from: session) else { return }
+            let wd = settings.effectiveWorkingDirectory(for: session)
+            let binary = settings.binaryOverride.isEmpty ? "gemini" : settings.binaryOverride
+            let builder = GeminiResumeCommandBuilder()
+            let core = "\(builder.shellQuoteIfNeeded(binary)) --resume \(builder.shellQuoteIfNeeded(sid))"
+            let command = wd.map { "cd \(builder.shellQuoteIfNeeded($0.path)) && \(core)" } ?? core
+            pb.setString(command, forType: .string)
+
+        default:
+            break
+        }
     }
 
 	    private var transcriptPane: some View {
@@ -1034,8 +1189,17 @@ struct UnifiedSessionsView: View {
                     .help(
                         liveSessionsFeatureEnabled
                             ? "Show only live sessions in the list (Codex, Claude)"
-                            : "Enable Live sessions + Cockpit (Beta) in Settings → Advanced."
+                            : "Enable Live sessions + Cockpit (Beta) in Settings → Agent Cockpit."
                     )
+
+                Button(action: { showSubagentHierarchy.toggle() }) {
+                    Image(systemName: showSubagentHierarchy ? "list.bullet.indent" : "list.bullet")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(showSubagentHierarchy ? Color.accentColor : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(showSubagentHierarchy ? "Flat session list (⇧⌘H)" : "Show subagent hierarchy (⇧⌘H)")
+                .keyboardShortcut("h", modifiers: [.command, .shift])
 
                 if codexAgentEnabled {
                     AgentTabToggle(title: "Codex", color: Color.agentCodex, isMonochrome: stripMonochrome, isOn: $unified.includeCodex)
@@ -1103,8 +1267,8 @@ struct UnifiedSessionsView: View {
 
             AnalyticsButtonView(
                 isReady: analyticsReady,
-                disabledReason: analyticsDisabledReason,
-                onWarmupTap: handleAnalyticsWarmupTap
+                phase: analyticsPhase,
+                isStale: analyticsIsStale
             )
 
             ToolbarGroupDivider()
@@ -1127,13 +1291,15 @@ struct UnifiedSessionsView: View {
             .disabled(selectedSession == nil)
             .accessibilityLabel(Text("Open Working Directory"))
 
-            ToolbarIconButton(help: "Re-run the session indexer to discover new logs (⌘R)") { _ in
+            ToolbarIconButton(help: "Refresh sessions list/index (core indexing, not Analytics) (⌘R)") { _ in
                 ZStack {
                     ToolbarIcon(systemName: "arrow.clockwise")
                         .opacity(unified.isIndexing || unified.isProcessingTranscripts ? 0.35 : 1)
                     if unified.isIndexing || unified.isProcessingTranscripts {
-                        ProgressView()
-                            .controlSize(.small)
+                        Circle()
+                            .fill(Color.secondary)
+                            .frame(width: 7, height: 7)
+                            .offset(x: 8, y: -8)
                     }
                 }
             } action: {
@@ -1150,6 +1316,18 @@ struct UnifiedSessionsView: View {
             }
             .disabled(selectedSession == nil)
             .accessibilityLabel(Text("Image Browser"))
+
+            ToolbarIconButton(
+                help: liveSessionsFeatureEnabled
+                    ? "Open Agent Cockpit."
+                    : "Enable Live sessions + Cockpit (Beta) in Settings → Agent Cockpit."
+            ) { _ in
+                ToolbarIcon(systemName: "rectangle.3.group")
+            } action: {
+                openWindow(id: "AgentCockpit")
+            }
+            .disabled(!liveSessionsFeatureEnabled)
+            .accessibilityLabel(Text("Agent Cockpit"))
 
             if isGitInspectorEnabled {
                 ToolbarIconButton(help: "Show historical and current git context with safety analysis (⌘⇧G)") { _ in
@@ -1228,7 +1406,7 @@ struct UnifiedSessionsView: View {
         return "Show images for the selected session"
     }
 
-    // Local helper mirrors SessionsListView absolute time formatting
+    // Local helper for absolute time formatting
     private func absoluteTimeUnified(_ date: Date?) -> String {
         guard let date else { return "" }
         return AppDateFormatting.dateTimeShort(date)
@@ -1364,6 +1542,162 @@ struct UnifiedSessionsView: View {
         updateFocusedSessionIfNeeded(s)
     }
 
+    private struct CockpitNavigationTarget {
+        let unifiedSessionID: String
+        let source: SessionSource?
+        let runtimeSessionID: String?
+        let logPath: String?
+        let workingDirectory: String?
+    }
+
+    private func handleNavigateToSessionFromCockpit(_ notification: Notification) {
+        guard let unifiedSessionID = notification.object as? String else { return }
+        let sourceRaw = notification.userInfo?[CockpitNavigationUserInfoKey.source] as? String
+        let source = sourceRaw.flatMap(SessionSource.init(rawValue:))
+        let target = CockpitNavigationTarget(
+            unifiedSessionID: unifiedSessionID,
+            source: source,
+            runtimeSessionID: notification.userInfo?[CockpitNavigationUserInfoKey.runtimeSessionID] as? String,
+            logPath: notification.userInfo?[CockpitNavigationUserInfoKey.logPath] as? String,
+            workingDirectory: notification.userInfo?[CockpitNavigationUserInfoKey.workingDirectory] as? String
+        )
+        _ = handleCockpitNavigation(target, emitBeepOnFailure: false)
+    }
+
+    @discardableResult
+    private func handleCockpitNavigation(_ target: CockpitNavigationTarget, emitBeepOnFailure: Bool) -> Bool {
+        guard let session = resolveCockpitNavigationTarget(target) else {
+            if emitBeepOnFailure {
+                NSSound.beep()
+            }
+            return false
+        }
+
+        let wasVisible = cachedRows.contains(where: { $0.id == session.id })
+        if !wasVisible {
+            applyAutoRevealFiltersForCockpitNavigation(session)
+            _ = updateCachedRows()
+        }
+
+        guard cachedRows.contains(where: { $0.id == session.id }) else {
+            if emitBeepOnFailure {
+                NSSound.beep()
+            }
+            return false
+        }
+
+        let selectedSource = cachedRows.first(where: { $0.id == session.id })?.source ?? session.source
+        setActiveSelection(session.id, source: selectedSource, userInitiated: true)
+        focusCoordinator.perform(.selectSession(id: session.id))
+        NotificationCenter.default.post(name: .collapseInlineSearchIfEmpty, object: nil)
+        updateFocusedSessionIfNeeded(session)
+        CockpitNavigationBridge.clearIfMatching(unifiedSessionID: target.unifiedSessionID)
+
+        NSApp.activate(ignoringOtherApps: true)
+        if let main = NSApp.windows.first(where: { $0.isVisible && $0.title == "Agent Sessions" }) ?? NSApp.mainWindow {
+            main.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    private func tryHandlePendingCockpitNavigationIfNeeded() {
+        guard let pending = CockpitNavigationBridge.load() else { return }
+        if Date().timeIntervalSince(pending.createdAt) > 45 {
+            CockpitNavigationBridge.clear()
+            return
+        }
+
+        let source = pending.sourceRawValue.flatMap(SessionSource.init(rawValue:))
+        let target = CockpitNavigationTarget(
+            unifiedSessionID: pending.unifiedSessionID,
+            source: source,
+            runtimeSessionID: pending.runtimeSessionID,
+            logPath: pending.logPath,
+            workingDirectory: pending.workingDirectory
+        )
+        _ = handleCockpitNavigation(target, emitBeepOnFailure: false)
+    }
+
+    private func resolveCockpitNavigationTarget(_ target: CockpitNavigationTarget) -> Session? {
+        let scoped = unified.allSessions.filter { session in
+            guard let source = target.source else { return true }
+            return session.source == source
+        }
+
+        if let direct = scoped.first(where: { $0.id == target.unifiedSessionID }) {
+            return direct
+        }
+
+        if let logPath = target.logPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !logPath.isEmpty {
+            let normalized = CodexActiveSessionsModel.normalizePath(logPath)
+            if let match = scoped.first(where: {
+                CodexActiveSessionsModel.normalizePath($0.filePath) == normalized
+            }) {
+                return match
+            }
+        }
+
+        if let runtimeSessionID = target.runtimeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !runtimeSessionID.isEmpty {
+            if let match = scoped.first(where: {
+                CodexActiveSessionsModel.liveSessionIDCandidates(for: $0).contains(runtimeSessionID)
+            }) {
+                return match
+            }
+        }
+
+        // cwd-only fallback intentionally omitted — prefer "no navigation"
+        // over navigating to a potentially wrong session from the same directory.
+        return nil
+    }
+
+    private func applyAutoRevealFiltersForCockpitNavigation(_ session: Session) {
+        ensureSourceIncludedForCockpitNavigation(session.source)
+
+        if showActiveSessionsOnly, !isSessionLive(session) {
+            showActiveSessionsOnly = false
+        }
+        if unified.showFavoritesOnly {
+            unified.showFavoritesOnly = false
+        }
+
+        if !unified.queryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !unified.query.isEmpty {
+            unified.queryDraft = ""
+            unified.query = ""
+            searchCoordinator.cancel()
+        }
+
+        if unified.projectFilter != nil { unified.projectFilter = nil }
+        if unified.dateFrom != nil { unified.dateFrom = nil }
+        if unified.dateTo != nil { unified.dateTo = nil }
+        if unified.selectedModel != nil { unified.selectedModel = nil }
+        let allKinds = Set(SessionEventKind.allCases)
+        if unified.selectedKinds != allKinds {
+            unified.selectedKinds = allKinds
+        }
+        unified.recomputeNow()
+    }
+
+    private func ensureSourceIncludedForCockpitNavigation(_ source: SessionSource) {
+        switch source {
+        case .codex:
+            if !unified.includeCodex { unified.includeCodex = true }
+        case .claude:
+            if !unified.includeClaude { unified.includeClaude = true }
+        case .gemini:
+            if !unified.includeGemini { unified.includeGemini = true }
+        case .opencode:
+            if !unified.includeOpenCode { unified.includeOpenCode = true }
+        case .copilot:
+            if !unified.includeCopilot { unified.includeCopilot = true }
+        case .droid:
+            if !unified.includeDroid { unified.includeDroid = true }
+        case .openclaw:
+            if !unified.includeOpenClaw { unified.includeOpenClaw = true }
+        }
+    }
+
     private func handleWindowDidBecomeKey() {
         isWindowKey = true
         updateFocusedSessionIfNeeded(selectedSession)
@@ -1441,7 +1775,14 @@ struct UnifiedSessionsView: View {
         )
 
 	        if !(shouldHoldRowsDuringRunningSearch || shouldHoldRowsDuringTransientEmptyRefresh) {
-	            cachedRows = nextRows
+                let searchActive = !query.isEmpty
+                let hierarchyResult = SubagentHierarchyBuilder.build(
+                    sessions: nextRows,
+                    collapsedParents: collapsedParents,
+                    hierarchyEnabled: showSubagentHierarchy && !searchActive
+                )
+	            cachedRows = hierarchyResult.sessions
+                hierarchyRowMeta = hierarchyResult.rowMeta
 	        }
         let heldRows = shouldHoldRowsDuringRunningSearch || shouldHoldRowsDuringTransientEmptyRefresh
 
@@ -1498,21 +1839,6 @@ struct UnifiedSessionsView: View {
 	        refreshSelectionSourceFromCachedRows()
 	    }
 
-    private func handleAnalyticsWarmupTap() {
-        if showAnalyticsWarmupNotice { return }
-        withAnimation { showAnalyticsWarmupNotice = true }
-        // Auto-dismiss after a short delay so the notice stays lightweight.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-            withAnimation { showAnalyticsWarmupNotice = false }
-        }
-    }
-
-    private var analyticsDisabledReason: String? {
-        if !analyticsReady {
-            return "Analytics warming up…"
-        }
-        return nil
-    }
 
     @ViewBuilder
     private func launchBlockingTranscriptOverlay() -> some View {
@@ -1550,9 +1876,12 @@ struct UnifiedSessionsView: View {
     private func cellSource(for session: Session) -> some View {
         let label: String
         let isSelected = selection == session.id
-        let liveState: CodexLiveState? = {
+        let presence: CodexActivePresence? = {
             guard activeCodexSessions.supportsLiveSessions(for: session.source) else { return nil }
-            guard let presence = livePresence(for: session) else { return nil }
+            return livePresence(for: session)
+        }()
+        let liveState: CodexLiveState? = {
+            guard let presence else { return nil }
             return activeCodexSessions.liveState(for: presence)
         }()
         let rowTextColor: Color = {
@@ -1560,9 +1889,18 @@ struct UnifiedSessionsView: View {
             return !stripMonochrome ? sourceAccent(session) : .secondary
         }()
         let rowDotColor: Color = {
+            if let liveState {
+                switch liveState {
+                case .activeWorking:
+                    return Color(hex: "30d158")
+                case .openIdle:
+                    return effectiveColorScheme == .dark ? Color(hex: "ffb340") : Color(hex: "e08600")
+                }
+            }
             if isSelected { return .white.opacity(0.95) }
             return !stripMonochrome ? sourceAccent(session) : .primary
         }()
+        let liveOpacity: Double = liveState == .openIdle ? 0.60 : 1.0
         switch session.source {
         case .codex: label = "Codex"
         case .claude: label = "Claude"
@@ -1572,16 +1910,32 @@ struct UnifiedSessionsView: View {
         case .droid: label = "Droid"
         case .openclaw: label = "OpenClaw"
         }
+        let isSubagentRow = (hierarchyRowMeta[session.id]?.depth ?? 0) > 0
         return HStack(spacing: 6) {
+            if isSubagentRow {
+                Spacer().frame(width: 12)
+            }
             if let liveState {
-                CodexLiveStatusDot(state: liveState, color: rowDotColor, size: 6)
+                CodexLiveStatusDot(
+                    state: liveState,
+                    color: rowDotColor,
+                    size: 7,
+                    lastSeenAt: presence?.lastSeenAt
+                )
                     .accessibilityLabel(Text("\(label) \(liveState == .activeWorking ? "active" : "open") session"))
             }
+            if session.isSubagent && !isSubagentRow {
+                Text("s")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(isSelected ? .white : rowTextColor)
+                    .accessibilityLabel("Subagent")
+            }
             Text(label)
-                .font(.system(size: 12, weight: .regular, design: .monospaced))
-                .foregroundStyle(rowTextColor)
+                .font(.system(size: 12, weight: isSubagentRow ? .light : .regular, design: .monospaced))
+                .foregroundStyle(isSubagentRow ? rowTextColor.opacity(0.7) : rowTextColor)
             Spacer(minLength: 4)
         }
+        .opacity(liveOpacity)
         .id("source-cell-\(session.id)-\(activeCodexSessions.activeMembershipVersion)")
     }
 
@@ -1653,16 +2007,71 @@ struct UnifiedSessionsView: View {
         NSWorkspace.shared.open(dir)
     }
 
+    private func resumeAgentLabel(_ source: SessionSource) -> String {
+        switch source {
+        case .codex: return "Codex CLI"
+        case .opencode: return "OpenCode"
+        case .claude: return "Claude Code"
+        case .copilot: return "Copilot CLI"
+        case .gemini: return "Gemini CLI"
+        default: return "CLI"
+        }
+    }
+
+    private func canResumeSession(_ s: Session, geminiCLISessionID: String? = nil) -> Bool {
+        switch s.source {
+        case .codex, .claude, .opencode, .copilot:
+            return true
+        case .gemini:
+            return (geminiCLISessionID ?? GeminiSessionIDHelper.deriveSessionID(from: s)) != nil
+        default:
+            return false
+        }
+    }
+
     private func resume(_ s: Session) {
-        if s.source == .gemini { return } // No resume support for Gemini
-        if s.source == .codex {
+        switch s.source {
+        case .codex:
             Task { @MainActor in
                 _ = await CodexResumeCoordinator.shared.quickLaunchInTerminal(session: s)
             }
-        } else {
-            let settings = ClaudeResumeSettings.shared
-            let sid = deriveClaudeSessionID(from: s)
+        case .opencode:
+            let settings = OpenCodeSettings.shared
+            let sid = s.id
             let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = OpenCodeResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: OpenCodeTerminalLaunching = settings.preferITerm ? OpenCodeITermLauncher() : OpenCodeTerminalLauncher()
+                let coord = OpenCodeResumeCoordinator(env: OpenCodeCLIEnvironment(), builder: OpenCodeResumeCommandBuilder(), launcher: launcher)
+                _ = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+            }
+        case .copilot:
+            let settings = CopilotSettings.shared
+            let sid = s.id
+            let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
+            let input = CopilotResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: CopilotTerminalLaunching = settings.preferITerm ? CopilotITermLauncher() : CopilotTerminalLauncher()
+                let coord = CopilotResumeCoordinator(env: CopilotCLIEnvironment(), builder: CopilotResumeCommandBuilder(), launcher: launcher)
+                _ = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
+            }
+        case .gemini:
+            let settings = GeminiCLISettings.shared
+            let sid = GeminiSessionIDHelper.deriveSessionID(from: s)
+            let wd = settings.effectiveWorkingDirectory(for: s)
+            let bin = settings.binaryOverride.isEmpty ? nil : settings.binaryOverride
+            let input = GeminiResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
+            Task { @MainActor in
+                let launcher: GeminiTerminalLaunching = settings.preferITerm ? GeminiITermLauncher() : GeminiTerminalLauncher()
+                let coord = GeminiResumeCoordinator(env: GeminiCLIEnvironment(), builder: GeminiResumeCommandBuilder(), launcher: launcher)
+                _ = await coord.resumeInTerminal(input: input, dryRun: false)
+            }
+        case .claude:
+            let settings = ClaudeResumeSettings.shared
+            let sid = ClaudeSessionIDHelper.deriveSessionID(from: s)
+            let wd = ClaudeSessionIDHelper.projectRoot(for: s)
             let bin = settings.binaryPath.isEmpty ? nil : settings.binaryPath
             let input = ClaudeResumeInput(sessionID: sid, workingDirectory: wd, binaryOverride: bin)
             Task { @MainActor in
@@ -1670,20 +2079,9 @@ struct UnifiedSessionsView: View {
                 let coord = ClaudeResumeCoordinator(env: ClaudeCLIEnvironment(), builder: ClaudeResumeCommandBuilder(), launcher: launcher)
                 _ = await coord.resumeInTerminal(input: input, policy: settings.fallbackPolicy, dryRun: false)
             }
+        default:
+            return
         }
-    }
-
-    private func deriveClaudeSessionID(from session: Session) -> String? {
-        let base = URL(fileURLWithPath: session.filePath).deletingPathExtension().lastPathComponent
-        if base.count >= 8 { return base }
-        let limit = min(session.events.count, 2000)
-        for e in session.events.prefix(limit) {
-            let raw = e.rawJSON
-            if let data = Data(base64Encoded: raw), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let sid = json["sessionId"] as? String, !sid.isEmpty {
-                return sid
-            }
-        }
-        return nil
     }
 
     // Match Codex window message display policy
@@ -1789,7 +2187,7 @@ struct UnifiedSessionsView: View {
     static func buildFallbackPresenceMap(sessions: [Session],
                                          presences: [CodexActivePresence],
                                          hasDirectJoin: (Session) -> Bool) -> [String: CodexActivePresence] {
-        let supportedSources: Set<SessionSource> = [.claude]
+        let supportedSources: Set<SessionSource> = [.claude, .opencode]
         var fallbackBySessionKey: [String: CodexActivePresence] = [:]
         var fallbackEligibleBySource: [SessionSource: [Session]] = [:]
         var fallbackEligibleByWorkspace: [String: [Session]] = [:]
@@ -2173,11 +2571,56 @@ private struct TranscriptHostView: View {
 		private struct SessionTitleCell: View {
 		    let session: Session
 		    @ObservedObject var geminiIndexer: GeminiSessionIndexer
+            let rowMeta: SubagentRowMeta?
+            let isExpanded: Bool
+            let onToggleExpand: ((String) -> Void)?
 		    @State private var hover: Bool = false
 
 	    var body: some View {
-	        HStack(spacing: 8) {
-	            Text(session.title)
+	        HStack(spacing: 4) {
+                // Disclosure chevron for parents with children
+                if let meta = rowMeta, meta.hasChildren {
+                    Button(action: { onToggleExpand?(session.id) }) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .medium))
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            .animation(.easeInOut(duration: 0.15), value: isExpanded)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: 16)
+                    .foregroundStyle(.secondary)
+                    Text("(\(meta.childCount))")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                } else if let meta = rowMeta, meta.depth > 0 {
+                    // Indent for subagent children
+                    Spacer().frame(width: 20)
+                }
+
+                // Subagent type badge (only when hierarchy nesting is active)
+                if let meta = rowMeta, meta.depth > 0 {
+                    if let agentType = session.subagentType, !agentType.isEmpty {
+                        Text(agentType)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.purple.opacity(0.15))
+                            .foregroundStyle(.purple)
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                    // Model badge
+                    if let abbreviated = ModelNameAbbreviator.abbreviate(session.model) {
+                        Text(abbreviated)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.blue.opacity(0.12))
+                            .foregroundStyle(.blue)
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                }
+
+	            Text(session.listTitle)
 	                .font(.system(size: 13, weight: .regular, design: .monospaced))
 	                .lineLimit(1)
 	                .truncationMode(.tail)
@@ -2521,39 +2964,49 @@ private struct ToolbarSearchTextField: NSViewRepresentable {
 
 private struct AnalyticsButtonView: View {
     let isReady: Bool
-    let disabledReason: String?
-    let onWarmupTap: () -> Void
+    let phase: AnalyticsIndexPhase
+    let isStale: Bool
 
-    // Access via app-level notification instead of environment
     var body: some View {
         ToolbarIconButton(help: helpText) { _ in
             ZStack {
                 ToolbarIcon(systemName: "chart.bar.xaxis")
-                    .opacity(isReady ? 1 : 0.35)
-                if !isReady {
+                    .opacity((isReady || phase == .ready) ? 1 : 0.5)
+                if phase == .queued || phase == .building {
                     ProgressView()
                         .controlSize(.mini)
+                } else if isStale {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 7, height: 7)
+                        .offset(x: 8, y: -8)
                 }
             }
         } action: {
-            if isReady {
-                NotificationCenter.default.post(name: .toggleAnalytics, object: nil)
-            } else {
-                onWarmupTap()
-            }
+            NotificationCenter.default.post(name: .toggleAnalyticsWindow, object: nil)
         }
         .keyboardShortcut("k", modifiers: .command)
         .accessibilityLabel(Text("Analytics"))
-        // Keep pressable; communicate readiness instead of disabling.
     }
 
     private var helpText: String {
-        if isReady { return "View usage analytics (⌘K)" }
-        return disabledReason ?? "Analytics warming up – results will appear once indexing finishes."
+        switch phase {
+        case .queued, .building:
+            return "Analytics build in progress (⌘K)"
+        case .ready:
+            if isStale {
+                return "View analytics (stale data, update available) (⌘K)"
+            }
+            return "View usage analytics (⌘K)"
+        case .failed:
+            return "View analytics (last build failed, retry available) (⌘K)"
+        case .canceled:
+            return "View analytics (build canceled, restart available) (⌘K)"
+        case .idle:
+            if isReady {
+                return "View usage analytics (⌘K)"
+            }
+            return "View analytics (build required) (⌘K)"
+        }
     }
-}
-
-// Notification for Analytics toggle
-private extension Notification.Name {
-    static let toggleAnalytics = Notification.Name("ToggleAnalyticsWindow")
 }

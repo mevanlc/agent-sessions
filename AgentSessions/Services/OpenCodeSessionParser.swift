@@ -27,7 +27,7 @@ final class OpenCodeSessionParser {
         let summary: Summary?
     }
 
-    private struct MessageJSON: Decodable {
+    struct MessageJSON: Decodable {
         struct Time: Decodable {
             let created: Int64?
         }
@@ -45,8 +45,8 @@ final class OpenCodeSessionParser {
             let todoread: Bool?
             let task: Bool?
         }
-        let id: String
-        let sessionID: String
+        let id: String?
+        let sessionID: String?
         let role: String?
         let time: Time?
         let summary: Summary?
@@ -140,6 +140,7 @@ final class OpenCodeSessionParser {
         // Count messages + commands cheaply by scanning the corresponding message directory, if present.
         let (eventCount, modelID, commandCount) = lightweightMessageMetadata(for: obj.id, sessionURL: url)
 
+        let subagentType = Self.deriveSubagentTypeFromTitle( obj.title)
         return Session(
             id: obj.id,
             source: .opencode,
@@ -153,7 +154,9 @@ final class OpenCodeSessionParser {
             cwd: obj.directory,
             repoName: nil,
             lightweightTitle: obj.title,
-            lightweightCommands: commandCount > 0 ? commandCount : nil
+            lightweightCommands: commandCount > 0 ? commandCount : nil,
+            parentSessionID: obj.parentID,
+            subagentType: subagentType
         )
     }
 
@@ -172,6 +175,7 @@ final class OpenCodeSessionParser {
         let allEvents = warningEvents + events
 
         let nonMetaCount = allEvents.filter { $0.kind != .meta }.count
+        let subagentType = Self.deriveSubagentTypeFromTitle( obj.title)
         return Session(
             id: obj.id,
             source: .opencode,
@@ -185,8 +189,20 @@ final class OpenCodeSessionParser {
             cwd: obj.directory,
             repoName: nil,
             lightweightTitle: obj.title,
-            lightweightCommands: commandCount > 0 ? commandCount : nil
+            lightweightCommands: commandCount > 0 ? commandCount : nil,
+            parentSessionID: obj.parentID,
+            subagentType: subagentType
         )
+    }
+
+    /// Derive subagent type from OpenCode title pattern: "... (@<agent> subagent)"
+    static func deriveSubagentTypeFromTitle(_ title: String?) -> String? {
+        guard let title else { return nil }
+        let pattern = #"\(@(\w+) subagent\)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: title, range: NSRange(title.startIndex..., in: title)),
+              let captureRange = Range(match.range(at: 1), in: title) else { return nil }
+        return String(title[captureRange])
     }
 
     // MARK: - Message loading helpers
@@ -265,7 +281,7 @@ final class OpenCodeSessionParser {
                    (tools.todowrite ?? false) || (tools.todoread ?? false) || (tools.task ?? false) {
                     commands += 1
                 }
-                if containsToolPart(for: msg.id, storageRoot: storageRoot, layout: layout, legacyIndex: &legacyIndex) {
+                if containsToolPart(for: msg.id ?? "", storageRoot: storageRoot, layout: layout, legacyIndex: &legacyIndex) {
                     commands += 1
                 }
             }
@@ -301,7 +317,7 @@ final class OpenCodeSessionParser {
                   let msg = try? JSONDecoder().decode(MessageJSON.self, from: data) else {
                 continue
             }
-            guard msg.sessionID == sessionID else { continue }
+            guard msg.sessionID == nil || msg.sessionID == sessionID else { continue }
             let created = msg.time?.created.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
             messageFiles.append((url: url, created: created, fileName: url.lastPathComponent))
         }
@@ -318,6 +334,9 @@ final class OpenCodeSessionParser {
             guard let data = try? Data(contentsOf: url) else { continue }
             guard let msg = try? JSONDecoder().decode(MessageJSON.self, from: data) else { continue }
 
+            // For JSON files, msg.id is always present. Use filename as safety fallback.
+            let effectiveMsgID = msg.id ?? url.deletingPathExtension().lastPathComponent
+
             let ts = msg.time?.created.flatMap { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
             if modelID == nil, let mid = (msg.model?.modelID ?? msg.modelID), !mid.isEmpty {
                 modelID = mid
@@ -328,10 +347,12 @@ final class OpenCodeSessionParser {
             let hasTextParts = !partEvents.text.isEmpty
 
             let rawJSON: String = {
-                if let str = String(data: data, encoding: .utf8) {
-                    return str
+                // Re-serialize via JSONSerialization to guarantee valid JSON, then cap at 8 KB.
+                if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    return cappedPartJSON(obj: obj, source: data)
                 }
-                return ""
+                guard let str = String(data: data, encoding: .utf8) else { return "" }
+                return str.count > 8192 ? String(str.prefix(8192)) : str
             }()
 
             // Treat messages with tools flags as command/tool-call events for terminal view + filters
@@ -342,7 +363,7 @@ final class OpenCodeSessionParser {
             // Preserve the raw message record for JSON view/debugging, but do not let it
             // drive transcript rendering (OpenCode stores actual text content in part files).
             let messageMetaEvent = SessionEvent(
-                id: msg.id + "-meta",
+                id: effectiveMsgID + "-meta",
                 timestamp: ts,
                 kind: .meta,
                 role: msg.role,
@@ -350,7 +371,7 @@ final class OpenCodeSessionParser {
                 toolName: nil,
                 toolInput: nil,
                 toolOutput: nil,
-                messageID: msg.id,
+                messageID: effectiveMsgID,
                 parentID: nil,
                 isDelta: false,
                 rawJSON: rawJSON
@@ -393,7 +414,7 @@ final class OpenCodeSessionParser {
                     // Drop completely empty non-user messages to avoid blank rows.
                 } else {
                     let event = SessionEvent(
-                        id: msg.id,
+                        id: effectiveMsgID,
                         timestamp: ts,
                         kind: baseKind,
                         role: msg.role,
@@ -401,7 +422,7 @@ final class OpenCodeSessionParser {
                         toolName: nil,
                         toolInput: nil,
                         toolOutput: nil,
-                        messageID: msg.id,
+                        messageID: effectiveMsgID,
                         parentID: nil,
                         isDelta: false,
                         rawJSON: rawJSON
@@ -419,7 +440,7 @@ final class OpenCodeSessionParser {
 
     // MARK: - Tool part helpers
 
-    private struct PartEvents {
+    struct PartEvents {
         var text: [SessionEvent] = []
         var tool: [SessionEvent] = []
         var meta: [SessionEvent] = []
@@ -430,7 +451,7 @@ final class OpenCodeSessionParser {
                                        layout: any OpenCodeStorageLayout,
                                        legacyIndex: inout [String: [URL]]?,
                                        fallbackTimestamp: Date?) -> PartEvents {
-        let files = layout.partFiles(forMessageID: msg.id, storageRoot: storageRoot, legacyIndex: &legacyIndex)
+        let files = layout.partFiles(forMessageID: msg.id ?? "", storageRoot: storageRoot, legacyIndex: &legacyIndex)
         if files.isEmpty { return PartEvents() }
 
         let kind = SessionEventKind.from(role: msg.role, type: nil)
@@ -453,7 +474,7 @@ final class OpenCodeSessionParser {
                   let typeAny = obj["type"] as? String else {
                 continue
             }
-            let rawJSON = String(data: data, encoding: .utf8) ?? ""
+            let rawJSON = cappedPartJSON(obj: obj, source: data)
             let type = typeAny.lowercased()
             let start = dateFromMillis((obj["time"] as? [String: Any])?["start"])
                 ?? dateFromMillis(((obj["state"] as? [String: Any])?["time"] as? [String: Any])?["start"])
@@ -652,7 +673,170 @@ final class OpenCodeSessionParser {
         ]
     }
 
-    private static func stringifyJSON(_ any: Any?) -> String? {
+    // MARK: - Shared part-event builder (used by both JSON and SQLite paths)
+
+    /// Builds PartEvents from an array of already-parsed part dictionaries.
+    /// Each entry is `(id: partID, dict: parsed JSON dict, rawJSON: original string)`.
+    static func buildPartEvents(
+        for msg: MessageJSON,
+        effectiveMsgID: String? = nil,
+        parts: [(id: String, dict: [String: Any], rawJSON: String)],
+        fallbackTimestamp: Date?
+    ) -> PartEvents {
+        let kind = SessionEventKind.from(role: msg.role, type: nil)
+        let resolvedMsgID = effectiveMsgID ?? msg.id ?? ""
+        var result = PartEvents()
+
+        for (partID, obj, rawJSON) in parts {
+            guard let typeAny = obj["type"] as? String else { continue }
+            let type = typeAny.lowercased()
+            let partStart = dateFromMillis((obj["time"] as? [String: Any])?["start"])
+                ?? dateFromMillis(((obj["state"] as? [String: Any])?["time"] as? [String: Any])?["start"])
+            let ts = fallbackTimestamp ?? partStart
+
+            switch type {
+            case "text":
+                let text = (obj["text"] as? String) ?? ""
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty { continue }
+                result.text.append(SessionEvent(
+                    id: partID,
+                    timestamp: ts,
+                    kind: kind,
+                    role: msg.role,
+                    text: text,
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+
+            case "tool":
+                let callID = obj["callID"] as? String
+                let toolName = obj["tool"] as? String
+                let state = obj["state"] as? [String: Any] ?? [:]
+                let status = (state["status"] as? String)?.lowercased()
+                let inputStr = stringifyJSON(state["input"])
+                let outputStr = stringifyJSON(state["output"]) ?? stringifyJSON(state["stdout"])
+                let errorStr = stringifyJSON(state["error"]) ?? stringifyJSON(state["stderr"])
+                let exitCode: Int? = {
+                    let metadata = state["metadata"] as? [String: Any]
+                    let any = metadata?["exit"] ?? state["exit"] ?? state["exitCode"] ?? state["exit_code"]
+                    if let i = any as? Int { return i }
+                    if let d = any as? Double { return Int(d) }
+                    if let s = any as? String { return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                    return nil
+                }()
+
+                func appendExitCode(_ text: String?, exitCode: Int?) -> String? {
+                    guard let exitCode else { return text }
+                    if let text, text.range(of: "Exit Code:", options: [.caseInsensitive]) != nil { return text }
+                    if let text, !text.isEmpty { return text + "\nExit Code: \(exitCode)" }
+                    return "Exit Code: \(exitCode)"
+                }
+
+                let outputWithExit = appendExitCode(outputStr, exitCode: exitCode)
+
+                let timeDict = state["time"] as? [String: Any]
+                let startDate = dateFromMillis(timeDict?["start"]) ?? fallbackTimestamp ?? partStart
+                let endDate = dateFromMillis(timeDict?["end"]) ?? dateFromMillis(timeDict?["start"]) ?? fallbackTimestamp ?? partStart
+
+                let callEvent = SessionEvent(
+                    id: partID + "-call",
+                    timestamp: startDate,
+                    kind: .tool_call,
+                    role: "assistant",
+                    text: nil,
+                    toolName: toolName,
+                    toolInput: inputStr,
+                    toolOutput: nil,
+                    messageID: callID ?? resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                )
+                result.tool.append(callEvent)
+
+                let isError = status == "error"
+                    || status == "failed"
+                    || (exitCode != nil && exitCode != 0)
+                    || (errorStr?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                let resultKind: SessionEventKind = isError ? .error : .tool_result
+                let resultText: String? = {
+                    let base = (isError && (errorStr?.isEmpty == false)) ? errorStr : outputWithExit
+                    return appendExitCode(base, exitCode: exitCode)
+                }()
+
+                result.tool.append(SessionEvent(
+                    id: partID + (isError ? "-error" : "-result"),
+                    timestamp: endDate,
+                    kind: resultKind,
+                    role: nil,
+                    text: resultText,
+                    toolName: toolName,
+                    toolInput: nil,
+                    toolOutput: outputWithExit,
+                    messageID: callID ?? resolvedMsgID,
+                    parentID: callEvent.id,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+
+            case "reasoning":
+                result.meta.append(SessionEvent(
+                    id: partID + "-meta",
+                    timestamp: ts,
+                    kind: .meta,
+                    role: msg.role,
+                    text: "[OpenCode reasoning part]",
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+
+            default:
+                result.meta.append(SessionEvent(
+                    id: partID + "-meta",
+                    timestamp: ts,
+                    kind: .meta,
+                    role: msg.role,
+                    text: "[OpenCode part: \(type)]",
+                    toolName: nil,
+                    toolInput: nil,
+                    toolOutput: nil,
+                    messageID: resolvedMsgID,
+                    parentID: nil,
+                    isDelta: false,
+                    rawJSON: rawJSON
+                ))
+            }
+        }
+
+        return result
+    }
+
+    /// Returns a rawJSON string for a parsed part object, capped at 8 KB.
+    /// Re-serializes from the already-parsed `obj` to guarantee valid JSON.
+    /// Falls back to the original `source` data (hard-truncated) only if re-serialization fails.
+    static func cappedPartJSON(obj: [String: Any], source: Data?, limit: Int = 8192) -> String {
+        if JSONSerialization.isValidJSONObject(obj),
+           let reencoded = try? JSONSerialization.data(withJSONObject: obj),
+           let str = String(data: reencoded, encoding: .utf8) {
+            return str.count > limit ? String(str.prefix(limit)) : str
+        }
+        // Fallback: use source bytes; hard truncation may yield invalid JSON but is safe.
+        guard let source, let str = String(data: source, encoding: .utf8) else { return "" }
+        return str.count > limit ? String(str.prefix(limit)) : str
+    }
+
+    static func stringifyJSON(_ any: Any?) -> String? {
         guard let any else { return nil }
         if let str = any as? String { return str }
         if JSONSerialization.isValidJSONObject(any),
@@ -663,7 +847,7 @@ final class OpenCodeSessionParser {
         return String(describing: any)
     }
 
-    private static func dateFromMillis(_ value: Any?) -> Date? {
+    static func dateFromMillis(_ value: Any?) -> Date? {
         guard let num = value as? NSNumber else { return nil }
         return Date(timeIntervalSince1970: num.doubleValue / 1000.0)
     }

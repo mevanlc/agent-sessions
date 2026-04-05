@@ -4,7 +4,184 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [3.4.1] - 2026-04-03
+
+### Changed
+- Analytics: Index building is now explicit and on-demand. Opening Analytics no longer auto-starts indexing from the Unified toolbar; users can start, cancel, and manually update analytics index builds from the Analytics window.
+- Performance: Analytics indexing work is decoupled from routine provider refresh paths so Unified/Cockpit stay responsive when Analytics is idle.
+- Performance: Core session indexing now uses a lower-impact foreground execution profile, reduced focused-session monitor cadence, and no longer cancels in-flight refreshes when the app deactivates.
+- Unified toolbar: Refresh indicator now explicitly represents core session indexing (not analytics), with clearer status/help copy to distinguish it from Analytics index builds.
+- Performance: Automatic core refresh monitors now pause while the app is foreground/active and resume in background, reducing sustained CPU and avoiding near-continuous “indexing” status during active Unified use.
+- Unified footer: Core indexing status now shows live session progress (`X/Y` and `%`) instead of a generic “refreshing” message.
+- Unified filters: Toggling agent pills in the toolbar is now filter-only and no longer auto-triggers index refreshes.
+- Indexing UX: Background monitor refreshes now surface as lightweight syncing status, while launch/manual indexing keeps stable progress messaging.
+- Indexing reliability: Core indexers now persist their own per-source file-stat baselines and restore them on startup, preventing large false re-sync runs after restart when only a few sessions changed.
+- Indexing reliability (Codex): Incremental refresh now force-includes recent files that exist on disk but are missing from the hydrated session snapshot, preventing newest sessions from being silently skipped when persisted file-stat baselines are ahead of session rows.
+- Indexing reliability (Codex): `thread_name` side-channel overrides now apply only to verified `.../sessions` layouts and use stronger cache invalidation, preventing cross-root title mismatches and stale rename reuse.
+- Agent Cockpit: `Go to Session` remains blocked for cwd-only fallback matches, but runtime-ID matches are now treated as navigable again.
+
 ### Added
+- Analytics: Build lifecycle UI now includes not-built, building, canceled, failed, and stale states with visible progress details (percent, sessions processed, source progress, and indexed date span).
+- Session list: Subagent sessions now show an `s` indicator in flat list view so they are identifiable without the hierarchy expanded. The indicator is hidden in hierarchy view where nesting already conveys subagent status.
+- Agent Cockpit: Limits bar now auto-expands the detail panel when any quota indicator is amber/red and reset times no longer fit inline, so constrained usage is always visible without a hover.
+- Codex: Session custom titles are now parsed from `session_index.jsonl` (`thread_name` field) using a lock-protected mtime/size/path cache and tail-read for large files.
+- Copilot: Session custom titles are now parsed from `workspace.yaml` (`name` field), gated to directory-based layouts to prevent cross-session contamination.
+- Claude: Custom session titles set via the `/rename` CLI command are now reliably restored after relaunch.
+
+### Fixed
+- Claude: Custom session titles set via the `/rename` CLI command were not restored after relaunch because `upsertSessionMetaCore` omitted `custom_title` from its `UPDATE SET`; non-NULL parsed values now update the DB while NULL preserves the existing title.
+- Custom title scan in the lightweight parser now uses a chunked gap scan (64KB chunks, 8MB budget) so title records in the middle of large session files are no longer missed.
+
+## [3.4] - 2026-03-30
+
+### Added
+- Session list: Codex subagent sessions now appear as nested children under their parent in the unified session list. A toggle shows or hides the hierarchy; `Cmd+H` controls visibility from the keyboard.
+- Agent Cockpit: Active Codex subagent count badge added to HUD rows. `Cmd+Shift+S` toggles subagent display.
+
+### Fixed
+- Agent Cockpit HUD: Codex active subagent badges now use the runtime `thread_spawn` state DB when available, so open worker agents stay counted even when their rollout files go quiet; passive rollout/`lsof` heuristics remain as a fallback.
+- Agent Cockpit HUD: Codex runtime subagent counts now resolve the parent session before runtime edge lookup (even when the primary log path is a child rollout), and runtime state DB discovery now honors `CODEX_HOME`/`SessionsRootOverride` before falling back to `~/.codex`.
+- Codex limits tracking: Visible usage surfaces now prefer auth-backed limits refresh first, fall back to CLI RPC and JSONL only when needed, and keep `/status` probing as a last resort. Preferences copy now reflects the new source order.
+- Codex limits tracking: `/status` fallback snapshots now refresh their rate-limit buckets correctly, menu-background surfaces still run the preferred OAuth/CLI refresh chain, and partial live responses no longer leave the other bucket frozen as if the whole snapshot were authoritative.
+- Performance: Eliminated a `repeatForever` animation CPU drain in session rows that caused sustained energy use even when sessions were idle.
+- Security: SQL queries throughout the indexer are now fully parameterized; regex extraction is hardened against malformed input.
+- Subagents: Subagent sessions are preserved in search results when hierarchy display is disabled, preventing sessions from going missing in filtered views.
+- OpenCode: Parent ID query is guarded for older SQLite schemas that predate the `parent_id` column.
+- Indexing: Reindex purge now runs after table creation in bootstrap, preventing failures on first-run with no prior DB.
+- Launch/TCC: Session startup now avoids implicit repo filesystem probes while deriving row project names, reducing spurious Photos/Music permission prompts after rebuild/cold launch.
+- Launch restore: `Saved Sessions` window now registers shared window-open routing callbacks, so menu-bar `Open Agent Sessions`/cockpit routing still works when only Saved Sessions is restored.
+- Launch/TCC: Preferences agent status rows and OpenCode backend badges now use stored non-probing state under build tooling, avoiding extra PATH, root-directory, and SQLite checks during metadata extraction.
+
+## [3.3.3.1] - 2026-03-26
+
+### Fixed
+- Codex: Reset countdown no longer exceeds the 5-hour window — reset times are now stored in ISO 8601 format, preventing a date-rollover bug that produced countdowns of up to 24 hours.
+
+## [3.3.3] - 2026-03-26
+
+### Added
+- Agent Cockpit: Reduce transparency is now on by default for improved HUD readability in both docked and floating modes.
+
+### Fixed
+- Agent Cockpit: OpenCode sessions now participate in iTerm tab-title enrichment alongside Claude and Codex.
+- Agent Cockpit: Hover tooltip columns now align consistently across Claude, Codex, and Copilot providers.
+- Codex: Repaired fallback chain for limit tracking when sessions are stale or missing — percentages no longer get stuck.
+- Codex: Preserved mtime cache on menu-background alt-source early return, preventing stale timestamps.
+- Copilot: Fixed CLI session discovery for subdirectory workspace layouts.
+
+## [3.3.2] - 2026-03-21
+
+### Added
+- Resume: Session resume support for GitHub Copilot CLI and Gemini CLI — right-click any active Copilot or Gemini session to copy the exact CLI resume command. Safe to skip this update if you don't use either agent.
+
+## [3.3.1] - 2026-03-20
+
+### Added
+- Codex Usage: OAuth API and CLI RPC fallback for rate limits — when the Codex CLI hits a rate limit, usage tracking automatically falls back to the OAuth endpoint so token data keeps flowing without interruption.
+- Resume: Copy Resume Command added to the context menu for Claude, Codex, and OpenCode sessions — right-click any active session to copy the exact CLI resume command to the clipboard.
+- OpenCode: Session resume support — OpenCode sessions can now be resumed directly from the context menu, matching Claude and Codex.
+
+### Fixed
+- **Critical — Codex Usage:** Fixed a 0% token display bug and a blocking-pipe issue that prevented Codex usage tracking from working at all. **This update is required for Codex usage tracking to function correctly.**
+- Resume (OpenCode): Corrected OpenCode CLI flags and inherit the user's iTerm preference when generating resume commands.
+- Resume (Claude): Fixed Claude session ID resolution so Copy Resume Command produces the correct command for active Claude sessions.
+
+## [3.3] - 2026-03-19
+
+### Added
+- Claude Usage: Multi-tier tracking with credential gating and Web API fallback. Reads live token usage via the OAuth endpoint (60-second refresh cycle), falls back to the tmux socket probe, and optionally fetches from the claude.ai Web API using a session cookie — with clear Full Disk Access guidance surfaced in Preferences when Web API mode is active.
+
+### Changed
+- Claude Usage: Unified the refresh-interval constant across all tracking tiers and hardened org UUID validation to prevent bad identifiers from poisoning the cache across sessions.
+- Preferences: Usage Tracking pane layout overhauled — data-source picker converted to a popup menu, segmented controls fill available width without overflow, and strip-option toggles stacked vertically for consistency.
+
+### Fixed
+- Usage display: Codex auto-probe cooldown no longer masquerades as UI freshness. Cockpit and in-app usage surfaces now age data correctly after `/status` probes while still suppressing redundant background probes.
+- Usage (Codex): Rollout logs that emit `token_count` events with `rate_limits: null` are now treated as limit-unavailable rather than reusing stale session-file percentages from before the last reset. This also re-enables the `/status` probe fallback for that newer Codex session format.
+- Agent Cockpit: The pinned HUD limits footer now rebuilds from live usage-model updates the same way the main window footer does, preventing stale percentages from persisting after the underlying snapshot changes.
+- Agent Cockpit: Weekly reset times in the hover-expanded limits footer now format consistently as `Day H:MM AM/PM` for both Codex and Claude.
+- Agent Cockpit: Cockpit-only launch (including pinned mode) now runs the same one-time startup/bootstrap path as the unified window, so Claude session names resolve without needing the main window open first.
+- Claude Usage: Safari cookie path corrected for both sandboxed and legacy macOS filesystem layouts; TCC Full Disk Access guidance now surfaces in Preferences when Web API mode is active.
+- Claude Usage: Guarded system-preferences URL construction to eliminate a force-unwrap crash path.
+- Claude Usage: Stale OAuth caches are invalidated on 401 responses; 429 rate-limit responses are now routed through the Web API fallback instead of blocking the refresh cycle.
+
+## [3.2.1] - 2026-03-16
+
+### Added
+- Agent Cockpit HUD: Usage limits footer now shows Claude API reset time and rate-limit state, with idle reason classification surfaced on the status dot.
+- Agent Cockpit HUD: Claude OAuth usage tracking with tmux socket fallback for probe-less environments.
+
+### Fixed
+- Agent Cockpit HUD: Eliminated transient "—" flash when iTerm2 probe returns an empty result.
+- Agent Cockpit: Three probe stability fixes — tmux socket leak on teardown, excessive re-probe on focus change, and HUD visibility loss after backgrounding.
+- Agent Cockpit HUD: Three display fixes — stale session titles after tab switch, empty-state flash on first load, and wrong-tab focus on direct open.
+- Session discovery: Prevent two processes sharing the same working directory from claiming the same session log.
+- Session discovery: Infer Claude session log from project directory when `lsof` socket lookup misses it.
+- Session discovery: Assign distinct sessions to multiple presences in the same workspace.
+- Session discovery (Claude Code): Improved Cockpit HUD session matching for Claude Code processes.
+- Session discovery (Claude Code): Use `fullReconcile` on Cockpit-only launch to surface sessions that skipped the normal indexing path.
+- Agent Cockpit HUD: Bootstrap indexers from Cockpit and show a spinner while usage limits are loading.
+- Usage probe: Parse ISO 8601 reset timestamps correctly and display reset time even when the limit data is stale.
+- Usage probe: Enforce a 5-minute minimum on `429 Retry-After` to prevent rapid retry loops.
+
+## [3.2] - 2026-03-13
+
+### Added
+- OpenCode: Added read-only SQLite backend support for OpenCode v1.2+, including automatic detection between `~/.local/share/opencode/opencode.db` and legacy per-file JSON session storage. Preferences → OpenCode now shows the detected backend.
+
+### Changed
+- Agent Cockpit / Menu Bar: OpenCode live sessions now participate in shared active/waiting summaries, background session lookup, and iTerm-based presence detection alongside Codex and Claude.
+
+### Fixed
+- OpenCode: Main-window session rows now show live-state dots for active and waiting OpenCode sessions.
+- OpenCode: iTerm busy-state detection is more reliable, reducing false idle/open classification while a session is still working.
+- OpenCode: Search hydration and direct session-directory overrides now work correctly for SQLite-backed storage.
+- OpenCode: Raw JSON previews are capped at `8 KB` with valid-JSON truncation to avoid oversized payload rendering.
+
+## [3.1] - 2026-03-12
+
+### Changed
+- Onboarding: Session visible/hidden counts now refresh on any live session-data update (not just total-count deltas), and DB snapshot fallback now evaluates session visibility with the same active filter logic used by onboarding counts.
+- Window restoration: Relaunch now restores the primary `Agent Sessions` window reliably even when its autosave name was already set, and auto-reopens `Agent Cockpit` when it was pinned.
+- Agent Cockpit: Major stability update. Fixed the Cockpit CPU/energy leak, eliminating long-run resource creep while pinned or backgrounded, while also reducing full-list/partial-row flicker and improving handling for disappearing probe rows.
+- Agent Cockpit: Follow-up CPU stabilization now suppresses redundant HUD snapshot invalidations, pauses idle-dot pulse animation while the app is inactive, and applies stable-cycle pinned-background cadence backoff up to `5s` to reduce long-run CPU accumulation without changing foreground responsiveness.
+- Agent Cockpit: Navigation and pinned-window behavior are more reliable after relaunch and while backgrounded, including correct `Open Agent Sessions` routing and tooltip layering above the HUD.
+- Menu Bar: Added a dedicated `Show Active/Waiting sessions` toggle plus a `Show menu bar icons` setting so live session dots can be shown independently from usage meters.
+- Preferences: Added an `Advanced` toggle to hide the Dock icon by switching Agent Sessions into accessory app mode; default remains off.
+- Preferences: `Hide Dock icon` now keeps a reopen path by auto-enabling the menu bar item, and app activation policy falls back to Dock-visible mode if no persistent reopen affordance is available.
+- Menu Bar: `Open Agent Cockpit` now routes by the cockpit window identifier only, avoiding false matches against unrelated untitled windows.
+- Agent Cockpit: Non-active live sessions now use `Waiting` terminology, grouped headers stay single-line, compact pinned mode keeps its toolbar visible, and long-waiting projects are visually deprioritized.
+- Menu Bar / Agent Cockpit: Live active/waiting counts and quick actions are surfaced more clearly, and follow-up fixes restored hidden menu bar items and unresolved Codex live presences.
+
+## [3.0.1] - 2026-03-04
+
+### Fixed
+- Sessions (Agent Cockpit): Active green live-status dots now render through a strictly static path so they no longer pulse in cockpit rows; idle amber dots remain animated.
+- Sessions (Agent Cockpit): Compact mode no longer auto-resizes on every row-count change by default; it now uses a stable default height (`Medium`, 4 rows) with internal scrolling, preserves user-resized compact height when toggling full↔compact and across app restarts, and adds compact-size controls (`Small/Medium/Large`) in Settings plus optional auto-fit re-enable.
+
+## [3.0] - 2026-03-04
+
+### Features
+- Agent Cockpit (Beta) is now the primary live command center for active iTerm2 Codex CLI and Claude Code sessions.
+- Onboarding was redesigned around cockpit-first workflows so new and upgrading users reach live session controls faster.
+- Cockpit gained direct row actions (`Go to Session`, terminal focus, log/workdir reveal, and copy helpers) for quick workflow handoffs.
+
+### Improvements
+- Live session tracking now better reflects real activity with clearer active vs idle states and steadier HUD indicators.
+- Gemini session discovery now supports newer named project folder layouts under `~/.gemini/tmp`, restoring full indexing for recent Gemini CLI data structures.
+- Cockpit compact/full behavior, subtitles, sizing, and toolbar ergonomics were refined for faster scanning and less layout churn.
+
+### Bug Fixes
+- Claude usage probe CPU spikes were reduced by hardening tmux cleanup/socket-liveness handling and probe lifecycle management.
+- Cockpit window behavior is more stable: unpin restore, subtitle retention, ordering consistency, and compact/full transition reliability were fixed.
+- Unified session view refresh and live-state joins were hardened to reduce transient empty flashes, ghost rows, and stale live indicators.
+
+### Added
+- Agent Cockpit (Beta): Agent Cockpit is now the primary live command center for iTerm2 Codex/Claude sessions, with grouped active/idle visibility and one-click focus workflows.
+- Onboarding (v3): New-user onboarding now introduces `Agent Cockpit (Beta)` as the third slide immediately after `Connect Your Agents`.
+- Onboarding (v3 updates): Upgrade onboarding is now a focused two-slide flow with an `Agent Cockpit (Beta)` how-it-works explainer followed by a feedback/community-support slide.
+- Sessions (Unified): Added an Agent Cockpit toolbar icon button in the main window for one-click access to the cockpit window.
+- Sessions (Agent Cockpit): Added a row context menu with `Go to Session`, `Focus in iTerm2`, `Reveal Log`, `Open Working Directory`, `Copy Session ID`, `Copy Tab Title`, and `Copy Working Directory Path`.
 - Cockpit: Added a Cockpit window for active Codex sessions with iTerm2 focus, plus active-session indicators in the Unified sessions list.
 - Sessions (Cockpit/Unified): Live session detection now includes Claude in addition to Codex, with mixed-source live rows in Cockpit and source-aware live filtering in Unified Sessions.
 - Sessions (Unified): Added a small active-status dot in the `CLI Agent` column for live Codex sessions.
@@ -14,7 +191,40 @@ All notable changes to this project will be documented in this file.
 - Sessions (Unified): Added `CLI Agent` cell double-click terminal focusing in the Sessions list (same focus path as `Focus in iTerm2`), with explicit alert feedback when no focusable live terminal is available.
 
 ### Fixed
+- Sessions (Agent Cockpit): Full-mode subtitles now prefer custom iTerm window titles when session naming is set to default job labels (for example `codex`), so configured window-label subtitles are no longer dropped.
+- Sessions (Agent Cockpit): Unpin now reliably restores normal window stacking behavior, cockpit tab subtitles now show only cleaned custom tab/window labels (default CLI suffixes are hidden), and row typography/spacing was tightened so idle titles stay readable in both compact and full modes.
+- Sessions (Agent Cockpit): HUD row status dots now use the same shared renderer as the main Sessions list, so active (green) dots remain steady in both compact and full cockpit modes.
+- Sessions (Agent Cockpit): Active green status dots now opt out of parent row animations, preventing perceived pulsing/flicker and keeping cockpit active-dot behavior aligned with the main Sessions list.
+- Sessions (Agent Cockpit): Compact mode now includes a dedicated tab/window subtitle column after `Agent`, defaults to a narrower first-run compact width (so session titles truncate earlier), auto-hides compact header controls when unfocused unless the mouse is hovering the cockpit, collapses/expands compact window height with toolbar visibility, balances top/bottom compact spacing for short unfocused lists, and now auto-fits focused compact height to visible sessions up to 10 rows before vertical scrolling.
+- Sessions (Agent Cockpit): Grouped compact mode no longer over-shrinks on focus loss; when toolbar hides it now subtracts only header height (not extra row delta), so manually sized grouped views no longer clip bottom rows.
+- Sessions (Agent Cockpit): Compact/full toggles now preserve user-resized frame dimensions in both directions, cockpit-visible background probing now remains warm even when unpinned (preventing intermittent `No active sessions` flicker while unfocused), and grouped `Idle` pills now use the same amber palette as idle status dots.
+- Sessions (Agent Cockpit): Switching from compact mode back to full mode now reliably restores normal titled-window chrome, including title text and traffic-light controls.
+- Sessions (Agent Cockpit): Full-mode iTerm subtitle rows now preserve tab/window title metadata through live-row dedupe so subtitle text no longer disappears unexpectedly.
+- Sessions (Agent Cockpit/Unified): `Go to Session` navigation from cockpit now auto-reveals hidden target sessions in the main list by relaxing restrictive filters when needed.
+- Sessions (Agent Cockpit/Unified): `Go to Session` navigation now uses a pending request handoff with retries, preventing dropped navigation when the Agent Sessions window/view is still initializing; auto-reveal now also clears `Saved Only` filtering so non-favorite targets can be selected.
+- Agent Cockpit: Removed the in-app `Legacy Cockpit` window scene so only `Agent Cockpit` is available at runtime.
+- Agent Cockpit: Full-mode row recency now reflects session write activity (`sessionLogPath`/presence source file mtime) instead of heartbeat timestamps; compact mode hides the recency token.
+- Agent Cockpit: Full-mode rows can now show iTerm tab title as an optional muted subtitle under the agent label, with long titles truncated and full text available on hover.
+- Agent Cockpit: iTerm subtitle detection now falls back to the iTerm window title when a tab/session title is empty, so full-mode subtitle rows remain informative in minimal-tab setups.
+- Agent Cockpit: iTerm subtitle refresh now prioritizes current iTerm tab titles (including post-launch tab-title edits), resolves titles by iTerm session GUID when TTY metadata is missing, keeps subtitle lookup in a single guarded iTerm scan so one inaccessible tab variable does not blank all rows, and avoids refresh stalls from per-session `osascript` loops on large iTerm setups.
+- Agent Cockpit: Full-mode subtitle discovery now reads iTerm tab titles through the native tab `title` property, so tab-only custom titles remain visible even when window title is empty.
+- Preferences (Agent Cockpit): Added `Show tab subtitle under agent name` for full-mode cockpit rows (default on).
+- Sessions (Agent Cockpit): Idle HUD rows now keep the session display name in the main text column, `Last active ... ago` messaging was moved to a compact elapsed column (for example `16s`), active status dots now render as solid green indicators, and idle status dots now pulse amber with a larger size after 10 minutes idle.
+- Sessions (Unified): `CLI Agent` live-state styling now matches Agent Cockpit: active sessions use a solid green dot, idle sessions use a pulsing amber dot that grows slightly after 10 minutes idle, and idle source cells are visually dimmed.
+- Sessions (Agent Cockpit/Unified): Idle amber status-dot pulses now brighten at peak size (instead of dimming), making animation more visible in both Cockpit and the main Sessions list.
+- Sessions (Agent Cockpit): Filter controls now use three single-select pills (`All N`, `Active N`, `Idle N`), with `Active` pill accent in amber and `Idle` pill accent in green for clearer state while preserving compact cockpit styling.
+- Sessions (Agent Cockpit): Compact mode now uses chrome-less window styling (no titlebar controls), no longer forces compact height on every refresh, and now sizes compact list height with group/divider layout units to avoid hidden rows.
+- Sessions (Agent Cockpit): Grouped compact mode now reserves extra bottom spacing so the last row is not cramped/clipped, and switching from compact back to full mode now preserves the current window size (no automatic full-mode resize).
+- Sessions (Agent Cockpit): Compact window sizing now also recalculates while live mode is disabled and reserves space for the disabled-state callout, preventing compact clipping in the disabled state.
+- Sessions (Agent Cockpit): Agent label, project name, and session name row typography/colors now align with the main Session list style (source-accent agent text and monospaced session/project text).
+- Sessions (Agent Cockpit): Agent-column labels now render as plain text (pill removed) and use the same standard Codex/Claude accent colors as the main Sessions list.
+- Sessions (Agent Cockpit): Removed persistent row-selection highlighting and removed up/down row navigation; cockpit row actions now use direct mouse clicks plus shortcut jumps (`Cmd+1...9`, `Cmd+0` for row 10).
+- Sessions (Agent Cockpit): Compact mode keeps the filter pills visible in the toolbar, removes the keyboard-shortcut badge column, and tightens compact height math so extra top/bottom blank bands are not reserved around the session rows.
+- Sessions (Agent Cockpit): Compact mode no longer reserves a titlebar-sized blank strip above the toolbar; compact rows now start at the top edge of the HUD content area.
+- Sessions (Agent Cockpit): Removed the active/idle split divider between rows in compact/full list rendering, and hardened HUD window configurator wiring to remain click-through for controls/rows.
+- Preferences: Reordered the Settings sidebar so `Agent Cockpit` appears directly after `General`.
 - Sessions (Agent Cockpit/Codex live detection): Pinned `Agent Cockpit` now uses a faster background refresh cadence (`3s`), foreground-return iTerm live-state probing now ramps in bounded batches to flatten short CPU spikes, and iTerm session discovery now reuses a single session-list fetch for Codex+Claude.
+- Sessions (Agent Cockpit/Codex live-state): Codex ambiguous non-prompt iTerm tails now fall back to log-write heuristics (instead of immediately forcing idle), and background iTerm probing is now deferred unless the app is foregrounded or a pinned cockpit is visible.
 - Sessions (Gemini): Session discovery now accepts named Gemini project directories under `~/.gemini/tmp` (for example `radio4j`), while still supporting both `chats/session-*.json` and direct `session-*.json` layouts.
 - Usage tracking (menu bar): The menu bar quota tracker now shows an in-progress spinner while Codex or Claude usage probes are running, matching the in-app usage strip behavior even when reset indicators are hidden.
 - Sessions (Cockpit): Selected-row text/dot colors now switch to selection-aware foreground styling and use the main Sessions-list selection accent/table style, improving readability when a Cockpit row is selected.
@@ -59,6 +269,15 @@ All notable changes to this project will be documented in this file.
 - Sessions (Cockpit/Unified/Claude): Cockpit now suppresses unresolved live placeholders that are neither focusable nor joinable to indexed workspace sessions, dedupes unresolved rows by stable tty/workspace identity, and its `Refresh` action now refreshes both live presence and provider indexes; Claude refresh now auto-escalates recent-scope drift to full reconcile, and manual refreshes in both Unified and Cockpit now run Claude full reconcile so newly opened Claude sessions appear reliably in the main Sessions list.
 
 ### Changed
+- Sessions (Agent Cockpit): HUD rows now remove the visible row-number column, keep `⌘1...⌘9` shortcut badges bound to visual order, and apply one-shot highlight washes for newly added rows.
+- Sessions (Agent Cockpit): Row order now stays stable while the window is visible and only re-sorts after hide/minimize when membership changed while hidden; quick hide/show without row churn keeps order unchanged.
+- Sessions (Agent Cockpit): Compact/full window sizing now persists per mode across restarts, compact defaults to six rows on first use (minimum three rows), and session add/remove no longer auto-resizes the window.
+- Sessions (Agent Cockpit): Added explicit empty states (`No active sessions` in full mode, `No sessions` in compact mode) and enabled overflow scroll indicators in compact mode.
+- Sessions (Agent Cockpit/Unified): Live-status visual hierarchy now emphasizes idle sessions (stronger amber pulse) while active sessions use a calm static green dot; all live dots now render at 7pt and idle row dimming is slightly reduced for readability.
+- Sessions (Agent Cockpit): Agent badges, preview text, elapsed-time text, and grouped idle-count chips now use higher-contrast light/dark palettes for improved scanability.
+- Sessions (Agent Cockpit): Full and compact HUD modes now both surface vertical scroll indicators for overflow lists.
+- Sessions (Agent Cockpit): Full HUD mode now allows long session names to wrap to two lines in the main row text, while compact mode keeps names single-line.
+- Sessions (Agent Cockpit): Compact HUD mode now hides the window title text while preserving user-controlled window height.
 - Sessions (Agent Cockpit): Replaced the `Agent Cockpit` window UI with the new floating HUD layout (chips, inline filter, grouped mode, compact mode, pin mode, and keyboard row shortcuts) while keeping Legacy Cockpit available and reusing existing live-session backend logic.
 - Sessions (Agent Cockpit): Window title now includes the currently shown session count (`Agent Cockpit (N)`), the in-content `AGENT COCKPIT` label and footer row (`Session List` + freshness) were removed, and focused-window blue list focus ring styling was removed for a cleaner HUD appearance.
 - Menu/Cockpit windows: Renamed the existing Cockpit window/menu item to `Legacy Cockpit` (defaulting to the `Live` filter), added a new single-instance `Agent Cockpit` window/menu item, moved `⌘⌥⇧C` to `Agent Cockpit`, and removed the Legacy shortcut.
@@ -70,9 +289,10 @@ All notable changes to this project will be documented in this file.
 - Sessions (Live/Cockpit): OpenCode active/open session detection is temporarily disabled for this release; live-state scope is now Codex + Claude only.
 - Cockpit/Sessions (Live controls): When `Live Sessions + Cockpit (Beta)` is disabled, Cockpit and live-filter controls remain visible but disabled with explanatory help text.
 - Sessions (Cockpit): Cockpit header controls now show only `Active` and `Live` filters (removed `Cockpit`/`Show` text); `Live` includes both active and idle sessions.
-- Sessions (Cockpit): Cockpit window layout no longer uses a fixed content frame; default new-window height is now tuned for about 8 visible rows and resizing now scales rows naturally in both directions.
+- Sessions (Cockpit): Cockpit window layout no longer uses a fixed content frame; rows scale naturally with window resizing, with per-mode frame persistence and no session-count auto-resize.
 - Preferences (Unified Window): Reordered sections so `Columns` and `Filters` appear before `Rich Transcript`.
 - Preferences (OpenClaw): Moved `Include deleted OpenClaw sessions` from Advanced to the OpenClaw pane as a standalone checkbox.
+- Preferences: Added a dedicated `Agent Cockpit` pane and moved Live Sessions + Cockpit settings there from `Advanced`; compact mode now includes a `Show agent name in compact mode` toggle (default on).
 - Sessions (Unified): Removed the leading dot from agent pill toggles in the main toolbar.
 - Sessions (Unified): `Active sessions only` now filters to live Codex sessions (`active` + `open`) instead of only actively working sessions.
 - Sessions (Unified): `Active sessions only` now filters to live Codex and Claude sessions (`active` + `open`).

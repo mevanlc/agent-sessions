@@ -29,12 +29,18 @@ extension PreferencesView {
                 // Terminal app preference for both Codex and Claude resumes
                 labeledRow("Terminal App") {
                     Picker("", selection: Binding(
-                        get: { (resumeSettings.launchMode == .iterm || claudeSettings.preferITerm) ? 1 : 0 },
+                        get: { (resumeSettings.launchMode == .iterm || claudeSettings.preferITerm || opencodeSettings.preferITerm || copilotSettings.preferITerm || geminiSettings.preferITerm) ? 1 : 0 },
                         set: { idx in
                             // Apply to Codex
                             resumeSettings.setLaunchMode(idx == 1 ? .iterm : .terminal)
                             // Apply to Claude
                             claudeSettings.setPreferITerm(idx == 1)
+                            // Apply to OpenCode
+                            opencodeSettings.setPreferITerm(idx == 1)
+                            // Apply to Copilot
+                            copilotSettings.setPreferITerm(idx == 1)
+                            // Apply to Gemini
+                            geminiSettings.setPreferITerm(idx == 1)
                         }
                     )) {
                         Text("Terminal").tag(0)
@@ -42,9 +48,9 @@ extension PreferencesView {
                     }
                     .pickerStyle(.segmented)
                     .frame(maxWidth: 260)
-                    .help("Choose which terminal application handles Resume for both Codex and Claude")
+                    .help("Choose which terminal application handles Resume for all CLI agents")
                 }
-                Text("Affects Resume actions in the Sessions window for Codex and Claude.")
+                Text("Affects Resume actions in the Sessions window for all CLI agents.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -70,11 +76,20 @@ extension PreferencesView {
         }
     }
 
-    var advancedTab: some View {
+    var agentCockpitTab: some View {
         VStack(alignment: .leading, spacing: 24) {
-            Text("Advanced")
+            Text("Agent Cockpit")
                 .font(.title2)
                 .fontWeight(.semibold)
+
+            sectionHeader("Appearance")
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Reduce transparency", isOn: $cockpitReduceTransparency)
+                    .help("Uses a denser window background for better readability over dark or busy wallpapers.")
+                Text("Also respects macOS System Settings > Accessibility > Display > Reduce transparency.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             sectionHeader("Live Sessions + Cockpit BETA")
             VStack(alignment: .leading, spacing: 12) {
@@ -118,6 +133,42 @@ extension PreferencesView {
                     .foregroundStyle(.secondary)
             }
 
+            sectionHeader("Compact Mode")
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Show agent name in compact mode", isOn: $cockpitShowAgentNameInCompact)
+                    .help("When disabled, compact rows hide the agent-name text to free horizontal space. Status dot and row numbering remain visible.")
+
+                labeledRow("Default Compact Size") {
+                    Picker("", selection: $cockpitCompactBaselineRows) {
+                        Text("Small").tag(3)
+                        Text("Medium").tag(4)
+                        Text("Large").tag(6)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 280)
+                    .help("Sets the default compact window height by visible rows. Sessions above this count scroll inside the list.")
+                }
+
+                Toggle("Auto-fit compact height to visible sessions", isOn: $cockpitCompactAutoFitEnabled)
+                    .help("When enabled, compact mode grows/shrinks with visible session count. Off keeps compact height stable and uses scrolling.")
+            }
+
+            sectionHeader("Full Mode")
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Show tab subtitle under agent name", isOn: $cockpitShowTabSubtitleInFullMode)
+                    .help("Displays iTerm tab title as a muted subtitle under the agent label in full Agent Cockpit rows. Long titles are truncated with hover tooltips.")
+                Toggle("Show usage limits footer", isOn: $cockpitShowLimitsFooter)
+                    .help("Shows a compact limits footer at the bottom of the Cockpit window with 5-hour and weekly usage percentages for enabled providers.")
+            }
+        }
+    }
+
+    var advancedTab: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("Advanced")
+                .font(.title2)
+                .fontWeight(.semibold)
+
             sectionHeader("Saved Sessions")
             VStack(alignment: .leading, spacing: 12) {
                 Toggle("Save also keeps locally", isOn: $starPinsSessions)
@@ -142,7 +193,7 @@ extension PreferencesView {
                     Toggle("Index full tool I/O for recent sessions", isOn: Binding(
                         get: {
                             UserDefaults.standard.object(forKey: PreferencesKey.Advanced.enableRecentToolIOIndex) == nil
-	                                ? true
+	                                ? false
                                 : UserDefaults.standard.bool(forKey: PreferencesKey.Advanced.enableRecentToolIOIndex)
                         },
                         set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Advanced.enableRecentToolIOIndex) }
@@ -164,15 +215,36 @@ extension PreferencesView {
                     .foregroundStyle(.secondary)
             }
 
-            sectionHeader("Git Context")
-            VStack(alignment: .leading, spacing: 12) {
-                Toggle("Show Git Context button", isOn: Binding(
-                    get: { UserDefaults.standard.bool(forKey: PreferencesKey.Advanced.enableGitInspector) },
-                    set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Advanced.enableGitInspector) }
-                ))
-                .help("Show the Git Context toolbar button in Sessions (⌘⇧G)")
+            Toggle("Hide Dock icon", isOn: Binding(
+                get: { UserDefaults.standard.object(forKey: PreferencesKey.Advanced.hideDockIcon) as? Bool ?? false },
+                set: { newValue in
+                    if newValue {
+                        // Ensure there is always a persistent way to reopen app windows.
+                        let menuBarEnabled = UserDefaults.standard.bool(forKey: PreferencesKey.menuBarEnabled)
+                        if !menuBarEnabled {
+                            UserDefaults.standard.set(true, forKey: PreferencesKey.menuBarEnabled)
+                        }
+                    }
+                    UserDefaults.standard.set(newValue, forKey: PreferencesKey.Advanced.hideDockIcon)
+                }
+            ))
+            .help("Removes Agent Sessions from the Dock by switching the app to accessory activation mode. When enabled, Agent Sessions automatically keeps the menu bar item enabled so the app remains accessible.")
 
-                Text("Adds a Git Context button to the Sessions toolbar and context menus.")
+            Toggle("Show Git Context button", isOn: Binding(
+                get: { UserDefaults.standard.bool(forKey: PreferencesKey.Advanced.enableGitInspector) },
+                set: { UserDefaults.standard.set($0, forKey: PreferencesKey.Advanced.enableGitInspector) }
+            ))
+            .help("Show the Git Context toolbar button in Sessions (⌘⇧G)")
+
+            sectionHeader("Indexing")
+            VStack(alignment: .leading, spacing: 8) {
+                Button("Rebuild Core Index…") {
+                    showCoreIndexRebuildConfirm = true
+                }
+                .buttonStyle(.borderedProminent)
+                .help("Clear and rebuild the core sessions index. Use only when indexing appears corrupted.")
+
+                Text("This is an advanced repair action and can be CPU-intensive.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -338,12 +410,10 @@ extension PreferencesView {
 
 private extension PreferencesView {
     func agentEnableToggle(title: String, source: SessionSource, isOn: Binding<Bool>, enabledCount: Int) -> some View {
-        let installed = AgentEnablement.binaryInstalled(for: source)
-        let available = installed || AgentEnablement.isAvailable(source)
-        let statusText: String = installed ? "Installed" : (available ? "Data folder found" : "Not installed")
+        let availability = AgentEnablement.availabilityStatus(for: source)
         let isCurrentlyOn = isOn.wrappedValue
         let canDisable = !(enabledCount == 1 && isCurrentlyOn)
-        let canEnable = available || isCurrentlyOn
+        let canEnable = availability.isAvailable || isCurrentlyOn
         let accent = Color.agentColor(for: source, monochrome: stripMonochromeGlobal)
 
         return Toggle(isOn: Binding(
@@ -357,7 +427,7 @@ private extension PreferencesView {
                     .foregroundStyle(accent)
                     .opacity(isCurrentlyOn ? 1.0 : 0.6)
                 Spacer()
-                Text(statusText)
+                Text(availability.statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -36,11 +36,17 @@ final class ClaudeSessionParser {
         var events: [SessionEvent] = []
         var sessionID: String?
         var model: String?
+        var llmModel: String?
         var cwd: String?
         var gitBranch: String?
         var tmin: Date?
         var tmax: Date?
+        var customTitle: String?
+        var hasExplicitCustomTitle = false
         var idx = 0
+
+        // Detect subagent from file path
+        let (parentSessionID, subagentType) = Self.detectSubagentInfo(from: url)
 
         do {
             try reader.forEachLine { rawLine in
@@ -67,11 +73,29 @@ final class ClaudeSessionParser {
                 if model == nil, let ver = obj["version"] as? String {
                     model = "Claude Code \(ver)"
                 }
+                // Prefer actual LLM model from assistant events over CLI version
+                if llmModel == nil,
+                   let message = obj["message"] as? [String: Any],
+                   let msgModel = message["model"] as? String, !msgModel.isEmpty {
+                    llmModel = msgModel
+                }
 
                 // Extract timestamp
                 if let ts = extractTimestamp(from: obj) {
                     if tmin == nil || ts < tmin! { tmin = ts }
                     if tmax == nil || ts > tmax! { tmax = ts }
+                }
+
+                // Extract custom title from /rename records.
+                // custom-title always wins; agent-name is only a fallback.
+                if let t = obj["type"] as? String {
+                    if t == "custom-title", let ct = obj["customTitle"] as? String, !ct.isEmpty {
+                        customTitle = ct
+                        hasExplicitCustomTitle = true
+                    } else if t == "agent-name", !hasExplicitCustomTitle,
+                              let an = obj["agentName"] as? String, !an.isEmpty {
+                        customTitle = an
+                    }
                 }
 
                 // Parse event
@@ -95,7 +119,7 @@ final class ClaudeSessionParser {
             source: .claude,
             startTime: tmin,
             endTime: tmax,
-            model: model,
+            model: llmModel ?? model,
             filePath: url.path,
             fileSizeBytes: size >= 0 ? size : nil,
             eventCount: nonMetaCount,
@@ -104,7 +128,10 @@ final class ClaudeSessionParser {
             repoName: nil,
             lightweightTitle: nil,
             isHousekeeping: isHousekeeping,
-            codexInternalSessionIDHint: sessionID
+            codexInternalSessionIDHint: sessionID,
+            parentSessionID: parentSessionID,
+            subagentType: subagentType,
+            customTitle: hasExplicitCustomTitle ? customTitle : nil
         )
     }
 
@@ -637,6 +664,9 @@ final class ClaudeSessionParser {
             return false
         }
 
+        // Detect subagent from file path
+        let (parentSessionID, subagentType) = detectSubagentInfo(from: url)
+
         func build(headBytes: Int) -> Session? {
             guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
             defer { try? fh.close() }
@@ -667,12 +697,15 @@ final class ClaudeSessionParser {
             let tailLines = lines(from: tailData, keepHead: false)
 
             var model: String?
+            var llmModel: String?
             var cwd: String?
             var sessionID: String?
             var tmin: Date?
             var tmax: Date?
             var sampleCount = 0
             var sampleEvents: [SessionEvent] = []
+            var customTitle: String?
+            var hasExplicitCustomTitle = false
 
             func ingest(_ rawLine: String) {
                 guard let data = rawLine.data(using: .utf8),
@@ -694,11 +727,29 @@ final class ClaudeSessionParser {
                 if model == nil, let ver = obj["version"] as? String {
                     model = "Claude Code \(ver)"
                 }
+                // Prefer actual LLM model from assistant events over CLI version
+                if llmModel == nil,
+                   let message = obj["message"] as? [String: Any],
+                   let msgModel = message["model"] as? String, !msgModel.isEmpty {
+                    llmModel = msgModel
+                }
 
                 // Extract timestamp
                 if let ts = extractTimestamp(from: obj) {
                     if tmin == nil || ts < tmin! { tmin = ts }
                     if tmax == nil || ts > tmax! { tmax = ts }
+                }
+
+                // Extract custom title from /rename records.
+                // custom-title always wins; agent-name is only a fallback.
+                if let t = obj["type"] as? String {
+                    if t == "custom-title", let ct = obj["customTitle"] as? String, !ct.isEmpty {
+                        customTitle = ct
+                        hasExplicitCustomTitle = true
+                    } else if t == "agent-name", !hasExplicitCustomTitle,
+                              let an = obj["agentName"] as? String, !an.isEmpty {
+                        customTitle = an
+                    }
                 }
 
                 // Create sample event for title extraction
@@ -710,19 +761,92 @@ final class ClaudeSessionParser {
             headLines.forEach(ingest)
             tailLines.forEach(ingest)
 
+            // If no explicit custom-title found in head/tail, do a targeted chunked scan of the gap.
+            // Only searches for explicit custom-title records (not agent-name) to avoid regressing
+            // a newer fallback title from tail with older gap data.
+            // Capped at 8MB to bound I/O for very large sessions without custom-title records.
+            let gapScanBudget = 8 * 1024 * 1024
+            if !hasExplicitCustomTitle, fileSize > headBytes + tailBytes {
+                let marker = Data("\"custom-title\"".utf8)
+                let newline = UInt8(0x0a)
+                if let gapFH = try? FileHandle(forReadingFrom: url) {
+                    defer { try? gapFH.close() }
+                    let gapStart = UInt64(headBytes)
+                    let gapEndRaw = UInt64(max(0, fileSize - tailBytes))
+                    let gapEnd = min(gapEndRaw, gapStart + UInt64(gapScanBudget))
+                    if gapEnd > gapStart {
+                        try? gapFH.seek(toOffset: gapStart)
+                        // Skip partial first line only if we're mid-line (byte before gapStart is not newline).
+                        // If gapStart is already at a line boundary, start scanning immediately.
+                        var needsSkip = true
+                        if gapStart > 0 {
+                            try? gapFH.seek(toOffset: gapStart - 1)
+                            if let prevByte = try? gapFH.read(upToCount: 1), prevByte.first == newline {
+                                needsSkip = false
+                            }
+                            // Position is now at gapStart (read 1 byte from gapStart-1)
+                        }
+                        if needsSkip {
+                            var skipBuffer = Data()
+                            while skipBuffer.last != newline, gapFH.offsetInFile < gapEnd {
+                                let skipRead = min(1024, Int(gapEnd - gapFH.offsetInFile))
+                                guard skipRead > 0, let chunk = try? gapFH.read(upToCount: skipRead), !chunk.isEmpty else { break }
+                                skipBuffer.append(chunk)
+                                if skipBuffer.count > 64 * 1024 { break }
+                            }
+                        }
+                        let chunkSize = 64 * 1024
+                        var remainder = Data()
+                        var pos = gapFH.offsetInFile
+                        scanLoop: while pos < gapEnd {
+                            let toRead = min(chunkSize, Int(gapEnd - pos))
+                            guard let chunk = try? gapFH.read(upToCount: toRead), !chunk.isEmpty else { break }
+                            pos = gapFH.offsetInFile
+                            var buffer = remainder
+                            buffer.append(chunk)
+                            remainder = Data()
+                            // Split on newlines, keeping last partial line as remainder
+                            var start = buffer.startIndex
+                            while let nlIdx = buffer[start...].firstIndex(of: newline) {
+                                let lineData = buffer[start..<nlIdx]
+                                start = buffer.index(after: nlIdx)
+                                // Fast byte-level check for marker before any decoding
+                                guard lineData.range(of: marker) != nil else { continue }
+                                guard let line = String(data: lineData, encoding: .utf8),
+                                      let ld = line.data(using: .utf8),
+                                      let obj = try? JSONSerialization.jsonObject(with: ld) as? [String: Any],
+                                      let t = obj["type"] as? String,
+                                      t == "custom-title",
+                                      let ct = obj["customTitle"] as? String, !ct.isEmpty else { continue }
+                                customTitle = ct
+                                hasExplicitCustomTitle = true
+                                break scanLoop
+                            }
+                            if start < buffer.endIndex {
+                                remainder = Data(buffer[start...])
+                            }
+                        }
+                    }
+                }
+            }
+
             // Estimate event count
             let headBytesRead = headData?.count ?? 1
             let newlineCount = headData?.filter { $0 == 0x0a }.count ?? 1
             let avgLineLen = max(256, headBytesRead / max(newlineCount, 1))
             let estEvents = max(1, min(1_000_000, fileSize / avgLineLen))
 
-            // Extract title from sample events (temp session; ID not used downstream for UI)
+            // Extract title from sample events. Pass customTitle (including agent-name fallback)
+            // to the temp session so it influences title computation, then capture the result
+            // as lightweightTitle. Only persist explicit custom-title values on the final session
+            // to prevent agent-name fallbacks from overwriting authoritative titles in the DB.
+            let effectiveModel = llmModel ?? model
             let tempIsHousekeeping = Session.computeIsHousekeeping(source: .claude, events: sampleEvents)
             let tempSession = Session(id: hash(path: url.path),
                                       source: .claude,
                                       startTime: tmin,
                                       endTime: tmax,
-                                      model: model,
+                                      model: effectiveModel,
                                       filePath: url.path,
                                       fileSizeBytes: size,
                                       eventCount: estEvents,
@@ -731,15 +855,19 @@ final class ClaudeSessionParser {
                                       repoName: nil,
                                       lightweightTitle: nil,
                                       isHousekeeping: tempIsHousekeeping,
-                                      codexInternalSessionIDHint: sessionID)
+                                      codexInternalSessionIDHint: sessionID,
+                                      parentSessionID: parentSessionID,
+                                      subagentType: subagentType,
+                                      customTitle: customTitle)
             let title = tempSession.title
+            let explicitCustomTitle = hasExplicitCustomTitle ? customTitle : nil
 
             // Create final lightweight session with empty events
             return Session(id: hash(path: url.path),
                            source: .claude,
                            startTime: tmin ?? mtime,
                            endTime: tmax ?? mtime,
-                           model: model,
+                           model: effectiveModel,
                            filePath: url.path,
                            fileSizeBytes: size,
                            eventCount: estEvents,
@@ -748,7 +876,10 @@ final class ClaudeSessionParser {
                            repoName: nil,
                            lightweightTitle: title,
                            isHousekeeping: tempIsHousekeeping || title == "No prompt",
-                           codexInternalSessionIDHint: sessionID)
+                           codexInternalSessionIDHint: sessionID,
+                           parentSessionID: parentSessionID,
+                           subagentType: subagentType,
+                           customTitle: explicitCustomTitle)
         }
 
         guard let initial = build(headBytes: headBytesInitial) else { return nil }
@@ -887,6 +1018,28 @@ final class ClaudeSessionParser {
         // Stable, deterministic ID based on file path (hex SHA-256)
         let d = SHA256.hash(data: Data(path.utf8))
         return d.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Detect Claude subagent session from file path layout.
+    /// Pattern: .../<parentUUID>/subagents/agent-<agentId>.jsonl
+    /// Also reads adjacent agent-<id>.meta.json for agentType.
+    static func detectSubagentInfo(from url: URL) -> (parentSessionID: String?, subagentType: String?) {
+        let parentDir = url.deletingLastPathComponent()
+        guard parentDir.lastPathComponent == "subagents" else { return (nil, nil) }
+
+        let parentSessionName = parentDir.deletingLastPathComponent().lastPathComponent
+        guard ClaudeSessionIDHelper.looksLikeUUID(parentSessionName) else { return (nil, nil) }
+
+        // Read adjacent meta.json for agentType
+        let baseName = url.deletingPathExtension().lastPathComponent
+        let metaFile = parentDir.appendingPathComponent("\(baseName).meta.json")
+        var agentType: String?
+        if let metaData = try? Data(contentsOf: metaFile),
+           let metaObj = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any] {
+            agentType = metaObj["agentType"] as? String
+        }
+
+        return (parentSessionName, agentType)
     }
 
     private static func isValidPath(_ path: String) -> Bool {

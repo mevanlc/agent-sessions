@@ -123,6 +123,41 @@ actor IndexDB {
             try exec(db, "CREATE INDEX IF NOT EXISTS idx_session_meta_housekeeping ON session_meta(is_housekeeping);")
         }
 
+        // Subagent hierarchy columns.
+        if !tableHasColumn(db, table: "session_meta", column: "parent_session_id") {
+            do {
+                try exec(db, "ALTER TABLE session_meta ADD COLUMN parent_session_id TEXT;")
+            } catch {
+                if !isDuplicateColumnError(error) { throw error }
+            }
+        }
+
+        if !tableHasColumn(db, table: "session_meta", column: "subagent_type") {
+            do {
+                try exec(db, "ALTER TABLE session_meta ADD COLUMN subagent_type TEXT;")
+            } catch {
+                if !isDuplicateColumnError(error) { throw error }
+            }
+        }
+
+        if !tableHasColumn(db, table: "session_meta", column: "custom_title") {
+            do {
+                try exec(db, "ALTER TABLE session_meta ADD COLUMN custom_title TEXT;")
+            } catch {
+                if !isDuplicateColumnError(error) { throw error }
+            }
+        }
+
+        if tableHasColumn(db, table: "session_meta", column: "parent_session_id") {
+            try exec(db, "CREATE INDEX IF NOT EXISTS idx_session_meta_parent ON session_meta(parent_session_id);")
+        }
+
+        // One-time migration marker table for schema changes that require a full reindex.
+        try exec(db, "CREATE TABLE IF NOT EXISTS schema_migrations (key TEXT PRIMARY KEY);")
+
+        // Generic key-value state table for lightweight persistent markers (e.g. backfill tracking).
+        try exec(db, "CREATE TABLE IF NOT EXISTS index_state (key TEXT PRIMARY KEY, value TEXT);")
+
         // session_days keeps per-session contributions split by day
         try exec(db,
             """
@@ -270,9 +305,45 @@ actor IndexDB {
         } catch {
             // Optional.
         }
+
+        // Force full reindex to populate parent_session_id and subagent_type for all sessions.
+        // v2: extract agent_role from Codex thread_spawn instead of hardcoding "thread_spawn".
+        // Runs after all CREATE TABLE statements so fresh databases don't hit "no such table".
+        let migrationKey = "subagent_reindex_v2"
+        if !migrationApplied(db, key: migrationKey) {
+            try exec(db, "DELETE FROM files;")
+            try exec(db, "DELETE FROM session_meta;")
+            try exec(db, "DELETE FROM session_search;")
+            try exec(db, "DELETE FROM session_tool_io;")
+            try exec(db, "DELETE FROM session_days;")
+            try exec(db, "DELETE FROM rollups_daily;")
+            try execBind(db, "INSERT OR IGNORE INTO schema_migrations(key) VALUES(?);", migrationKey)
+        }
+
+        // Backfill custom_title for already-indexed sessions by forcing a full reindex.
+        let customTitleMigration = "custom_title_reindex_v1"
+        if !migrationApplied(db, key: customTitleMigration) {
+            try exec(db, "DELETE FROM files;")
+            try exec(db, "DELETE FROM session_meta;")
+            try exec(db, "DELETE FROM session_search;")
+            try exec(db, "DELETE FROM session_tool_io;")
+            try exec(db, "DELETE FROM session_days;")
+            try exec(db, "DELETE FROM rollups_daily;")
+            try execBind(db, "INSERT OR IGNORE INTO schema_migrations(key) VALUES(?);", customTitleMigration)
+        }
     }
 
     // MARK: - Exec helpers
+    private static func migrationApplied(_ db: OpaquePointer?, key: String) -> Bool {
+        guard let db else { return false }
+        let sql = "SELECT 1 FROM schema_migrations WHERE key = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK { return false }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
     private static func tableHasColumn(_ db: OpaquePointer?, table: String, column: String) -> Bool {
         guard let db else { return false }
         let escapedTable = table.replacingOccurrences(of: "'", with: "''")
@@ -300,6 +371,21 @@ actor IndexDB {
             let msg: String
             if let e = err { msg = String(cString: e); sqlite3_free(e) } else { msg = "exec failed" }
             throw DBError.execFailed(msg)
+        }
+    }
+
+    /// Execute a single-parameter text-bind statement, throwing on prepare or step failure.
+    private static func execBind(_ db: OpaquePointer?, _ sql: String, _ value: String) throws {
+        guard let db else { throw DBError.openFailed("db closed") }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, value, -1, SQLITE_TRANSIENT)
+        let rc = sqlite3_step(stmt)
+        guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
+            throw DBError.execFailed(String(cString: sqlite3_errmsg(db)))
         }
     }
 
@@ -350,6 +436,90 @@ actor IndexDB {
         if has == 1 { return false }
         let hasDays = try queryOneInt64("SELECT EXISTS(SELECT 1 FROM session_days LIMIT 1);")
         return hasDays == 0
+    }
+
+    // MARK: - Analytics Backfill State
+
+    /// Record that a full analytics backfill completed for `source` at the given schema version.
+    func setAnalyticsBackfillComplete(source: String, version: Int) throws {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        let key = "analytics_backfill_done:\(source):\(version)"
+        let sql = "INSERT OR REPLACE INTO index_state(key, value) VALUES(?, '1');"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        let rc = sqlite3_step(stmt)
+        guard rc == SQLITE_DONE else {
+            throw DBError.execFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Returns the set of source names that have a backfill-complete marker for `version`.
+    func analyticsBackfillCompleteSources(version: Int) throws -> Set<String> {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        let prefix = "analytics_backfill_done:"
+        let expectedSuffix = ":\(version)"
+        let sql = "SELECT key FROM index_state WHERE key LIKE ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, "\(prefix)%", -1, SQLITE_TRANSIENT)
+        var sources = Set<String>()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let cStr = sqlite3_column_text(stmt, 0) else { continue }
+            let key = String(cString: cStr)
+            // Key format: "analytics_backfill_done:<source>:<version>"
+            guard key.hasSuffix(expectedSuffix) else { continue }
+            let inner = key.dropFirst(prefix.count).dropLast(expectedSuffix.count)
+            if !inner.isEmpty {
+                sources.insert(String(inner))
+            }
+        }
+        return sources
+    }
+
+    /// Remove all analytics backfill markers (all sources, all versions).
+    func clearAnalyticsBackfillState() throws {
+        try exec("DELETE FROM index_state WHERE key LIKE 'analytics_backfill_done:%';")
+    }
+
+    // MARK: - Generic Index State
+
+    /// Store an arbitrary string value in index_state under a key.
+    func setIndexState(key: String, value: String) throws {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        let sql = "INSERT OR REPLACE INTO index_state(key, value) VALUES(?, ?);"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT)
+        let rc = sqlite3_step(stmt)
+        guard rc == SQLITE_DONE else {
+            throw DBError.execFailed(String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Fetch an arbitrary string value from index_state by key.
+    func indexStateValue(for key: String) throws -> String? {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        let sql = "SELECT value FROM index_state WHERE key = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        guard let cStr = sqlite3_column_text(stmt, 0) else { return nil }
+        return String(cString: cStr)
     }
 
     /// Fetch indexed file records for a source from the files table.
@@ -417,7 +587,7 @@ actor IndexDB {
     func fetchSessionMeta(for source: String) throws -> [SessionMetaRow] {
         guard let db = handle else { throw DBError.openFailed("db closed") }
         let sql = """
-        SELECT session_id, source, path, mtime, size, start_ts, end_ts, model, cwd, repo, title, codex_internal_session_id, is_housekeeping, messages, commands
+        SELECT session_id, source, path, mtime, size, start_ts, end_ts, model, cwd, repo, title, codex_internal_session_id, is_housekeeping, messages, commands, parent_session_id, subagent_type, custom_title
         FROM session_meta
         WHERE source = ?
         ORDER BY COALESCE(end_ts, mtime) DESC
@@ -446,7 +616,10 @@ actor IndexDB {
                 codexInternalSessionID: sqlite3_column_type(stmt, 11) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 11)),
                 isHousekeeping: sqlite3_column_int64(stmt, 12) != 0,
                 messages: Int(sqlite3_column_int64(stmt, 13)),
-                commands: Int(sqlite3_column_int64(stmt, 14))
+                commands: Int(sqlite3_column_int64(stmt, 14)),
+                parentSessionID: sqlite3_column_type(stmt, 15) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 15)),
+                subagentType: sqlite3_column_type(stmt, 16) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 16)),
+                customTitle: sqlite3_column_type(stmt, 17) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 17))
             )
             out.append(row)
         }
@@ -508,6 +681,35 @@ actor IndexDB {
     }
 
     // MARK: - Analytics rollup queries
+    func analyticsSessionDaySpan(sources: [String]) throws -> (String?, String?) {
+        guard let db = handle else { throw DBError.openFailed("db closed") }
+        var clauses: [String] = []
+        var binds: [String] = []
+        if !sources.isEmpty {
+            let qs = Array(repeating: "?", count: sources.count).joined(separator: ",")
+            clauses.append("source IN (\(qs))")
+            binds.append(contentsOf: sources)
+        }
+        let whereSQL = clauses.isEmpty ? "" : (" WHERE " + clauses.joined(separator: " AND "))
+        let sql = "SELECT MIN(day), MAX(day) FROM session_days\(whereSQL);"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
+            throw DBError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        var idx: Int32 = 1
+        for source in binds {
+            sqlite3_bind_text(stmt, idx, source, -1, SQLITE_TRANSIENT)
+            idx += 1
+        }
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            let minDay = sqlite3_column_type(stmt, 0) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 0))
+            let maxDay = sqlite3_column_type(stmt, 1) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 1))
+            return (minDay, maxDay)
+        }
+        return (nil, nil)
+    }
+
     func countDistinctSessions(sources: [String], dayStart: String?, dayEnd: String?) throws -> Int {
         guard let db = handle else { throw DBError.openFailed("db closed") }
         var clauses: [String] = []
@@ -903,6 +1105,9 @@ actor IndexDB {
         try exec("DELETE FROM session_search WHERE source='\(source)'")
         try exec("DELETE FROM session_tool_io WHERE source='\(source)'")
         try exec("DELETE FROM files WHERE source='\(source)'")
+        // Clear analytics backfill markers for this source (all versions).
+        // Note: source values are controlled ASCII identifiers (e.g. "codex"); interpolation is safe here.
+        try exec("DELETE FROM index_state WHERE key LIKE 'analytics_backfill_done:\(source):%'")
     }
 
     /// Delete DB rows for sessions whose file paths were removed.
@@ -1087,13 +1292,14 @@ actor IndexDB {
 
     func upsertSessionMeta(_ m: SessionMetaRow) throws {
         let sql = """
-        INSERT INTO session_meta(session_id, source, path, mtime, size, start_ts, end_ts, model, cwd, repo, title, codex_internal_session_id, is_housekeeping, messages, commands)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO session_meta(session_id, source, path, mtime, size, start_ts, end_ts, model, cwd, repo, title, codex_internal_session_id, is_housekeeping, messages, commands, parent_session_id, subagent_type, custom_title)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET
           source=excluded.source, path=excluded.path, mtime=excluded.mtime, size=excluded.size,
           start_ts=excluded.start_ts, end_ts=excluded.end_ts, model=excluded.model, cwd=excluded.cwd,
           repo=excluded.repo, title=excluded.title, codex_internal_session_id=excluded.codex_internal_session_id,
-          is_housekeeping=excluded.is_housekeeping, messages=excluded.messages, commands=excluded.commands;
+          is_housekeeping=excluded.is_housekeeping, messages=excluded.messages, commands=excluded.commands,
+          parent_session_id=excluded.parent_session_id, subagent_type=excluded.subagent_type, custom_title=excluded.custom_title;
         """
         let stmt = try prepare(sql)
         defer { sqlite3_finalize(stmt) }
@@ -1112,7 +1318,50 @@ actor IndexDB {
         sqlite3_bind_int64(stmt, 13, m.isHousekeeping ? 1 : 0)
         sqlite3_bind_int64(stmt, 14, Int64(m.messages))
         sqlite3_bind_int64(stmt, 15, Int64(m.commands))
+        if let pid = m.parentSessionID { sqlite3_bind_text(stmt, 16, pid, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 16) }
+        if let sat = m.subagentType { sqlite3_bind_text(stmt, 17, sat, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 17) }
+        if let ct = m.customTitle { sqlite3_bind_text(stmt, 18, ct, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 18) }
         if sqlite3_step(stmt) != SQLITE_DONE { throw DBError.execFailed("upsert session_meta") }
+    }
+
+    /// Lightweight upsert for core indexers. Preserves `messages` and `commands` set by the
+    /// analytics indexer (which produces higher-quality values). Uses COALESCE for
+    /// `custom_title` and `codex_internal_session_id` so non-NULL parsed values update the DB
+    /// while NULL values (from lightweight parses that missed the record) preserve existing data.
+    func upsertSessionMetaCore(_ m: SessionMetaRow) throws {
+        let sql = """
+        INSERT INTO session_meta(session_id, source, path, mtime, size, start_ts, end_ts, model, cwd, repo, title, codex_internal_session_id, is_housekeeping, messages, commands, parent_session_id, subagent_type, custom_title)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          source=excluded.source, path=excluded.path, mtime=excluded.mtime, size=excluded.size,
+          start_ts=excluded.start_ts, end_ts=excluded.end_ts, model=excluded.model, cwd=excluded.cwd,
+          repo=excluded.repo, title=excluded.title,
+          is_housekeeping=excluded.is_housekeeping,
+          parent_session_id=excluded.parent_session_id, subagent_type=excluded.subagent_type,
+          custom_title=COALESCE(excluded.custom_title, session_meta.custom_title),
+          codex_internal_session_id=CASE WHEN session_meta.codex_internal_session_id IS NULL THEN excluded.codex_internal_session_id ELSE session_meta.codex_internal_session_id END;
+        """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, m.sessionID, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, m.source, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, m.path, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 4, m.mtime)
+        sqlite3_bind_int64(stmt, 5, m.size)
+        sqlite3_bind_int64(stmt, 6, m.startTS)
+        sqlite3_bind_int64(stmt, 7, m.endTS)
+        if let model = m.model { sqlite3_bind_text(stmt, 8, model, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 8) }
+        if let cwd = m.cwd { sqlite3_bind_text(stmt, 9, cwd, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 9) }
+        if let repo = m.repo { sqlite3_bind_text(stmt, 10, repo, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 10) }
+        if let title = m.title { sqlite3_bind_text(stmt, 11, title, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 11) }
+        if let codexInternal = m.codexInternalSessionID { sqlite3_bind_text(stmt, 12, codexInternal, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 12) }
+        sqlite3_bind_int64(stmt, 13, m.isHousekeeping ? 1 : 0)
+        sqlite3_bind_int64(stmt, 14, Int64(m.messages))
+        sqlite3_bind_int64(stmt, 15, Int64(m.commands))
+        if let pid = m.parentSessionID { sqlite3_bind_text(stmt, 16, pid, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 16) }
+        if let sat = m.subagentType { sqlite3_bind_text(stmt, 17, sat, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 17) }
+        if let ct = m.customTitle { sqlite3_bind_text(stmt, 18, ct, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 18) }
+        if sqlite3_step(stmt) != SQLITE_DONE { throw DBError.execFailed("upsert session_meta core") }
     }
 
     func upsertSessionSearch(sessionID: String, source: String, mtime: Int64, size: Int64, text: String, formatVersion: Int = FeatureFlags.sessionSearchFormatVersion) throws {
@@ -1567,6 +1816,9 @@ struct SessionMetaRow {
     let isHousekeeping: Bool
     let messages: Int
     let commands: Int
+    let parentSessionID: String?
+    let subagentType: String?
+    let customTitle: String?
 }
 
 struct SessionDayRow {

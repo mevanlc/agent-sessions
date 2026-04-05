@@ -2,10 +2,12 @@ import SwiftUI
 
 struct AgentCockpitHUDGroupHeader: View {
     let projectName: String
-    let summary: String
-    let hasActive: Bool
+    let activeCount: Int
+    let idleCount: Int
+    let isStaleOnly: Bool
     let isCollapsed: Bool
     let onTap: () -> Void
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Button(action: onTap) {
@@ -14,14 +16,32 @@ struct AgentCockpitHUDGroupHeader: View {
                     .font(.system(size: 12, weight: .bold))
                     .tracking(0.8)
                     .foregroundStyle(.secondary.opacity(0.9))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
+                    .help(projectName)
 
-                Text(summary)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(hasActive ? Color.green : .secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background((hasActive ? Color.green : Color.secondary).opacity(0.12))
-                    .clipShape(Capsule())
+                if activeCount > 0 {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(Color(hex: "30d158"))
+                            .frame(width: 7, height: 7)
+                        Text("\(activeCount)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color(hex: "30d158"))
+                    }
+                }
+
+                if idleCount > 0 {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(waitingDotColor)
+                            .frame(width: 7, height: 7)
+                        Text("\(idleCount)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(waitingDotColor)
+                    }
+                }
 
                 Rectangle()
                     .fill(Color.primary.opacity(0.08))
@@ -38,5 +58,10 @@ struct AgentCockpitHUDGroupHeader: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    private var waitingDotColor: Color {
+        let base = colorScheme == .dark ? Color(hex: "ffb340") : Color(hex: "e08600")
+        return isStaleOnly ? base.opacity(0.5) : base
     }
 }

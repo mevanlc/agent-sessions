@@ -8,10 +8,142 @@ extension Notification.Name {
     static let openTranscriptFindFromMenu = Notification.Name("AgentSessionsOpenTranscriptFindFromMenu")
     static let showOnboardingFromMenu = Notification.Name("AgentSessionsShowOnboardingFromMenu")
     static let navigateToSessionFromImages = Notification.Name("AgentSessionsNavigateToSessionFromImages")
+    static let navigateToSessionFromCockpit = Notification.Name("AgentSessionsNavigateToSessionFromCockpit")
     static let navigateToSessionEventFromImages = Notification.Name("AgentSessionsNavigateToSessionEventFromImages")
     static let showImagesFromMenu = Notification.Name("AgentSessionsShowImagesFromMenu")
     static let showImagesForInlineImage = Notification.Name("AgentSessionsShowImagesForInlineImage")
     static let selectImagesBrowserItem = Notification.Name("AgentSessionsSelectImagesBrowserItem")
+    static let requestCoreIndexRebuild = Notification.Name("AgentSessionsRequestCoreIndexRebuild")
+}
+
+struct PendingCockpitNavigationRequest {
+    let unifiedSessionID: String
+    let sourceRawValue: String?
+    let runtimeSessionID: String?
+    let logPath: String?
+    let workingDirectory: String?
+    let createdAt: Date
+}
+
+enum AppWindowRouter {
+    @MainActor static var openAgentSessionsWindow: (() -> Void)?
+    @MainActor static var openAgentCockpitWindow: (() -> Void)?
+    @MainActor private static var didAttemptPinnedCockpitLaunchRestore: Bool = false
+
+    @MainActor private static func existingWindow(title: String, identifier: String? = nil) -> NSWindow? {
+        if let identifier {
+            if let identifiedWindow = NSApp.windows.first(where: { $0.identifier?.rawValue == identifier }) {
+                return identifiedWindow
+            }
+        }
+
+        return NSApp.windows.first(where: { $0.title == title })
+    }
+
+    @MainActor private static func existingWindow(identifier: String) -> NSWindow? {
+        NSApp.windows.first(where: { $0.identifier?.rawValue == identifier })
+    }
+
+    @MainActor static func showAgentSessionsWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let main = existingWindow(title: "Agent Sessions") {
+            main.makeKeyAndOrderFront(nil)
+            return
+        }
+        if let openAgentSessionsWindow {
+            openAgentSessionsWindow()
+            return
+        }
+    }
+
+    @MainActor static func showAgentCockpitWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let cockpit = existingWindow(identifier: "AgentCockpit") {
+            cockpit.makeKeyAndOrderFront(nil)
+            return
+        }
+        if let openAgentCockpitWindow {
+            openAgentCockpitWindow()
+            return
+        }
+    }
+
+    @MainActor
+    static func shouldRestorePinnedCockpitOnLaunch(defaults: UserDefaults = .standard) -> Bool {
+        let liveSessionsEnabled = defaults.object(forKey: PreferencesKey.Cockpit.codexActiveSessionsEnabled) as? Bool ?? true
+        guard liveSessionsEnabled else { return false }
+        return defaults.object(forKey: PreferencesKey.Cockpit.hudPinned) as? Bool ?? false
+    }
+
+    @MainActor
+    static func maybeRestorePinnedCockpitOnLaunch(openWindow: () -> Void) {
+        guard !didAttemptPinnedCockpitLaunchRestore else { return }
+        didAttemptPinnedCockpitLaunchRestore = true
+        guard !AppRuntime.isRunningTests else { return }
+        guard shouldRestorePinnedCockpitOnLaunch() else { return }
+        guard existingWindow(identifier: "AgentCockpit") == nil else { return }
+        openWindow()
+    }
+}
+
+enum CockpitNavigationBridge {
+    private static let defaultsKey = "AgentSessionsPendingCockpitNavigationRequest"
+    private static let unifiedSessionIDKey = "unifiedSessionID"
+    private static let sourceRawValueKey = "sourceRawValue"
+    private static let runtimeSessionIDKey = "runtimeSessionID"
+    private static let logPathKey = "logPath"
+    private static let workingDirectoryKey = "workingDirectory"
+    private static let createdAtKey = "createdAtEpoch"
+
+    static func store(_ request: PendingCockpitNavigationRequest) {
+        let payload: [String: Any] = [
+            unifiedSessionIDKey: request.unifiedSessionID,
+            sourceRawValueKey: request.sourceRawValue ?? "",
+            runtimeSessionIDKey: request.runtimeSessionID ?? "",
+            logPathKey: request.logPath ?? "",
+            workingDirectoryKey: request.workingDirectory ?? "",
+            createdAtKey: request.createdAt.timeIntervalSince1970
+        ]
+        UserDefaults.standard.set(payload, forKey: defaultsKey)
+    }
+
+    static func load() -> PendingCockpitNavigationRequest? {
+        guard let payload = UserDefaults.standard.dictionary(forKey: defaultsKey),
+              let unifiedSessionID = payload[unifiedSessionIDKey] as? String,
+              !unifiedSessionID.isEmpty,
+              let createdAtEpoch = payload[createdAtKey] as? TimeInterval else {
+            return nil
+        }
+
+        func optionalValue(for key: String) -> String? {
+            guard let raw = payload[key] as? String else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        return PendingCockpitNavigationRequest(
+            unifiedSessionID: unifiedSessionID,
+            sourceRawValue: optionalValue(for: sourceRawValueKey),
+            runtimeSessionID: optionalValue(for: runtimeSessionIDKey),
+            logPath: optionalValue(for: logPathKey),
+            workingDirectory: optionalValue(for: workingDirectoryKey),
+            createdAt: Date(timeIntervalSince1970: createdAtEpoch)
+        )
+    }
+
+    static func clear() {
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+    }
+
+    static func clearIfMatching(unifiedSessionID: String) {
+        guard let pending = load() else { return }
+        guard pending.unifiedSessionID == unifiedSessionID else { return }
+        clear()
+    }
+
+    static func hasPending(unifiedSessionID: String) -> Bool {
+        load()?.unifiedSessionID == unifiedSessionID
+    }
 }
 
 @main
@@ -45,10 +177,12 @@ struct AgentSessionsApp: App {
     @AppStorage("CodexUsageEnabled") private var codexUsageEnabledPref: Bool = false
     @AppStorage("ClaudeUsageEnabled") private var claudeUsageEnabledPref: Bool = false
     @AppStorage("ShowClaudeUsageStrip") private var showClaudeUsageStrip: Bool = false
+    @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var liveSessionsEnabled: Bool = true
     @AppStorage(PreferencesKey.Agents.codexEnabled) private var codexAgentEnabled: Bool = true
     @AppStorage(PreferencesKey.Agents.claudeEnabled) private var claudeAgentEnabled: Bool = true
     @AppStorage(PreferencesKey.Agents.geminiEnabled) private var geminiAgentEnabled: Bool = true
     @AppStorage(PreferencesKey.Agents.openCodeEnabled) private var openCodeAgentEnabled: Bool = true
+    @AppStorage(PreferencesKey.Advanced.hideDockIcon) private var hideDockIcon: Bool = false
     @AppStorage("UnifiedLegacyNoticeShown") private var unifiedNoticeShown: Bool = false
     @State private var selectedSessionID: String?
     @State private var selectedEventID: String?
@@ -59,41 +193,63 @@ struct AgentSessionsApp: App {
     @State private var analyticsService: AnalyticsService?
     @State private var analyticsWindowController: AnalyticsWindowController?
     @State private var analyticsReady: Bool = false
+    @State private var analyticsPhase: AnalyticsIndexPhase = .idle
+    @State private var analyticsStale: Bool = false
     @State private var analyticsReadyObserver: AnyCancellable?
+    @State private var analyticsPhaseObserver: AnyCancellable?
+    @State private var analyticsStaleObserver: AnyCancellable?
+    @State private var analyticsProgressObserver: AnyCancellable?
+    @State private var analyticsLastBuiltObserver: AnyCancellable?
+    @State private var analyticsBuildObserver: NSObjectProtocol?
+    @State private var analyticsCancelObserver: NSObjectProtocol?
+    @State private var analyticsUpdateObserver: NSObjectProtocol?
 
     init() {
-        AgentEnablement.seedIfNeeded()
+        guard !AppRuntime.isRunningTests else { return }
+        let defaults = UserDefaults.standard
+        let hideDockIcon = defaults.object(forKey: PreferencesKey.Advanced.hideDockIcon) as? Bool ?? false
+        let menuBarEnabled = defaults.object(forKey: PreferencesKey.menuBarEnabled) as? Bool ?? false
+        Self.applyActivationPolicy(hideDockIcon: hideDockIcon, menuBarEnabled: menuBarEnabled)
+
+        // Fallback: if no window appears within 3 seconds, open the gate anyway
+        // so startup tasks are never blocked indefinitely in a windowless launch.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { AppReadyGate.markReady() }
     }
 
     var body: some Scene {
         // Default unified window
-        WindowGroup("Agent Sessions") {
-            let unified = unifiedIndexerHolder.makeUnified(
-                codexIndexer: indexer,
-                claudeIndexer: claudeIndexer,
-                geminiIndexer: geminiIndexer,
-                opencodeIndexer: opencodeIndexer,
-                copilotIndexer: copilotIndexer,
-                droidIndexer: droidIndexer,
-                openclawIndexer: openclawIndexer
-            )
-            let layoutMode = LayoutMode(rawValue: layoutModeRaw) ?? .vertical
-            UnifiedSessionsView(
-                unified: unified,
-                codexIndexer: indexer,
-                claudeIndexer: claudeIndexer,
-                geminiIndexer: geminiIndexer,
-                opencodeIndexer: opencodeIndexer,
-                copilotIndexer: copilotIndexer,
-                droidIndexer: droidIndexer,
-                openclawIndexer: openclawIndexer,
-                analyticsReady: analyticsReady,
-                layoutMode: layoutMode,
-                onToggleLayout: {
-                    let current = LayoutMode(rawValue: layoutModeRaw) ?? .vertical
-                    layoutModeRaw = (current == .vertical ? LayoutMode.horizontal : .vertical).rawValue
-                }
-            )
+        WindowGroup("Agent Sessions", id: "Agent Sessions") {
+            if AppRuntime.isRunningTests {
+                EmptyView()
+            } else {
+                let unified = unifiedIndexerHolder.makeUnified(
+                    codexIndexer: indexer,
+                    claudeIndexer: claudeIndexer,
+                    geminiIndexer: geminiIndexer,
+                    opencodeIndexer: opencodeIndexer,
+                    copilotIndexer: copilotIndexer,
+                    droidIndexer: droidIndexer,
+                    openclawIndexer: openclawIndexer
+                )
+                let layoutMode = LayoutMode(rawValue: layoutModeRaw) ?? .vertical
+                UnifiedSessionsView(
+                    unified: unified,
+                    codexIndexer: indexer,
+                    claudeIndexer: claudeIndexer,
+                    geminiIndexer: geminiIndexer,
+                    opencodeIndexer: opencodeIndexer,
+                    copilotIndexer: copilotIndexer,
+                    droidIndexer: droidIndexer,
+                    openclawIndexer: openclawIndexer,
+                    analyticsReady: analyticsReady,
+                    analyticsPhase: analyticsPhase,
+                    analyticsIsStale: analyticsStale,
+                    layoutMode: layoutMode,
+                    onToggleLayout: {
+                        let current = LayoutMode(rawValue: layoutModeRaw) ?? .vertical
+                        layoutModeRaw = (current == .vertical ? LayoutMode.horizontal : .vertical).rawValue
+                    }
+                )
                 .environmentObject(codexUsageModel)
                 .environmentObject(claudeUsageModel)
                 .environmentObject(activeCodexSessions)
@@ -101,48 +257,15 @@ struct AgentSessionsApp: App {
                 .environmentObject(archiveManager)
                 .environmentObject(updaterController)
                 .background(WindowAutosave(name: "MainWindow"))
+                .background(WindowOpenRegistrationView())
                 .onAppear {
-                    guard !AppRuntime.isRunningTests else { return }
-                    if UpdaterController.shared == nil || UpdaterController.shared !== updaterController {
-                        UpdaterController.shared = updaterController
-                    }
-                    setupMainWindowCloseObserverIfNeeded()
-
-                    if !didRunStartupTasks {
-                        didRunStartupTasks = true
-                        LaunchProfiler.reset("Unified main window")
-                        LaunchProfiler.log("Window appeared")
-                        LaunchProfiler.log("UnifiedSessionIndexer.refresh() invoked")
-                        Task {
-                            let detectedCount = await CrashReportingService.shared.detectAndQueueOnLaunch()
-                            if detectedCount > 0 {
-                                await presentCrashRecoveryPrompt(newCrashCount: detectedCount)
-                            }
-                        }
-                        onboardingCoordinator.checkAndPresentIfNeeded()
-                        unifiedIndexerHolder.unified?.refresh()
-                        setupAnalytics()
-                    }
-
-                    let isAppActive = NSApp?.isActive ?? true
-                    unifiedIndexerHolder.unified?.setAppActive(isAppActive)
-                    activeCodexSessions.setAppActive(isAppActive)
-                    codexUsageModel.setAppActive(isAppActive)
-                    claudeUsageModel.setAppActive(isAppActive)
-                    updateUsageModels()
+                    runSharedLaunchBootstrap(windowLabel: "Unified main window")
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                    unifiedIndexerHolder.unified?.setAppActive(true)
-                    activeCodexSessions.setAppActive(true)
-                    codexUsageModel.setAppActive(true)
-                    claudeUsageModel.setAppActive(true)
-                    archiveManager.syncPinnedSessionsNow()
+                    handleAppDidBecomeActive()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
-                    unifiedIndexerHolder.unified?.setAppActive(false)
-                    activeCodexSessions.setAppActive(false)
-                    codexUsageModel.setAppActive(false)
-                    claudeUsageModel.setAppActive(false)
+                    handleAppDidResignActive()
                 }
                 .onChange(of: showUsageStrip) { _, _ in
                     updateUsageModels()
@@ -155,6 +278,13 @@ struct AgentSessionsApp: App {
                 }
                 .onChange(of: menuBarEnabled) { _, newValue in
                     updateUsageModels()
+                    Self.applyActivationPolicy(hideDockIcon: hideDockIcon, menuBarEnabled: newValue)
+                }
+                .onChange(of: liveSessionsEnabled) { _, _ in
+                    updateUsageModels()
+                }
+                .onChange(of: hideDockIcon) { _, newValue in
+                    Self.applyActivationPolicy(hideDockIcon: newValue, menuBarEnabled: menuBarEnabled)
                 }
                 .onChange(of: codexAgentEnabled) { _, _ in handleAgentEnablementChange() }
                 .onChange(of: claudeAgentEnabled) { _, _ in handleAgentEnablementChange() }
@@ -162,15 +292,13 @@ struct AgentSessionsApp: App {
                 .onChange(of: openCodeAgentEnabled) { _, _ in handleAgentEnablementChange() }
                 .onAppear {
                     guard !AppRuntime.isRunningTests else { return }
-                    if statusItemController == nil {
-                        statusItemController = StatusItemController(indexer: indexer,
-                                                                     codexStatus: codexUsageModel,
-                                                                     claudeStatus: claudeUsageModel)
-                    }
-                    updateUsageModels()
+                    Self.applyActivationPolicy(hideDockIcon: hideDockIcon, menuBarEnabled: menuBarEnabled)
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .showOnboardingFromMenu)) { _ in
                     onboardingCoordinator.presentManually()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .requestCoreIndexRebuild)) { _ in
+                    unified.rebuildCoreIndex()
                 }
                 .onChange(of: onboardingCoordinator.isPresented) { _, isPresented in
                     if isPresented, let content = onboardingCoordinator.content {
@@ -192,6 +320,7 @@ struct AgentSessionsApp: App {
                     }
                 }
                 // Immediate cleanup happens after each probe; no app-exit cleanup required.
+            }
         }
         .commands {
             CommandGroup(replacing: .appInfo) {
@@ -221,18 +350,18 @@ struct AgentSessionsApp: App {
             }
             // View menu with Saved Only toggle (stateful)
             CommandMenu("View") {
-                Button("Toggle Dark/Light") { indexer.toggleDarkLightUsingSystemAppearance() }
-                Button("Use System Appearance") { indexer.useSystemAppearance() }
-                    .disabled((AppAppearance(rawValue: appAppearanceRaw) ?? .system) == .system)
-                Divider()
-                // Bind through UserDefaults so it persists; also forward to unified when it changes
-                FavoritesOnlyToggle(unifiedHolder: unifiedIndexerHolder)
-                Divider()
+                OpenAgentCockpitWindowButton()
                 Button("Image Browser") {
                     NotificationCenter.default.post(name: .showImagesFromMenu, object: nil)
                 }
-                OpenAgentCockpitWindowButton()
+                .keyboardShortcut("i", modifiers: [.command, .option, .shift])
                 OpenPinnedSessionsWindowButton()
+                Divider()
+                // Bind through UserDefaults so it persists; also forward to unified when it changes
+                FavoritesOnlyToggle(unifiedHolder: unifiedIndexerHolder)
+                Button("Toggle Dark/Light") { indexer.toggleDarkLightUsingSystemAppearance() }
+                Button("Use System Appearance") { indexer.useSystemAppearance() }
+                    .disabled((AppAppearance(rawValue: appAppearanceRaw) ?? .system) == .system)
             }
             CommandGroup(after: .help) {
                 Button("Show Onboarding") {
@@ -243,40 +372,53 @@ struct AgentSessionsApp: App {
         }
 
         WindowGroup("Saved Sessions", id: "PinnedSessions") {
-            PinnedSessionsView(
-                unified: unifiedIndexerHolder.makeUnified(
-                    codexIndexer: indexer,
-                    claudeIndexer: claudeIndexer,
-                    geminiIndexer: geminiIndexer,
-                    opencodeIndexer: opencodeIndexer,
-                    copilotIndexer: copilotIndexer,
-                    droidIndexer: droidIndexer,
-                    openclawIndexer: openclawIndexer
+            if AppRuntime.isRunningTests {
+                EmptyView()
+            } else {
+                PinnedSessionsView(
+                    unified: unifiedIndexerHolder.makeUnified(
+                        codexIndexer: indexer,
+                        claudeIndexer: claudeIndexer,
+                        geminiIndexer: geminiIndexer,
+                        opencodeIndexer: opencodeIndexer,
+                        copilotIndexer: copilotIndexer,
+                        droidIndexer: droidIndexer,
+                        openclawIndexer: openclawIndexer
+                    )
                 )
-            )
-            .environmentObject(archiveManager)
+                .environmentObject(archiveManager)
+                .background(WindowOpenRegistrationView())
+                .onAppear {
+                    runSharedLaunchBootstrap(windowLabel: "Saved Sessions window")
+                }
+            }
         }
 
         Window("Agent Cockpit", id: "AgentCockpit") {
-            AgentCockpitHUDView(
-                codexIndexer: indexer,
-                claudeIndexer: claudeIndexer
-            )
+            if AppRuntime.isRunningTests {
+                EmptyView()
+            } else {
+                AgentCockpitHUDView(
+                    codexIndexer: indexer,
+                    claudeIndexer: claudeIndexer,
+                    opencodeIndexer: opencodeIndexer
+                )
                 .environmentObject(activeCodexSessions)
+                .environmentObject(codexUsageModel)
+                .environmentObject(claudeUsageModel)
+                .background(WindowOpenRegistrationView())
+                .onAppear {
+                    runSharedLaunchBootstrap(windowLabel: "Agent Cockpit window")
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    handleAppDidBecomeActive()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+                    handleAppDidResignActive()
+                }
+            }
         }
         .defaultSize(width: 644, height: 320)
-
-        Window("Legacy Cockpit", id: "LegacyCockpit") {
-            CockpitView(
-                codexIndexer: indexer,
-                claudeIndexer: claudeIndexer,
-                liveFilterStorageKey: PreferencesKey.Cockpit.legacyCodexLiveFilterMode
-            )
-                .environmentObject(activeCodexSessions)
-                .background(WindowAutosave(name: "CockpitWindow"))
-        }
-        .defaultSize(width: 980, height: 310)
-        .commandsRemoved()
     }
 }
 
@@ -319,6 +461,7 @@ private struct FavoritesOnlyToggle: View {
         )) {
             Text("Saved Only")
         }
+        .keyboardShortcut("s", modifiers: [.command, .option, .shift])
     }
 }
 
@@ -343,7 +486,7 @@ private struct OpenAgentCockpitWindowButton: View {
         .help(
             liveSessionsFeatureEnabled
                 ? "Open Agent Cockpit."
-                : "Enable Live sessions + Cockpit (Beta) in Settings → Advanced."
+                : "Enable Live sessions + Cockpit (Beta) in Settings → Agent Cockpit."
         )
         .keyboardShortcut("c", modifiers: [.command, .option, .shift])
     }
@@ -354,6 +497,143 @@ extension AgentSessionsApp {
 
     private static let crashSupportRecipient = "jazzyalex@gmail.com"
     private static let crashIssueURL = URL(string: "https://github.com/jazzyalex/agent-sessions/issues/new?title=Crash%20Report&body=Please%20attach%20the%20exported%20crash%20report%20JSON%20file%20and%20steps%20to%20reproduce.")!
+
+    private static func applyActivationPolicy(hideDockIcon: Bool, menuBarEnabled: Bool) {
+        let apply: () -> Void = {
+            // Safety: never allow accessory mode without a persistent reopen path.
+            let shouldHideDockIcon = hideDockIcon && menuBarEnabled
+            let policy: NSApplication.ActivationPolicy = shouldHideDockIcon ? .accessory : .regular
+            NSApplication.shared.setActivationPolicy(policy)
+        }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
+        }
+    }
+
+    @MainActor
+    private func unifiedIndexer() -> UnifiedSessionIndexer {
+        unifiedIndexerHolder.makeUnified(
+            codexIndexer: indexer,
+            claudeIndexer: claudeIndexer,
+            geminiIndexer: geminiIndexer,
+            opencodeIndexer: opencodeIndexer,
+            copilotIndexer: copilotIndexer,
+            droidIndexer: droidIndexer,
+            openclawIndexer: openclawIndexer
+        )
+    }
+
+    @MainActor
+    private func runSharedLaunchBootstrap(windowLabel: String) {
+        guard !AppRuntime.isRunningTests else { return }
+        DispatchQueue.main.async { AppReadyGate.markReady() }
+        if UpdaterController.shared == nil || UpdaterController.shared !== updaterController {
+            UpdaterController.shared = updaterController
+        }
+        ensureStatusItemController()
+        updateUsageModels()
+        setupMainWindowCloseObserverIfNeeded()
+
+        let unified = unifiedIndexer()
+        runStartupTasksIfNeeded(unified: unified, windowLabel: windowLabel)
+        synchronizeLiveModelsWithCurrentAppActiveState(unified: unified)
+    }
+
+    @MainActor
+    private func runStartupTasksIfNeeded(unified: UnifiedSessionIndexer, windowLabel: String) {
+        guard !didRunStartupTasks else { return }
+        didRunStartupTasks = true
+        LaunchProfiler.reset(windowLabel)
+        LaunchProfiler.log("Window appeared")
+        LaunchProfiler.log("UnifiedSessionIndexer.refresh() invoked")
+        onboardingCoordinator.checkAndPresentIfNeeded()
+        Task {
+            await AppReadyGate.waitUntilReady()
+            AgentEnablement.seedIfNeeded()
+            migrateAnalyticsCacheIfNeeded()
+            unified.syncAgentEnablementFromDefaults()
+            unified.refresh(trigger: .launch)
+            setupAnalytics()
+            presentAnalyticsOnDemandNoticeIfNeeded()
+        }
+        Task.detached(priority: .utility) {
+            await AppReadyGate.waitUntilReady()
+            await CodexStatusService.cleanupOrphansOnLaunch()
+            await ClaudeStatusService.cleanupOrphansOnLaunch()
+        }
+        Task {
+            await AppReadyGate.waitUntilReady()
+            let detectedCount = await CrashReportingService.shared.detectAndQueueOnLaunch()
+            if detectedCount > 0 {
+                await presentCrashRecoveryPrompt(newCrashCount: detectedCount)
+            }
+        }
+    }
+
+    @MainActor
+    private func synchronizeLiveModelsWithCurrentAppActiveState(unified: UnifiedSessionIndexer) {
+        let isAppActive = NSApp?.isActive ?? true
+        unified.setAppActive(isAppActive)
+        activeCodexSessions.setAppActive(isAppActive)
+        codexUsageModel.setAppActive(isAppActive)
+        claudeUsageModel.setAppActive(isAppActive)
+    }
+
+    private func migrateAnalyticsCacheIfNeeded() {
+        let defaults = UserDefaults.standard
+        let key = "AnalyticsOnDemandCacheReset_v1"
+        if defaults.bool(forKey: key) { return }
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return
+        }
+        let dir = appSupport.appendingPathComponent("AgentSessions", isDirectory: true)
+        let db = dir.appendingPathComponent("index.db", isDirectory: false)
+        let wal = dir.appendingPathComponent("index.db-wal", isDirectory: false)
+        let shm = dir.appendingPathComponent("index.db-shm", isDirectory: false)
+        try? FileManager.default.removeItem(at: db)
+        try? FileManager.default.removeItem(at: wal)
+        try? FileManager.default.removeItem(at: shm)
+        defaults.set(true, forKey: key)
+    }
+
+    @MainActor
+    private func presentAnalyticsOnDemandNoticeIfNeeded() {
+        let defaults = UserDefaults.standard
+        let key = "AnalyticsOnDemandNoticeShown_v1"
+        if defaults.bool(forKey: key) { return }
+        defaults.set(true, forKey: key)
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Analytics Is Now On Demand"
+        alert.informativeText = """
+        Agent Sessions now prioritizes Unified and Cockpit responsiveness.
+        Analytics indexing starts only when you open Analytics and press Build.
+        """
+        alert.addButton(withTitle: "OK")
+        _ = alert.runModal()
+    }
+
+    @MainActor
+    private func handleAppDidBecomeActive() {
+        guard !AppRuntime.isRunningTests else { return }
+        unifiedIndexerHolder.unified?.setAppActive(true)
+        activeCodexSessions.setAppActive(true)
+        codexUsageModel.setAppActive(true)
+        claudeUsageModel.setAppActive(true)
+        archiveManager.syncPinnedSessionsNow()
+    }
+
+    @MainActor
+    private func handleAppDidResignActive() {
+        guard !AppRuntime.isRunningTests else { return }
+        unifiedIndexerHolder.unified?.setAppActive(false)
+        activeCodexSessions.setAppActive(false)
+        codexUsageModel.setAppActive(false)
+        claudeUsageModel.setAppActive(false)
+    }
 
     private func setupMainWindowCloseObserverIfNeeded() {
         guard !AppRuntime.isRunningTests else { return }
@@ -384,12 +664,14 @@ extension AgentSessionsApp {
     }
 
     private func handleAgentEnablementChange() {
+        guard !AppRuntime.isRunningTests else { return }
         unifiedIndexerHolder.unified?.recomputeNow()
         analyticsService?.refreshReadiness()
         updateUsageModels()
     }
 
     private func updateUsageModels() {
+        guard !AppRuntime.isRunningTests else { return }
         let d = UserDefaults.standard
         // Migration defaults on first run of new toggles
         let codexEnabled: Bool = {
@@ -416,8 +698,18 @@ extension AgentSessionsApp {
         let claudeTrackingEnabled = claudeEnabled && claudeAgentEnabled
         claudeUsageModel.setEnabled(claudeTrackingEnabled)
 
-        let anyUsageTrackingEnabled = codexTrackingEnabled || claudeTrackingEnabled
-        statusItemController?.setEnabled(menuBarEnabled && anyUsageTrackingEnabled)
+        statusItemController?.setEnabled(menuBarEnabled)
+    }
+
+    private func ensureStatusItemController() {
+        guard !AppRuntime.isRunningTests else { return }
+        guard statusItemController == nil else { return }
+        statusItemController = StatusItemController(indexer: indexer,
+                                                    claudeIndexer: claudeIndexer,
+                                                    opencodeIndexer: opencodeIndexer,
+                                                    activeSessions: activeCodexSessions,
+                                                    codexStatus: codexUsageModel,
+                                                    claudeStatus: claudeUsageModel)
     }
 
     private func setupAnalytics() {
@@ -427,6 +719,18 @@ extension AgentSessionsApp {
             NotificationCenter.default.removeObserver(observer)
             analyticsToggleObserver = nil
         }
+        if let observer = analyticsBuildObserver {
+            NotificationCenter.default.removeObserver(observer)
+            analyticsBuildObserver = nil
+        }
+        if let observer = analyticsCancelObserver {
+            NotificationCenter.default.removeObserver(observer)
+            analyticsCancelObserver = nil
+        }
+        if let observer = analyticsUpdateObserver {
+            NotificationCenter.default.removeObserver(observer)
+            analyticsUpdateObserver = nil
+        }
 
         // Create analytics service with indexers
         let service = AnalyticsService(
@@ -434,21 +738,44 @@ extension AgentSessionsApp {
             claudeIndexer: claudeIndexer,
             geminiIndexer: geminiIndexer,
             opencodeIndexer: opencodeIndexer,
-            copilotIndexer: copilotIndexer
+            copilotIndexer: copilotIndexer,
+            droidIndexer: droidIndexer
         )
         analyticsService = service
 
-        // Gate readiness on both analytics warmup and unified analytics indexing.
+        // Relay readiness and analytics phase from unified indexer to the service.
         if let unified = unifiedIndexerHolder.unified {
-            analyticsReady = service.isReady && !unified.isAnalyticsIndexing
+            analyticsReady = service.isReady
             analyticsReadyObserver = service.$isReady
-                .combineLatest(unified.$isAnalyticsIndexing)
                 .receive(on: RunLoop.main)
-                .sink { ready, indexing in
-                    self.analyticsReady = ready && !indexing
-                    if !indexing {
+                .sink { ready in
+                    self.analyticsReady = ready
+                }
+            // Phase relay — keeps service.analyticsPhase in sync with unified indexer.
+            analyticsPhaseObserver = unified.$analyticsPhase
+                .receive(on: RunLoop.main)
+                .sink { phase in
+                    self.analyticsPhase = phase
+                    service.analyticsPhase = phase
+                    if phase == .ready {
                         service.refreshReadiness()
                     }
+                }
+            analyticsStaleObserver = unified.$analyticsIsStale
+                .receive(on: RunLoop.main)
+                .sink { stale in
+                    self.analyticsStale = stale
+                    service.setAnalyticsStale(stale)
+                }
+            analyticsProgressObserver = unified.$analyticsBuildProgress
+                .receive(on: RunLoop.main)
+                .sink { progress in
+                    service.setBuildProgress(progress)
+                }
+            analyticsLastBuiltObserver = unified.$analyticsLastBuiltAt
+                .receive(on: RunLoop.main)
+                .sink { date in
+                    service.setLastBuiltAt(date)
                 }
         } else {
             analyticsReady = service.isReady
@@ -463,20 +790,47 @@ extension AgentSessionsApp {
         let controller = AnalyticsWindowController(service: service)
         analyticsWindowController = controller
 
-        // Observe toggle notifications
+        // Observe toggle notifications — always opens the window, regardless of readiness.
+        let holder = unifiedIndexerHolder
         analyticsToggleObserver = NotificationCenter.default.addObserver(
-            forName: Notification.Name("ToggleAnalyticsWindow"),
+            forName: .toggleAnalyticsWindow,
             object: nil,
             queue: .main
-        ) { [weak service, weak controller] _ in
+        ) { [weak controller] _ in
             Task { @MainActor in
-                guard let service, let controller else { return }
-                guard service.isReady else {
-                    NSSound.beep()
-                    print("[Analytics] Ignoring toggle – analytics still warming up")
-                    return
-                }
+                guard let controller else { return }
                 controller.toggle()
+            }
+        }
+
+        // Observe build requests from AnalyticsView.
+        analyticsBuildObserver = NotificationCenter.default.addObserver(
+            forName: .requestAnalyticsBuild,
+            object: nil,
+            queue: .main
+        ) { [weak holder] _ in
+            Task { @MainActor in
+                holder?.unified?.startAnalyticsBuild()
+            }
+        }
+
+        analyticsCancelObserver = NotificationCenter.default.addObserver(
+            forName: .cancelAnalyticsBuild,
+            object: nil,
+            queue: .main
+        ) { [weak holder] _ in
+            Task { @MainActor in
+                holder?.unified?.cancelAnalyticsBuild()
+            }
+        }
+
+        analyticsUpdateObserver = NotificationCenter.default.addObserver(
+            forName: .requestAnalyticsUpdate,
+            object: nil,
+            queue: .main
+        ) { [weak holder] _ in
+            Task { @MainActor in
+                holder?.unified?.updateAnalyticsNow()
             }
         }
     }
@@ -558,6 +912,27 @@ extension AgentSessionsApp {
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         _ = alert.runModal()
+    }
+}
+
+private struct WindowOpenRegistrationView: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                AppWindowRouter.openAgentSessionsWindow = {
+                    openWindow(id: "Agent Sessions")
+                }
+                let openCockpitWindow = {
+                    openWindow(id: "AgentCockpit")
+                }
+                AppWindowRouter.openAgentCockpitWindow = {
+                    openCockpitWindow()
+                }
+                AppWindowRouter.maybeRestorePinnedCockpitOnLaunch(openWindow: openCockpitWindow)
+            }
     }
 }
 // MARK: - Onboarding window presentation

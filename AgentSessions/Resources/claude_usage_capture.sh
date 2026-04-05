@@ -81,6 +81,27 @@ remove_managed_socket_files() {
 # ============================================================================
 # Cleanup trap
 # ============================================================================
+# Iteratively collect ALL descendant PIDs of $1 (children, grandchildren, etc.)
+# Needed because Node.js/claude may setsid into its own process group,
+# making process-group kills miss grandchild processes.
+collect_descendants() {
+    local queue="$1"
+    local all=""
+    while [[ -n "$queue" ]]; do
+        local next_queue=""
+        for pid in $queue; do
+            all="$all $pid"
+            local ch
+            ch=$(pgrep -P "$pid" 2>/dev/null || true)
+            if [[ -n "$ch" ]]; then
+                next_queue="$next_queue $ch"
+            fi
+        done
+        queue="$next_queue"
+    done
+    echo "$all"
+}
+
 cleanup() {
     set +e
     set +o pipefail
@@ -91,15 +112,30 @@ cleanup() {
             pane_pid=$("$tmux_cmd" -L "$LABEL" display-message -p -t "$SESSION:0.0" "#{pane_pid}" 2>/dev/null || true)
         fi
         if [[ -n "$pane_pid" ]]; then
+            # Collect ALL descendants recursively (catches grandchildren in separate
+            # process groups, e.g. Node.js native binary after setsid)
+            local all_desc=""
+            all_desc=$(collect_descendants "$pane_pid")
+            # SIGTERM every descendant individually
+            for dpid in $all_desc; do
+                kill -TERM "$dpid" 2>/dev/null || true
+            done
+            # Also SIGTERM the pane's process group as a belt-and-suspenders measure
             local pgid=""
             pgid=$(ps -o pgid= -p "$pane_pid" 2>/dev/null | tr -d ' ')
             if [[ -n "$pgid" ]]; then
                 kill -TERM -"$pgid" 2>/dev/null || true
-                sleep 0.4
-                kill -KILL -"$pgid" 2>/dev/null || true
             else
                 kill -TERM "$pane_pid" 2>/dev/null || true
-                sleep 0.4
+            fi
+            sleep 0.4
+            # SIGKILL every descendant
+            for dpid in $all_desc; do
+                kill -KILL "$dpid" 2>/dev/null || true
+            done
+            if [[ -n "$pgid" ]]; then
+                kill -KILL -"$pgid" 2>/dev/null || true
+            else
                 kill -KILL "$pane_pid" 2>/dev/null || true
             fi
         fi
@@ -304,6 +340,19 @@ ensure_usage_visible() {
 }
 
 ensure_usage_visible
+
+# ============================================================================
+# Detect rate-limited / error screens before parsing
+# ============================================================================
+# Claude Code may show "rate exceeded", "rate limit", or similar instead of
+# normal usage data. Detect this early and return a structured error so the
+# caller can serve stale data instead of treating it as a parse failure.
+if echo "$usage_output" | grep -qiE '(rate limit|rate exceeded|too many requests|try again later)'; then
+  cat <<EOF
+{"ok":false,"error":"rate_limited","hint":"Claude Code CLI reported rate limiting in /usage output"}
+EOF
+  exit 0
+fi
 
 # ============================================================================
 # Parse usage output

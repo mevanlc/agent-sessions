@@ -12,7 +12,9 @@ private enum CockpitStyle {
 struct CockpitView: View {
     @ObservedObject var codexIndexer: SessionIndexer
     @ObservedObject var claudeIndexer: ClaudeSessionIndexer
+    @ObservedObject var opencodeIndexer: OpenCodeSessionIndexer
     @EnvironmentObject var activeCodex: CodexActiveSessionsModel
+    @Environment(\.colorScheme) private var systemColorScheme
     @AppStorage("AppAppearance") private var appAppearanceRaw: String = AppAppearance.system.rawValue
     @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var activeEnabled: Bool = true
     @AppStorage private var liveFilterModeRaw: String
@@ -45,6 +47,11 @@ struct CockpitView: View {
             case .live: return "Live"
             }
         }
+    }
+
+    private var effectiveColorScheme: ColorScheme {
+        let current = AppAppearance(rawValue: appAppearanceRaw) ?? .system
+        return current.effectiveColorScheme(systemScheme: systemColorScheme)
     }
 
     private struct Row: Identifiable {
@@ -82,10 +89,12 @@ struct CockpitView: View {
     init(
         codexIndexer: SessionIndexer,
         claudeIndexer: ClaudeSessionIndexer,
+        opencodeIndexer: OpenCodeSessionIndexer,
         liveFilterStorageKey: String = PreferencesKey.Cockpit.codexLiveFilterMode
     ) {
         self.codexIndexer = codexIndexer
         self.claudeIndexer = claudeIndexer
+        self.opencodeIndexer = opencodeIndexer
         _liveFilterModeRaw = AppStorage(
             wrappedValue: LiveFilterMode.live.rawValue,
             liveFilterStorageKey
@@ -105,8 +114,8 @@ struct CockpitView: View {
 
     private func makeLiveRowsSnapshot() -> LiveRowsSnapshot {
         let lookupIndexes = buildSessionLookupIndexes()
-        let supportedSources: Set<SessionSource> = [.codex, .claude]
-        let allSessions = codexIndexer.allSessions + claudeIndexer.allSessions
+        let supportedSources: Set<SessionSource> = [.codex, .claude, .opencode]
+        let allSessions = codexIndexer.allSessions + claudeIndexer.allSessions + opencodeIndexer.allSessions
         let fallbackBySessionKey = UnifiedSessionsView.buildFallbackPresenceMap(
             sessions: allSessions,
             presences: activeCodex.presences
@@ -253,7 +262,7 @@ struct CockpitView: View {
 
             if !activeEnabled {
                 PreferenceCallout {
-                    Text("Live sessions + Cockpit (Beta) is disabled in Settings → Advanced.")
+                    Text("Live sessions + Cockpit (Beta) is disabled in Settings → Agent Cockpit.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -269,7 +278,7 @@ struct CockpitView: View {
                 TableColumn("Name") { row in
                     HStack(spacing: 8) {
                         CodexLiveStatusDot(state: row.liveState, color: rowStatusDotColor(for: row), size: 7)
-                            .help(row.liveState == .activeWorking ? "Active (working)" : "Idle")
+                            .help(row.liveState == .activeWorking ? "Active (working)" : "Waiting")
                         Text(row.title)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -362,7 +371,7 @@ struct CockpitView: View {
     }
 
     private func footerText(snapshot: LiveRowsSnapshot) -> String {
-        "\(snapshot.filteredRows.count) shown • \(snapshot.activeCount) active • \(snapshot.idleCount) idle"
+        "\(snapshot.filteredRows.count) shown • \(snapshot.activeCount) active • \(snapshot.idleCount) waiting"
     }
 
     private func rowIsSelected(_ row: Row) -> Bool {
@@ -378,14 +387,20 @@ struct CockpitView: View {
     }
 
     private func rowStatusDotColor(for row: Row) -> Color {
-        rowAgentForeground(for: row)
+        switch row.liveState {
+        case .activeWorking:
+            return Color(hex: "30d158")
+        case .openIdle:
+            return effectiveColorScheme == .dark ? Color(hex: "ffb340") : Color(hex: "e08600")
+        }
     }
 
     private func refreshAllSources() {
         guard activeEnabled else { return }
         activeCodex.refreshNow()
         codexIndexer.refresh(mode: .incremental, trigger: .manual)
-        claudeIndexer.refresh(mode: .fullReconcile, trigger: .manual)
+        claudeIndexer.refresh(mode: .incremental, trigger: .manual)
+        opencodeIndexer.refresh()
     }
 
     private func focus(_ row: Row) {
@@ -596,8 +611,8 @@ struct CockpitView: View {
     }
 
     private func buildSessionLookupIndexes() -> SessionLookupIndexes {
-        let supportedSources: Set<SessionSource> = [.codex, .claude]
-        let allSessions = codexIndexer.allSessions + claudeIndexer.allSessions
+        let supportedSources: Set<SessionSource> = [.codex, .claude, .opencode]
+        let allSessions = codexIndexer.allSessions + claudeIndexer.allSessions + opencodeIndexer.allSessions
 
         var byLogPath: [String: Session] = [:]
         var bySessionID: [String: Session] = [:]

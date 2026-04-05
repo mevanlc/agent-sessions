@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Darwin
+import SQLite3
 
 enum CodexLiveState: String, Sendable, CaseIterable {
     case activeWorking
@@ -23,6 +24,7 @@ struct CodexActivePresence: Codable, Equatable, Sendable {
         var termProgram: String?
         var itermSessionId: String?
         var revealUrl: String?
+        var tabTitle: String?
     }
 
     var schemaVersion: Int?
@@ -47,6 +49,8 @@ struct CodexActivePresence: Codable, Equatable, Sendable {
 
     // Local-only metadata (not part of the on-disk schema).
     var sourceFilePath: String? = nil
+    /// All JSONL log paths open by this process (parent + subagents).
+    var openSessionLogPaths: [String] = []
 
     var itermSessionGuid: String? {
         CodexActiveSessionsModel.itermSessionGuid(from: terminal?.itermSessionId)
@@ -122,13 +126,20 @@ final class CodexActiveSessionsModel: ObservableObject {
     nonisolated static let defaultStaleTTL: TimeInterval = 10
     nonisolated static let backgroundPollInterval: TimeInterval = 15
     nonisolated static let pinnedBackgroundPollInterval: TimeInterval = 3
+    nonisolated static let stablePinnedBackgroundPollInterval: TimeInterval = 5
+    nonisolated static let pinnedBackgroundITermProbeMinInterval: TimeInterval = 9
+    nonisolated static let pinnedBackgroundProcessProbeMinInterval: TimeInterval = 12
+    nonisolated private static let stableBackoffActivationCycles: Int = 3
+    nonisolated private static let codexInconclusiveTailActiveGraceWindow: TimeInterval = 6
     nonisolated private static let processProbeTimeout: TimeInterval = 0.75
-    nonisolated private static let processProbeMinIntervalRegistryEmptyForeground: TimeInterval = 6
+    nonisolated static let subagentRecentWriteWindow: TimeInterval = 45
+    nonisolated static let processProbeMinIntervalRegistryEmptyForeground: TimeInterval = 6
     nonisolated private static let processProbeMinIntervalRegistryEmptyBackground: TimeInterval = 45
     nonisolated private static let processProbeMinIntervalRegistryPresentForeground: TimeInterval = 30
     nonisolated private static let processProbeMinIntervalRegistryPresentBackground: TimeInterval = 120
     nonisolated private static let resumeProbeBudgets: [Int] = [1, 2, 4]
     nonisolated private static let steadyStateITermProbeBudget: Int = 4
+    nonisolated private static let pinnedBackgroundWaitingITermProbeBudget: Int = 2
     nonisolated(unsafe) private static let normalizedPathCache = NSCache<NSString, NSString>()
 #if DEBUG
     nonisolated(unsafe) private static var normalizedPathCacheHitCount: UInt64 = 0
@@ -140,11 +151,13 @@ final class CodexActiveSessionsModel: ObservableObject {
     /// Used by views that want to refresh the sessions list only when active state changes,
     /// not on every heartbeat.
     @Published private(set) var activeMembershipVersion: UInt64 = 0
+    @Published private(set) var subagentBadgeVersion: UInt64 = 0
 
     @Published private(set) var presences: [CodexActivePresence] = []
     private(set) var lastRefreshAt: Date? = nil
 
     private var lastPublishedPresenceSignatures: [String: String] = [:]
+    private var lastCockpitVisibleAt: Date?
 
     @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled)
     private var enabled: Bool = true {
@@ -169,18 +182,65 @@ final class CodexActiveSessionsModel: ObservableObject {
     private var refreshTask: Task<Void, Never>? = nil
     private var refreshInFlight: Bool = false
     private var refreshQueued: Bool = false
+    private var refreshGeneration: UInt64 = 0
+    private var activeRefreshGeneration: UInt64 = 0
+    private var activeRefreshCount: Int = 0
 
     private var bySessionID: [String: CodexActivePresence] = [:]
     private var byLogPath: [String: CodexActivePresence] = [:]
+    private var lastPublishedRuntimeSubagentCountsByPresenceKey: [String: Int] = [:]
     private var liveStateByPresenceKey: [String: CodexLiveState] = [:]
+    private var idleReasonByPresenceKey: [String: HUDIdleReason] = [:]
+    private var lastActivityByPresenceKey: [String: Date] = [:]
     private var cachedProcessPresences: [CodexActivePresence] = []
+    private var cachedITermPresences: [CodexActivePresence] = []
+    private var cachedITermTabTitleByTTY: [String: String] = [:]
+    private var cachedITermTabTitleBySessionGuid: [String: String] = [:]
     private var lastProcessProbeAt: Date? = nil
+    private var lastITermProbeAt: Date? = nil
     private var unifiedVisibleConsumerIDs: Set<UUID> = []
     private var cockpitVisibleConsumerIDs: Set<UUID> = []
+    private var cockpitWindowVisibleConsumerIDs: Set<UUID> = []
     private var appIsActive: Bool = true
     private var resumeProbeBudgetIndex: Int? = nil
     private var itermProbeRoundRobinCursor: Int = 0
     private var forceFullProbeNextRefresh: Bool = false
+    private var consecutiveStableCycles: Int = 0
+    private var consecutiveEmptySuppressedCycles: Int = 0
+    private enum ManagedProbeKind: String, Hashable {
+        case processDiscovery
+        case iTermInventory
+        case iTermBatchProbe
+    }
+    /// Main-actor confined command wrapper used by refresh/cancel paths.
+    /// Do not capture instances into detached tasks.
+    private final class ManagedProbeCommand {
+        let id = UUID()
+        let kind: ManagedProbeKind
+        let process = Process()
+        let stdoutPipe = Pipe()
+
+        init(kind: ManagedProbeKind, executable: URL, arguments: [String]) {
+            self.kind = kind
+            process.executableURL = executable
+            process.arguments = arguments
+            process.standardOutput = stdoutPipe
+            process.standardError = FileHandle.nullDevice
+        }
+
+        func start() throws {
+            try process.run()
+        }
+
+        func terminate() {
+            guard process.isRunning else { return }
+            process.terminate()
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+    }
+    private var inFlightProbeCommands: [ManagedProbeKind: ManagedProbeCommand] = [:]
 
     private struct SessionLookupCacheEntry {
         var source: SessionSource
@@ -189,8 +249,12 @@ final class CodexActiveSessionsModel: ObservableObject {
         var internalSessionIDHint: String?
         var filenameUUID: String?
         var runtimeSessionIDs: [String]
+        var lastAccessTick: UInt64
     }
+    private static let sessionLookupCacheHardLimit = 500
+    private static let sessionLookupCacheTargetSize = 400
     private var sessionLookupCacheByID: [String: SessionLookupCacheEntry] = [:]
+    private var sessionLookupAccessTick: UInt64 = 0
 #if DEBUG
     private struct DebugMetrics {
         var refreshCount: UInt64 = 0
@@ -200,8 +264,28 @@ final class CodexActiveSessionsModel: ObservableObject {
         var processProbeSkips: UInt64 = 0
         var processProbeRegistryEmptyRuns: UInt64 = 0
         var processProbeRegistryPresentRuns: UInt64 = 0
+        var suppressedTransientEmptyPublishes: UInt64 = 0
         var isActiveCalls: UInt64 = 0
+        var staleRefreshResultsDropped: UInt64 = 0
+        var terminatedStaleProbeProcesses: UInt64 = 0
+        var maxConcurrentRefreshes: Int = 0
+        var maxConcurrentITermScans: Int = 0
+        var maxConcurrentITermBatchProbes: Int = 0
+        var maxConcurrentProcessProbes: Int = 0
+        var latestRefreshGeneration: UInt64 = 0
+        var currentITermScans: Int = 0
+        var currentITermBatchProbes: Int = 0
+        var currentProcessProbes: Int = 0
     }
+    private static let debugPerfLoggingEnabled: Bool = {
+        let env = ProcessInfo.processInfo.environment["AGENT_SESSIONS_DEBUG_PERF_LOGS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if env == "1" || env == "true" || env == "yes" {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "DebugCodexActivePerfLogs")
+    }()
     private var debugMetrics = DebugMetrics()
     private var lastDebugMetricsReportAt: Date = .distantPast
 #endif
@@ -209,13 +293,45 @@ final class CodexActiveSessionsModel: ObservableObject {
     init() {
         // Avoid background activity under `xcodebuild test`.
         guard !AppRuntime.isRunningTests else { return }
-        startPollingIfNeeded()
+        Task {
+            await AppReadyGate.waitUntilReady()
+            startPollingIfNeeded()
+        }
     }
 
     deinit {
         pollTask?.cancel()
         refreshTask?.cancel()
     }
+
+#if DEBUG
+    enum DebugManagedProbeKind {
+        case processDiscovery
+        case iTermInventory
+        case iTermBatchProbe
+    }
+
+    func debugRunManagedCommand(kind: DebugManagedProbeKind = .processDiscovery,
+                                executable: URL,
+                                arguments: [String],
+                                timeout: TimeInterval,
+                                generation: UInt64? = nil) async -> Data? {
+        let managedKind: ManagedProbeKind
+        switch kind {
+        case .processDiscovery:
+            managedKind = .processDiscovery
+        case .iTermInventory:
+            managedKind = .iTermInventory
+        case .iTermBatchProbe:
+            managedKind = .iTermBatchProbe
+        }
+        return await runManagedCommand(kind: managedKind,
+                                       generation: generation ?? activeRefreshGeneration,
+                                       executable: executable,
+                                       arguments: arguments,
+                                       timeout: timeout)
+    }
+#endif
 
     func isActive(_ session: Session) -> Bool {
         guard enabled, supportsLiveSessions(for: session.source) else { return false }
@@ -239,6 +355,11 @@ final class CodexActiveSessionsModel: ObservableObject {
         return liveState(for: presence)
     }
 
+    func idleReason(for presence: CodexActivePresence) -> HUDIdleReason? {
+        let key = Self.presenceKey(for: presence)
+        return idleReasonByPresenceKey[key]
+    }
+
     func liveState(for presence: CodexActivePresence) -> CodexLiveState {
         let key = Self.presenceKey(for: presence)
         if let cached = liveStateByPresenceKey[key] { return cached }
@@ -247,6 +368,12 @@ final class CodexActiveSessionsModel: ObservableObject {
             sourceFilePath: presence.sourceFilePath,
             now: Date()
         )
+    }
+
+    func lastActivityAt(for presence: CodexActivePresence) -> Date? {
+        let key = Self.presenceKey(for: presence)
+        if let cached = lastActivityByPresenceKey[key] { return cached }
+        return Self.lastActivityAt(logPath: presence.sessionLogPath, sourceFilePath: presence.sourceFilePath)
     }
 
     func presence(for session: Session) -> CodexActivePresence? {
@@ -266,10 +393,12 @@ final class CodexActiveSessionsModel: ObservableObject {
     }
 
     func setUnifiedConsumerVisible(_ visible: Bool, consumerID: UUID) {
+        guard !AppRuntime.isRunningTests else { return }
         let hadVisibleConsumer = hasVisibleConsumer
         if visible { unifiedVisibleConsumerIDs.insert(consumerID) }
         else { unifiedVisibleConsumerIDs.remove(consumerID) }
         guard hasVisibleConsumer != hadVisibleConsumer else { return }
+        resetStablePollBackoff()
         if !hadVisibleConsumer, hasVisibleConsumer, appIsActive {
             armForegroundProbeRamp()
         }
@@ -277,19 +406,46 @@ final class CodexActiveSessionsModel: ObservableObject {
     }
 
     func setCockpitConsumerVisible(_ visible: Bool, consumerID: UUID) {
+        guard !AppRuntime.isRunningTests else { return }
         let hadVisibleConsumer = hasVisibleConsumer
         if visible { cockpitVisibleConsumerIDs.insert(consumerID) }
-        else { cockpitVisibleConsumerIDs.remove(consumerID) }
+        else {
+            cockpitVisibleConsumerIDs.remove(consumerID)
+            cockpitWindowVisibleConsumerIDs.remove(consumerID)
+        }
         guard hasVisibleConsumer != hadVisibleConsumer else { return }
+        resetStablePollBackoff()
         if !hadVisibleConsumer, hasVisibleConsumer, appIsActive {
             armForegroundProbeRamp()
         }
         refreshSoon()
     }
 
+    func setCockpitWindowVisible(_ visible: Bool, consumerID: UUID) {
+        guard !AppRuntime.isRunningTests else { return }
+        let hadVisibleCockpitWindow = hasVisibleCockpitWindow
+        if visible {
+            guard cockpitVisibleConsumerIDs.contains(consumerID) else { return }
+            cockpitWindowVisibleConsumerIDs.insert(consumerID)
+        } else {
+            cockpitWindowVisibleConsumerIDs.remove(consumerID)
+        }
+        if hasVisibleCockpitWindow {
+            lastCockpitVisibleAt = Date()
+        }
+        guard hasVisibleCockpitWindow != hadVisibleCockpitWindow else { return }
+        resetStablePollBackoff()
+        if !hadVisibleCockpitWindow, hasVisibleCockpitWindow, appIsActive {
+            armForegroundProbeRamp()
+        }
+        refreshSoon()
+    }
+
     func setAppActive(_ active: Bool) {
+        guard !AppRuntime.isRunningTests else { return }
         guard appIsActive != active else { return }
         appIsActive = active
+        resetStablePollBackoff()
         if active { armForegroundProbeRamp() }
         refreshSoon()
     }
@@ -302,18 +458,34 @@ final class CodexActiveSessionsModel: ObservableObject {
         !cockpitVisibleConsumerIDs.isEmpty
     }
 
+    private var hasVisibleCockpitWindow: Bool {
+        !cockpitWindowVisibleConsumerIDs.isEmpty
+    }
+
+    private var isCockpitVisible: Bool {
+        hasVisibleCockpitWindow && hudOpen
+    }
+
     private var isPinnedCockpitVisible: Bool {
         hasVisibleCockpitConsumer && hudOpen && hudPinned
     }
 
     func refreshNow() {
+        guard !AppRuntime.isRunningTests else { return }
         // Manual refresh should bypass probe throttling so live state transitions
         // (active -> open and vice versa) are reflected immediately.
         lastProcessProbeAt = nil
         cachedProcessPresences = []
+        lastITermProbeAt = nil
+        cachedITermPresences = []
+        cachedITermTabTitleByTTY = [:]
+        cachedITermTabTitleBySessionGuid = [:]
         forceFullProbeNextRefresh = true
+        consecutiveEmptySuppressedCycles = 0
+        resetStablePollBackoff()
         armForegroundProbeRamp()
         refreshTask?.cancel()
+        cancelAllInFlightProbeCommands(reason: "manual-refresh")
         refreshTask = Task { [weak self] in
             await self?.refreshOnce()
         }
@@ -322,6 +494,7 @@ final class CodexActiveSessionsModel: ObservableObject {
     // MARK: - Polling
 
     private func startPollingIfNeeded() {
+        guard !AppRuntime.isRunningTests else { return }
         guard enabled else { return }
         guard pollTask == nil else { return }
 
@@ -339,24 +512,35 @@ final class CodexActiveSessionsModel: ObservableObject {
         pollTask = nil
         refreshTask?.cancel()
         refreshTask = nil
+        cancelAllInFlightProbeCommands(reason: clear ? "stop-clear" : "stop")
         refreshInFlight = false
         refreshQueued = false
+        resetStablePollBackoff()
         if clear {
             presences = []
             bySessionID = [:]
             byLogPath = [:]
             liveStateByPresenceKey = [:]
+            idleReasonByPresenceKey = [:]
+            lastActivityByPresenceKey = [:]
             cachedProcessPresences = []
+            cachedITermPresences = []
+            cachedITermTabTitleByTTY = [:]
+            cachedITermTabTitleBySessionGuid = [:]
             lastProcessProbeAt = nil
+            lastITermProbeAt = nil
             lastPublishedPresenceSignatures = [:]
             // Preserve visible-consumer registrations across disable/enable toggles so
             // open windows immediately restore foreground cadence without requiring re-appear.
             sessionLookupCacheByID = [:]
+            sessionLookupAccessTick = 0
             lastRefreshAt = nil
             resumeProbeBudgetIndex = nil
             itermProbeRoundRobinCursor = 0
             forceFullProbeNextRefresh = false
             activeMembershipVersion &+= 1
+            refreshGeneration &+= 1
+            activeRefreshGeneration = refreshGeneration
         }
     }
 
@@ -364,9 +548,572 @@ final class CodexActiveSessionsModel: ObservableObject {
         // Coalesce rapid preference edits.
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 250_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
             await self?.refreshOnce()
         }
+    }
+
+    private func beginRefreshGeneration() -> UInt64 {
+        refreshGeneration &+= 1
+        activeRefreshGeneration = refreshGeneration
+        return activeRefreshGeneration
+    }
+
+    private func isCurrentRefreshGeneration(_ generation: UInt64) -> Bool {
+        generation == activeRefreshGeneration
+    }
+
+    private func markStaleRefreshDrop() {
+#if DEBUG
+        debugMetrics.staleRefreshResultsDropped &+= 1
+#endif
+    }
+
+    private func cancelAllInFlightProbeCommands(reason: String) {
+        let kinds = Array(inFlightProbeCommands.keys)
+        for kind in kinds {
+            cancelInFlightProbeCommand(kind: kind, reason: reason)
+        }
+    }
+
+    private func cancelInFlightProbeCommand(kind: ManagedProbeKind, reason: String) {
+        guard let command = inFlightProbeCommands.removeValue(forKey: kind) else { return }
+        command.terminate()
+#if DEBUG
+        switch kind {
+        case .processDiscovery:
+            debugMetrics.currentProcessProbes = max(0, debugMetrics.currentProcessProbes - 1)
+        case .iTermInventory:
+            debugMetrics.currentITermScans = max(0, debugMetrics.currentITermScans - 1)
+        case .iTermBatchProbe:
+            debugMetrics.currentITermBatchProbes = max(0, debugMetrics.currentITermBatchProbes - 1)
+        }
+        debugMetrics.terminatedStaleProbeProcesses &+= 1
+        if Self.debugPerfLoggingEnabled {
+            print("[CodexActiveSessionsModel][perf] cancelled in-flight \(kind.rawValue) probe reason=\(reason)")
+        }
+#endif
+    }
+
+    private func beginManagedProbeCommand(kind: ManagedProbeKind, command: ManagedProbeCommand) {
+        if inFlightProbeCommands[kind] != nil {
+            cancelInFlightProbeCommand(kind: kind, reason: "replaced")
+        }
+        inFlightProbeCommands[kind] = command
+#if DEBUG
+        switch kind {
+        case .processDiscovery:
+            debugMetrics.currentProcessProbes += 1
+            debugMetrics.maxConcurrentProcessProbes = max(
+                debugMetrics.maxConcurrentProcessProbes,
+                debugMetrics.currentProcessProbes
+            )
+        case .iTermInventory:
+            debugMetrics.currentITermScans += 1
+            debugMetrics.maxConcurrentITermScans = max(
+                debugMetrics.maxConcurrentITermScans,
+                debugMetrics.currentITermScans
+            )
+        case .iTermBatchProbe:
+            debugMetrics.currentITermBatchProbes += 1
+            debugMetrics.maxConcurrentITermBatchProbes = max(
+                debugMetrics.maxConcurrentITermBatchProbes,
+                debugMetrics.currentITermBatchProbes
+            )
+        }
+#endif
+    }
+
+    private func finishManagedProbeCommand(kind: ManagedProbeKind, id: UUID) {
+        guard inFlightProbeCommands[kind]?.id == id else { return }
+        inFlightProbeCommands.removeValue(forKey: kind)
+#if DEBUG
+        switch kind {
+        case .processDiscovery:
+            debugMetrics.currentProcessProbes = max(0, debugMetrics.currentProcessProbes - 1)
+        case .iTermInventory:
+            debugMetrics.currentITermScans = max(0, debugMetrics.currentITermScans - 1)
+        case .iTermBatchProbe:
+            debugMetrics.currentITermBatchProbes = max(0, debugMetrics.currentITermBatchProbes - 1)
+        }
+#endif
+    }
+
+    private enum ManagedProbeWaitResult {
+        case exited
+        case timedOut
+    }
+
+    private final class ManagedProbeWaitState {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<ManagedProbeWaitResult, Never>?
+
+        init(_ continuation: CheckedContinuation<ManagedProbeWaitResult, Never>) {
+            self.continuation = continuation
+        }
+
+        func resumeIfNeeded(_ result: ManagedProbeWaitResult) {
+            lock.lock()
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(returning: result)
+        }
+    }
+
+    private func runManagedCommand(kind: ManagedProbeKind,
+                                   generation: UInt64,
+                                   executable: URL,
+                                   arguments: [String],
+                                   timeout: TimeInterval) async -> Data? {
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return nil
+        }
+
+        let command = ManagedProbeCommand(kind: kind, executable: executable, arguments: arguments)
+        beginManagedProbeCommand(kind: kind, command: command)
+
+        do {
+            try command.start()
+        } catch {
+            finishManagedProbeCommand(kind: kind, id: command.id)
+            return nil
+        }
+
+        let stdoutHandle = command.stdoutPipe.fileHandleForReading
+        async let drainedOutput = Self.readManagedProbeOutput(from: stdoutHandle)
+        let waitResult = await withTaskCancellationHandler {
+            await waitForManagedProbeExit(command.process, timeout: timeout)
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cancelInFlightProbeCommand(kind: kind, reason: "task-cancelled")
+            }
+        }
+        command.process.terminationHandler = nil
+        let timedOut = waitResult == .timedOut
+        if timedOut {
+            cancelInFlightProbeCommand(kind: kind, reason: "timeout")
+        }
+        let wasCancelled = Task.isCancelled
+        let data = await drainedOutput
+        let stillOwned = inFlightProbeCommands[kind]?.id == command.id
+        let stillCurrent = isCurrentRefreshGeneration(generation)
+        finishManagedProbeCommand(kind: kind, id: command.id)
+        if !stillCurrent {
+            markStaleRefreshDrop()
+            return nil
+        }
+        if wasCancelled || timedOut || !stillOwned { return nil }
+        return data
+    }
+
+    private nonisolated static func readManagedProbeOutput(from handle: FileHandle) async -> Data {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                defer { try? handle.close() }
+                continuation.resume(returning: (try? handle.readToEnd()) ?? Data())
+            }
+        }
+    }
+
+    private func waitForManagedProbeExit(_ process: Process,
+                                         timeout: TimeInterval) async -> ManagedProbeWaitResult {
+        await withCheckedContinuation { continuation in
+            let state = ManagedProbeWaitState(continuation)
+            let timeoutItem = DispatchWorkItem {
+                state.resumeIfNeeded(.timedOut)
+            }
+
+            process.terminationHandler = { _ in
+                timeoutItem.cancel()
+                state.resumeIfNeeded(.exited)
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + max(timeout, 0),
+                execute: timeoutItem
+            )
+
+            if !process.isRunning {
+                timeoutItem.cancel()
+                state.resumeIfNeeded(.exited)
+            }
+        }
+    }
+
+    private struct RefreshDiscoveryResult {
+        let loaded: [CodexActivePresence]
+        let didProbeProcesses: Bool
+        let didProbeITerm: Bool
+        let registryHadPresences: Bool
+        let itermPresences: [CodexActivePresence]
+        let itermTabTitleByTTY: [String: String]
+        let itermTabTitleBySessionGuid: [String: String]
+    }
+
+    private func performRefreshDiscovery(generation: UInt64,
+                                         now: Date,
+                                         ttl: TimeInterval,
+                                         rootPaths: [String],
+                                         codexSessionRoots: [String],
+                                         claudeSessionRoots: [String],
+                                         opencodeSessionRoots: [String],
+                                         lastProcessProbeAtSnapshot: Date?,
+                                         lastITermProbeAtSnapshot: Date?,
+                                         cachedProcessProbeSnapshot: [CodexActivePresence],
+                                         cachedITermPresenceSnapshot: [CodexActivePresence],
+                                         cachedITermTabTitleByTTYSnapshot: [String: String],
+                                         cachedITermTabTitleBySessionGuidSnapshot: [String: String],
+                                         hasVisibleConsumerSnapshot: Bool,
+                                         appIsActiveSnapshot: Bool,
+                                         isCockpitVisibleSnapshot: Bool,
+                                         isPinnedCockpitVisibleSnapshot: Bool,
+                                         shouldUseITermSnapshot: Bool,
+                                         shouldProbeITermSnapshot: Bool) async -> RefreshDiscoveryResult? {
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return nil
+        }
+
+        var out: [CodexActivePresence] = []
+        var itermPresences: [CodexActivePresence] = []
+        var itermTabTitleByTTY: [String: String] = [:]
+        var itermTabTitleBySessionGuid: [String: String] = [:]
+        let decoder = Self.makeDecoder()
+        for path in rootPaths {
+            out.append(contentsOf: Self.filterSupportedPresences(
+                Self.loadPresences(from: URL(fileURLWithPath: path), decoder: decoder, now: now, ttl: ttl)
+            ))
+        }
+
+        let registryHasPresences = !out.isEmpty
+        let processProbeMinInterval = Self.processProbeMinIntervalSeconds(
+            registryHasPresences: registryHasPresences,
+            hasVisibleConsumer: hasVisibleConsumerSnapshot,
+            appIsActive: appIsActiveSnapshot,
+            isCockpitVisible: isCockpitVisibleSnapshot,
+            isPinnedCockpitVisible: isPinnedCockpitVisibleSnapshot
+        )
+        let processPresenceCacheTTL = Self.effectiveCachedProcessPresenceTTL(
+            baseTTL: ttl,
+            processProbeMinInterval: processProbeMinInterval,
+            pollInterval: Self.effectivePollIntervalSeconds(
+                appIsActive: appIsActiveSnapshot,
+                hasVisibleConsumer: hasVisibleConsumerSnapshot,
+                isCockpitVisible: isCockpitVisibleSnapshot,
+                isPinnedCockpitVisible: isPinnedCockpitVisibleSnapshot
+            ),
+            hasVisibleConsumer: hasVisibleConsumerSnapshot
+        )
+        let shouldProbeProcesses: Bool = {
+            guard let last = lastProcessProbeAtSnapshot else { return true }
+            return now.timeIntervalSince(last) >= processProbeMinInterval
+        }()
+
+        if shouldProbeProcesses {
+            let processPresences = await discoverProcessPresences(
+                generation: generation,
+                now: now,
+                codexSessionRoots: codexSessionRoots,
+                claudeSessionRoots: claudeSessionRoots,
+                opencodeSessionRoots: opencodeSessionRoots,
+                timeout: Self.processProbeTimeout
+            )
+            guard isCurrentRefreshGeneration(generation) else {
+                markStaleRefreshDrop()
+                return nil
+            }
+            out.append(contentsOf: processPresences)
+        } else {
+            out.append(contentsOf: Self.filterSupportedPresences(
+                cachedProcessProbeSnapshot.filter { !$0.isStale(now: now, ttl: processPresenceCacheTTL) }
+            ))
+        }
+
+        if shouldProbeITermSnapshot {
+            let sessions = await loadITermSessions(
+                generation: generation,
+                timeout: Self.processProbeTimeout
+            )
+            guard isCurrentRefreshGeneration(generation) else {
+                markStaleRefreshDrop()
+                return nil
+            }
+            if !sessions.isEmpty {
+                itermTabTitleByTTY = Self.itermTabTitleByTTY(sessions)
+                itermTabTitleBySessionGuid = Self.itermTabTitleBySessionGuid(sessions)
+                itermPresences = Self.presencesFromITermSessions(sessions, source: .codex, now: now)
+                itermPresences += Self.presencesFromITermSessions(sessions, source: .claude, now: now)
+                itermPresences += Self.presencesFromITermSessions(sessions, source: .opencode, now: now)
+                out.append(contentsOf: itermPresences)
+            }
+        } else if shouldUseITermSnapshot {
+            itermPresences = Self.filterSupportedPresences(
+                cachedITermPresenceSnapshot.filter { !$0.isStale(now: now, ttl: ttl) }
+            )
+            itermTabTitleByTTY = cachedITermTabTitleByTTYSnapshot
+            itermTabTitleBySessionGuid = cachedITermTabTitleBySessionGuidSnapshot
+            out.append(contentsOf: itermPresences)
+        }
+
+        return RefreshDiscoveryResult(
+            loaded: out,
+            didProbeProcesses: shouldProbeProcesses,
+            didProbeITerm: shouldProbeITermSnapshot,
+            registryHadPresences: registryHasPresences,
+            itermPresences: itermPresences,
+            itermTabTitleByTTY: itermTabTitleByTTY,
+            itermTabTitleBySessionGuid: itermTabTitleBySessionGuid
+        )
+    }
+
+    private func discoverProcessPresences(generation: UInt64,
+                                          now: Date,
+                                          codexSessionRoots: [String],
+                                          claudeSessionRoots: [String],
+                                          opencodeSessionRoots: [String],
+                                          timeout: TimeInterval) async -> [CodexActivePresence] {
+        let user = NSUserName()
+        let psData = await runManagedCommand(
+            kind: .processDiscovery,
+            generation: generation,
+            executable: URL(fileURLWithPath: "/bin/ps"),
+            arguments: ["axww", "-o", "pid=,tty=,command="],
+            timeout: timeout
+        )
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return []
+        }
+
+        let commandInfos = psData.map { Self.parsePSCommandListOutput(String(decoding: $0, as: UTF8.self)) } ?? []
+        let claudeCommandPIDs = Array(
+            Set(
+                commandInfos
+                    .filter { info in
+                        guard info.tty != nil else { return false }
+                        return Self.commandContainsNeedle(info.command, needles: ["claude", "claude-code"])
+                    }
+                    .map(\.pid)
+            )
+        ).sorted()
+        let opencodeCommandPIDs = Array(
+            Set(
+                commandInfos
+                    .filter { info in
+                        guard info.tty != nil else { return false }
+                        return Self.commandContainsNeedle(info.command, needles: ["opencode"])
+                    }
+                    .map(\.pid)
+            )
+        ).sorted()
+
+        let codexInfos = await discoverLsofPIDInfos(
+            generation: generation,
+            source: .codex,
+            queryArguments: ["-w", "-a", "-c", "codex", "-u", user, "-nP", "-F", "pftn"],
+            sessionsRoots: codexSessionRoots,
+            timeout: timeout
+        )
+        // Claude Code sets process.title to its version string (e.g. "2.1.76"),
+        // so `lsof -c claude` never matches. Discover via ps-based PID query only.
+        let claudeInfos: [Int: LsofPIDInfo]
+        if claudeCommandPIDs.isEmpty {
+            claudeInfos = [:]
+        } else {
+            claudeInfos = await discoverLsofPIDInfos(
+                generation: generation,
+                source: .claude,
+                queryArguments: ["-w", "-a", "-p", claudeCommandPIDs.map(String.init).joined(separator: ","), "-u", user, "-nP", "-F", "pftn"],
+                sessionsRoots: claudeSessionRoots,
+                timeout: timeout
+            )
+        }
+        let opencodeInfos = await discoverLsofPIDInfos(
+            generation: generation,
+            source: .opencode,
+            queryArguments: ["-w", "-a", "-c", "opencode", "-u", user, "-nP", "-F", "pftn"],
+            sessionsRoots: opencodeSessionRoots,
+            timeout: timeout
+        )
+        let opencodeCommandInfos: [Int: LsofPIDInfo]
+        if opencodeCommandPIDs.isEmpty {
+            opencodeCommandInfos = [:]
+        } else {
+            opencodeCommandInfos = await discoverLsofPIDInfos(
+                generation: generation,
+                source: .opencode,
+                queryArguments: ["-w", "-a", "-p", opencodeCommandPIDs.map(String.init).joined(separator: ","), "-u", user, "-nP", "-F", "pftn"],
+                sessionsRoots: opencodeSessionRoots,
+                timeout: timeout
+            )
+        }
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return []
+        }
+        let pidInfoBySource: [SessionSource: [Int: LsofPIDInfo]] = [
+            .codex: codexInfos,
+            .claude: claudeInfos,
+            .opencode: Self.mergePIDInfos(opencodeInfos, with: opencodeCommandInfos)
+        ]
+        let allPIDs = Array(pidInfoBySource.values.flatMap(\.keys)).sorted()
+        var envByPID: [Int: PSProcessEnvMeta] = [:]
+        if !allPIDs.isEmpty,
+           let envData = await runManagedCommand(
+                kind: .processDiscovery,
+                generation: generation,
+                executable: URL(fileURLWithPath: "/bin/ps"),
+                arguments: ["eww", "-p", allPIDs.map(String.init).joined(separator: ",")],
+                timeout: timeout
+           ) {
+            envByPID = Self.parsePSEnvironmentOutput(String(decoding: envData, as: UTF8.self))
+        }
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return []
+        }
+
+        var out: [CodexActivePresence] = []
+        var assignedLogPaths: Set<String> = []
+        for (source, infos) in pidInfoBySource {
+            for var info in infos.values {
+                if let envMeta = envByPID[info.pid] {
+                    info.termProgram = envMeta.termProgram
+                    info.itermSessionId = envMeta.itermSessionId
+                }
+                var presence = CodexActivePresence()
+                presence.schemaVersion = 1
+                presence.publisher = "agent-sessions-process"
+                presence.kind = "interactive"
+                presence.source = source
+                presence.sessionId = info.sessionID
+                presence.sessionLogPath = info.sessionLogPath
+                presence.workspaceRoot = info.cwd
+                // Claude Code doesn't keep the JSONL open, so lsof usually misses it.
+                // Infer the session log from the project directory's newest JSONL file.
+                // Track assigned paths so two processes in the same cwd get different files.
+                if presence.sessionLogPath == nil, source == .claude, let cwd = info.cwd {
+                    let root = claudeSessionRoots.first ?? (NSHomeDirectory() + "/.claude")
+                    let candidates = Self.claudeSessionLogCandidates(cwd: cwd, claudeRoot: root, recencyCutoff: now.addingTimeInterval(-60))
+                    if let match = candidates.first(where: { !assignedLogPaths.contains($0.path) }) {
+                        presence.sessionLogPath = match.path
+                        presence.sessionId = match.sessionID
+                        assignedLogPaths.insert(match.path)
+                    }
+                } else if let logPath = presence.sessionLogPath {
+                    assignedLogPaths.insert(logPath)
+                }
+                presence.pid = info.pid
+                presence.tty = Self.normalizedTTY(info.tty)
+                presence.openSessionLogPaths = info.openSessionLogPaths
+                presence.lastSeenAt = now
+                var terminal = CodexActivePresence.Terminal()
+                terminal.termProgram = info.termProgram
+                terminal.itermSessionId = info.itermSessionId
+                presence.terminal = terminal
+                out.append(presence)
+            }
+        }
+        return out
+    }
+
+    private func discoverLsofPIDInfos(generation: UInt64,
+                                      source: SessionSource,
+                                      queryArguments: [String],
+                                      sessionsRoots: [String],
+                                      timeout: TimeInterval) async -> [Int: LsofPIDInfo] {
+        guard let out = await runManagedCommand(
+            kind: .processDiscovery,
+            generation: generation,
+            executable: URL(fileURLWithPath: "/usr/sbin/lsof"),
+            arguments: queryArguments,
+            timeout: timeout
+        ) else {
+            return [:]
+        }
+        let roots = sessionsRoots.map(Self.normalizePath)
+        return Self.parseLsofMachineOutput(String(decoding: out, as: UTF8.self), sessionsRoots: roots, source: source)
+    }
+
+    private static func mergePIDInfos(_ lhs: [Int: LsofPIDInfo], with rhs: [Int: LsofPIDInfo]) -> [Int: LsofPIDInfo] {
+        var merged = lhs
+        for (pid, info) in rhs {
+            if let existing = merged[pid] {
+                merged[pid] = mergePIDInfo(existing, info)
+            } else {
+                merged[pid] = info
+            }
+        }
+        return merged
+    }
+
+    private static func mergePIDInfo(_ existing: LsofPIDInfo, _ incoming: LsofPIDInfo) -> LsofPIDInfo {
+        let preferredSessionLogPath: String?
+        let preferredSessionID: String?
+        let preferredSessionLogFD: Int
+        if incoming.sessionLogFD < existing.sessionLogFD {
+            preferredSessionLogPath = incoming.sessionLogPath
+            preferredSessionID = incoming.sessionID
+            preferredSessionLogFD = incoming.sessionLogFD
+        } else {
+            preferredSessionLogPath = existing.sessionLogPath
+            preferredSessionID = existing.sessionID
+            preferredSessionLogFD = existing.sessionLogFD
+        }
+
+        var openSessionLogPaths = existing.openSessionLogPaths
+        for path in incoming.openSessionLogPaths where !openSessionLogPaths.contains(path) {
+            openSessionLogPaths.append(path)
+        }
+
+        return LsofPIDInfo(
+            pid: incoming.pid,
+            cwd: incoming.cwd ?? existing.cwd,
+            tty: incoming.tty ?? existing.tty,
+            sessionID: preferredSessionID,
+            sessionLogPath: preferredSessionLogPath,
+            sessionLogFD: preferredSessionLogFD,
+            openSessionLogPaths: openSessionLogPaths,
+            termProgram: incoming.termProgram ?? existing.termProgram,
+            itermSessionId: incoming.itermSessionId ?? existing.itermSessionId
+        )
+    }
+
+    private func classifyLiveStatesAsync(for presences: [CodexActivePresence],
+                                         generation: UInt64,
+                                         now: Date,
+                                         probeITerm: Bool,
+                                         timeout: TimeInterval,
+                                         previousLiveStates: [String: CodexLiveState],
+                                         probedITermPresenceKeys: Set<String>) async -> LiveStateClassification {
+        let probeTargets = Self.itermProbeTargets(
+            from: presences,
+            selectedPresenceKeys: probedITermPresenceKeys,
+            probeITerm: probeITerm
+        )
+        let batchProbeResults = await captureBatchedITermProbeResults(
+            generation: generation,
+            for: probeTargets,
+            timeout: timeout
+        )
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return LiveStateClassification(liveStates: previousLiveStates, idleReasons: [:])
+        }
+        return Self.classifyLiveStates(
+            for: presences,
+            now: now,
+            probeITerm: probeITerm,
+            previousLiveStates: previousLiveStates,
+            probedITermPresenceKeys: probedITermPresenceKeys,
+            batchProbeResults: batchProbeResults
+        )
     }
 
     private func refreshOnce() async {
@@ -375,12 +1122,22 @@ final class CodexActiveSessionsModel: ObservableObject {
             refreshQueued = true
             return
         }
+        let generation = beginRefreshGeneration()
         refreshInFlight = true
+#if DEBUG
+        activeRefreshCount += 1
+        debugMetrics.maxConcurrentRefreshes = max(debugMetrics.maxConcurrentRefreshes, activeRefreshCount)
+        debugMetrics.latestRefreshGeneration = generation
+#endif
         defer {
+#if DEBUG
+            activeRefreshCount = max(0, activeRefreshCount - 1)
+#endif
             refreshInFlight = false
             if refreshQueued {
                 refreshQueued = false
-                Task { [weak self] in
+                refreshTask?.cancel()
+                refreshTask = Task { [weak self] in
                     await self?.refreshOnce()
                 }
             }
@@ -394,80 +1151,88 @@ final class CodexActiveSessionsModel: ObservableObject {
         let rootPaths = registryRoots().map(\.path)
         let codexSessionRoots = codexSessionsRoots().map(\.path)
         let claudeSessionRoots = claudeSessionsRoots().map(\.path)
+        let opencodeSessionRoots = opencodeSessionsRoots().map(\.path)
         let previousLogKeys = Set(byLogPath.keys)
         let previousSessionKeys = Set(bySessionID.keys)
         let previousLiveStates = liveStateByPresenceKey
-        let lastProbeAt = lastProcessProbeAt
-        let cachedProbeSnapshot = cachedProcessPresences
+        let lastProcessProbeAtSnapshot = lastProcessProbeAt
+        let lastITermProbeAtSnapshot = lastITermProbeAt
+        let cachedProcessProbeSnapshot = cachedProcessPresences
+        let cachedITermPresenceSnapshot = cachedITermPresences
+        let cachedITermTabTitleByTTYSnapshot = cachedITermTabTitleByTTY
+        let cachedITermTabTitleBySessionGuidSnapshot = cachedITermTabTitleBySessionGuid
         let hasVisibleConsumerSnapshot = hasVisibleConsumer
         let appIsActiveSnapshot = appIsActive
-
-        let probeResult: (loaded: [CodexActivePresence], didProbe: Bool, registryHadPresences: Bool) = await Task.detached(priority: .utility) {
-            var out: [CodexActivePresence] = []
-            let decoder = Self.makeDecoder()
-            for path in rootPaths {
-                out.append(contentsOf: Self.filterSupportedPresences(
-                    Self.loadPresences(from: URL(fileURLWithPath: path), decoder: decoder, now: now, ttl: ttl)
-                ))
-            }
-            let registryHasPresences = !out.isEmpty
-            let processProbeMinInterval = Self.processProbeMinIntervalSeconds(
-                registryHasPresences: registryHasPresences,
-                hasVisibleConsumer: hasVisibleConsumerSnapshot,
-                appIsActive: appIsActiveSnapshot
+        let isCockpitVisibleSnapshot = isCockpitVisible
+        let isPinnedCockpitVisibleSnapshot = isPinnedCockpitVisible
+        let shouldUseITermSnapshot = Self.shouldProbeITermSessions(
+            appIsActive: appIsActiveSnapshot,
+            hasVisibleConsumer: hasVisibleConsumerSnapshot,
+            isCockpitVisible: isCockpitVisibleSnapshot,
+            isPinnedCockpitVisible: isPinnedCockpitVisibleSnapshot
+        )
+        let shouldProbeITermSnapshot: Bool = {
+            guard shouldUseITermSnapshot else { return false }
+            let probeMinInterval = Self.itermProbeMinIntervalSeconds(
+                appIsActive: appIsActiveSnapshot,
+                isCockpitVisible: isCockpitVisibleSnapshot,
+                isPinnedCockpitVisible: isPinnedCockpitVisibleSnapshot
             )
-            let shouldProbeProcesses: Bool = {
-                guard let last = lastProbeAt else { return true }
-                return now.timeIntervalSince(last) >= processProbeMinInterval
-            }()
-            if shouldProbeProcesses {
-                // Periodic fallback probe keeps mixed registry/non-registry environments complete.
-                out.append(contentsOf: Self.discoverPresencesFromRunningProcesses(
-                    source: .codex,
-                    processName: "codex",
-                    now: now,
-                    sessionsRoots: codexSessionRoots,
-                    timeout: Self.processProbeTimeout
-                ))
-                out.append(contentsOf: Self.discoverPresencesFromRunningProcesses(
-                    source: .claude,
-                    processName: "claude",
-                    now: now,
-                    sessionsRoots: claudeSessionRoots,
-                    timeout: Self.processProbeTimeout
-                ))
-                out.append(contentsOf: Self.discoverPresencesFromRunningCommands(
-                    source: .claude,
-                    commandNeedles: ["claude", "claude-code"],
-                    now: now,
-                    sessionsRoots: claudeSessionRoots,
-                    timeout: Self.processProbeTimeout
-                ))
-            } else {
-                // Reuse recent probe findings between probe intervals.
-                out.append(contentsOf: Self.filterSupportedPresences(
-                    cachedProbeSnapshot.filter { !$0.isStale(now: now, ttl: ttl) }
-                ))
-            }
-            if hasVisibleConsumerSnapshot {
-                let sessions = Self.loadITermSessions(timeout: Self.processProbeTimeout)
-                if !sessions.isEmpty {
-                    out.append(contentsOf: Self.presencesFromITermSessions(sessions, source: .codex, now: now))
-                    out.append(contentsOf: Self.presencesFromITermSessions(sessions, source: .claude, now: now))
-                }
-            }
-            return (out, shouldProbeProcesses, registryHasPresences)
-        }.value
+            guard let last = lastITermProbeAtSnapshot else { return true }
+            return now.timeIntervalSince(last) >= probeMinInterval
+        }()
+
+        guard let probeResult = await performRefreshDiscovery(
+            generation: generation,
+            now: now,
+            ttl: ttl,
+            rootPaths: rootPaths,
+            codexSessionRoots: codexSessionRoots,
+            claudeSessionRoots: claudeSessionRoots,
+            opencodeSessionRoots: opencodeSessionRoots,
+            lastProcessProbeAtSnapshot: lastProcessProbeAtSnapshot,
+            lastITermProbeAtSnapshot: lastITermProbeAtSnapshot,
+            cachedProcessProbeSnapshot: cachedProcessProbeSnapshot,
+            cachedITermPresenceSnapshot: cachedITermPresenceSnapshot,
+            cachedITermTabTitleByTTYSnapshot: cachedITermTabTitleByTTYSnapshot,
+            cachedITermTabTitleBySessionGuidSnapshot: cachedITermTabTitleBySessionGuidSnapshot,
+            hasVisibleConsumerSnapshot: hasVisibleConsumerSnapshot,
+            appIsActiveSnapshot: appIsActiveSnapshot,
+            isCockpitVisibleSnapshot: isCockpitVisibleSnapshot,
+            isPinnedCockpitVisibleSnapshot: isPinnedCockpitVisibleSnapshot,
+            shouldUseITermSnapshot: shouldUseITermSnapshot,
+            shouldProbeITermSnapshot: shouldProbeITermSnapshot
+        ) else {
+            return
+        }
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return
+        }
         let latestProcessProbe = Self.filterSupportedPresences(
             probeResult.loaded.filter { $0.publisher == "agent-sessions-process" }
         )
         let loaded = Self.coalescePresencesByTTY(
             Self.filterSupportedPresences(probeResult.loaded)
         )
+        if probeResult.didProbeITerm {
+            cachedITermPresences = probeResult.itermPresences
+            self.lastITermProbeAt = now
+            // Only update cached title maps when the probe returned data.
+            // An empty result is most likely a transient AppleScript failure, not a genuine
+            // "no iTerm sessions" state. Caching empty maps overwrites valid titles for all
+            // subsequent enrichment passes, producing a brief "—" flash for every Cockpit row.
+            if !probeResult.itermTabTitleByTTY.isEmpty || !probeResult.itermTabTitleBySessionGuid.isEmpty {
+                cachedITermTabTitleByTTY = probeResult.itermTabTitleByTTY
+                cachedITermTabTitleBySessionGuid = probeResult.itermTabTitleBySessionGuid
+            }
+        } else if shouldUseITermSnapshot {
+            cachedITermPresences = cachedITermPresences.filter { !$0.isStale(now: now, ttl: ttl) }
+        }
 
-        if probeResult.didProbe {
+        if probeResult.didProbeProcesses {
             cachedProcessPresences = latestProcessProbe
-            lastProcessProbeAt = now
+            self.lastProcessProbeAt = now
         } else {
             cachedProcessPresences = cachedProcessPresences.filter { !$0.isStale(now: now, ttl: ttl) }
         }
@@ -506,29 +1271,91 @@ final class CodexActiveSessionsModel: ObservableObject {
             }
             ui.append(p)
         }
-        ui = Self.reconcileFallbackPresences(Array(fallbackMap.values), into: ui)
+        let sortedFallbacks = Array(fallbackMap.values).sorted { a, b in
+            // Process-discovered presences (with pid) come first so they're indexed in baseUI
+            // before iTerm tty-only presences try to merge into them.
+            (a.pid != nil ? 0 : 1) < (b.pid != nil ? 0 : 1)
+        }
+        ui = Self.reconcileFallbackPresences(sortedFallbacks, into: ui)
+        let (effectiveTabTitleByTTY, effectiveTabTitleBySessionGuid) = Self.effectiveITermTitleMaps(
+            didProbeITerm: probeResult.didProbeITerm,
+            probeTitleByTTY: probeResult.itermTabTitleByTTY,
+            probeTitleBySessionGuid: probeResult.itermTabTitleBySessionGuid,
+            cachedTitleByTTY: cachedITermTabTitleByTTY,
+            cachedTitleBySessionGuid: cachedITermTabTitleBySessionGuid
+        )
+        ui = Self.enrichPresencesWithITermTabTitles(
+            ui,
+            tabTitleByTTY: effectiveTabTitleByTTY,
+            tabTitleBySessionGuid: effectiveTabTitleBySessionGuid
+        )
 
         let probedITermPresenceKeys = plannedITermProbePresenceKeys(
             for: ui,
-            hasVisibleConsumer: hasVisibleConsumerSnapshot
+            previousLiveStates: previousLiveStates,
+            hasVisibleConsumer: shouldProbeITermSnapshot,
+            appIsActive: appIsActiveSnapshot,
+            isCockpitVisible: isCockpitVisibleSnapshot,
+            isPinnedCockpitVisible: isPinnedCockpitVisibleSnapshot
         )
 
-        let nextLiveStates = await Task.detached(priority: .utility) {
-            Self.classifyLiveStates(
-                for: ui,
-                now: now,
-                probeITerm: hasVisibleConsumerSnapshot,
-                timeout: Self.processProbeTimeout,
-                previousLiveStates: previousLiveStates,
-                probedITermPresenceKeys: probedITermPresenceKeys
-            )
-        }.value
+        let classification = await classifyLiveStatesAsync(
+            for: ui,
+            generation: generation,
+            now: now,
+            probeITerm: shouldUseITermSnapshot,
+            timeout: Self.processProbeTimeout,
+            previousLiveStates: previousLiveStates,
+            probedITermPresenceKeys: probedITermPresenceKeys
+        )
+        let nextLiveStates = classification.liveStates
+        let rawIdleReasons = classification.idleReasons
+        guard isCurrentRefreshGeneration(generation) else {
+            markStaleRefreshDrop()
+            return
+        }
+        let nextLastActivityByPresenceKey = Self.lastActivityByPresenceKey(for: ui)
 
-        // Always keep lookup maps current, but avoid publishing UI changes on every heartbeat.
-        bySessionID = sessionMap
-        byLogPath = logMap
-        liveStateByPresenceKey = nextLiveStates
         lastRefreshAt = now
+
+        let cockpitRecentlyVisible = lastCockpitVisibleAt.map { now.timeIntervalSince($0) < 10 } ?? false
+        let cockpitIsOrWasVisible = isCockpitVisibleSnapshot || isPinnedCockpitVisibleSnapshot || cockpitRecentlyVisible
+        let baseSuppressEmptyPublish = Self.shouldSuppressTransientEmptyPublish(
+            ui: ui,
+            cockpitVisible: isCockpitVisibleSnapshot || isPinnedCockpitVisibleSnapshot,
+            cockpitRecentlyVisible: cockpitRecentlyVisible,
+            didProbeProcesses: probeResult.didProbeProcesses,
+            didProbeITerm: probeResult.didProbeITerm,
+            registryHadPresences: probeResult.registryHadPresences
+        )
+        let shouldSuppressRecentTransition = Self.shouldSuppressEmptyTransition(
+            uiIsEmpty: ui.isEmpty,
+            hadPreviouslyPublishedPresences: !lastPublishedPresenceSignatures.isEmpty,
+            cockpitIsOrWasVisible: cockpitIsOrWasVisible,
+            consecutiveSuppressedCycles: consecutiveEmptySuppressedCycles
+        )
+        let shouldSuppressEmptyPublish = baseSuppressEmptyPublish || shouldSuppressRecentTransition
+        if shouldSuppressEmptyPublish, ui.isEmpty {
+            consecutiveEmptySuppressedCycles += 1
+        } else {
+            consecutiveEmptySuppressedCycles = 0
+        }
+
+        if !shouldSuppressEmptyPublish {
+            bySessionID = sessionMap
+            byLogPath = logMap
+            liveStateByPresenceKey = nextLiveStates
+            lastActivityByPresenceKey = nextLastActivityByPresenceKey
+
+            // Sync idle reasons: remove stale entries, update current ones.
+            let idleKeys = Set(rawIdleReasons.keys)
+            for key in Array(idleReasonByPresenceKey.keys) where !idleKeys.contains(key) {
+                idleReasonByPresenceKey.removeValue(forKey: key)
+            }
+            for (key, reason) in rawIdleReasons {
+                idleReasonByPresenceKey[key] = reason
+            }
+        }
 
         let nextLogKeys = Set(logMap.keys)
         let nextSessionKeys = Set(sessionMap.keys)
@@ -538,18 +1365,42 @@ final class CodexActiveSessionsModel: ObservableObject {
         // Ignore lastSeenAt-only churn; only publish when stable fields that affect UI change.
         let nextSignatures = Self.stablePresenceSignatures(for: ui)
         let metadataChanged = nextSignatures != lastPublishedPresenceSignatures
+        let stateChanged = Self.shouldResetStablePollBackoff(
+            membershipChanged: membershipChanged,
+            liveStateChanged: liveStateChanged,
+            metadataChanged: metadataChanged
+        )
 
-        if membershipChanged || metadataChanged || liveStateChanged {
+        if !shouldSuppressEmptyPublish, (membershipChanged || metadataChanged || liveStateChanged) {
             presences = ui.sorted(by: { ($0.lastSeenAt ?? .distantPast) > ($1.lastSeenAt ?? .distantPast) })
             lastPublishedPresenceSignatures = nextSignatures
             activeMembershipVersion &+= 1
+        }
+
+        let shouldTrackRuntimeSubagentBadges = (isCockpitVisibleSnapshot || isPinnedCockpitVisibleSnapshot)
+            && ui.contains(where: { $0.source == .codex })
+        if shouldTrackRuntimeSubagentBadges {
+            let nextRuntimeSubagentCountsByPresenceKey = Self.runtimeCodexSubagentCountsByPresenceKey(
+                presences: ui,
+                stateDBURL: nil
+            )
+            if nextRuntimeSubagentCountsByPresenceKey != lastPublishedRuntimeSubagentCountsByPresenceKey {
+                lastPublishedRuntimeSubagentCountsByPresenceKey = nextRuntimeSubagentCountsByPresenceKey
+                subagentBadgeVersion &+= 1
+            }
+        }
+
+        if stateChanged {
+            resetStablePollBackoff()
+        } else {
+            consecutiveStableCycles = min(consecutiveStableCycles + 1, 1_000_000)
         }
 #if DEBUG
         let refreshDurationMs = Date().timeIntervalSince(refreshStartedAt) * 1000.0
         debugMetrics.refreshCount &+= 1
         debugMetrics.refreshTotalDurationMs += refreshDurationMs
         debugMetrics.refreshMaxDurationMs = max(debugMetrics.refreshMaxDurationMs, refreshDurationMs)
-        if probeResult.didProbe {
+        if probeResult.didProbeProcesses {
             debugMetrics.processProbeRuns &+= 1
             if probeResult.registryHadPresences {
                 debugMetrics.processProbeRegistryPresentRuns &+= 1
@@ -559,10 +1410,15 @@ final class CodexActiveSessionsModel: ObservableObject {
         } else {
             debugMetrics.processProbeSkips &+= 1
         }
-        if refreshDurationMs > 25 {
-            print("[CodexActiveSessionsModel][perf] refreshOnce took \(String(format: "%.1f", refreshDurationMs))ms didProbe=\(probeResult.didProbe) registryHadPresences=\(probeResult.registryHadPresences) loaded=\(loaded.count) itermProbed=\(probedITermPresenceKeys.count)")
+        if shouldSuppressEmptyPublish {
+            debugMetrics.suppressedTransientEmptyPublishes &+= 1
         }
-        maybeReportDebugMetrics(now: now)
+        if Self.debugPerfLoggingEnabled, refreshDurationMs > 25 {
+            print("[CodexActiveSessionsModel][perf] refreshOnce took \(String(format: "%.1f", refreshDurationMs))ms processProbed=\(probeResult.didProbeProcesses) itermProbed=\(probeResult.didProbeITerm) registryHadPresences=\(probeResult.registryHadPresences) loaded=\(loaded.count) itermTailProbed=\(probedITermPresenceKeys.count)")
+        }
+        if Self.debugPerfLoggingEnabled {
+            maybeReportDebugMetrics(now: now)
+        }
 #endif
     }
 
@@ -623,6 +1479,15 @@ final class CodexActiveSessionsModel: ObservableObject {
         return dedupRoots([discovery.sessionsRoot()])
     }
 
+    private func opencodeSessionsRoots() -> [URL] {
+        let defaults = UserDefaults.standard
+        let override = defaults.string(forKey: PreferencesKey.Paths.opencodeSessionsRootOverride)
+            ?? defaults.string(forKey: "OpenCodeSessionsRootOverride")
+            ?? ""
+        let discovery = OpenCodeSessionDiscovery(customRoot: override.isEmpty ? nil : override)
+        return dedupRoots([discovery.sessionsRoot()])
+    }
+
     private func dedupRoots(_ candidates: [URL]) -> [URL] {
         var out: [URL] = []
         var seen: Set<String> = []
@@ -635,7 +1500,7 @@ final class CodexActiveSessionsModel: ObservableObject {
 
     nonisolated private static func supportsLiveSessionSource(_ source: SessionSource) -> Bool {
         switch source {
-        case .codex, .claude:
+        case .codex, .claude, .opencode:
             return true
         default:
             return false
@@ -704,6 +1569,7 @@ final class CodexActiveSessionsModel: ObservableObject {
             t.termProgram = prefer(t.termProgram, other?.termProgram)
             t.itermSessionId = prefer(t.itermSessionId, other?.itermSessionId)
             t.revealUrl = prefer(t.revealUrl, other?.revealUrl)
+            t.tabTitle = prefer(t.tabTitle, other?.tabTitle)
             merged.terminal = t
         }
 
@@ -875,6 +1741,440 @@ final class CodexActiveSessionsModel: ObservableObject {
         return out
     }
 
+    nonisolated static func activeSubagentCounts(
+        presences: [CodexActivePresence],
+        sessionsByLogPath: [String: Session],
+        now: Date,
+        recentWriteWindow: TimeInterval = subagentRecentWriteWindow,
+        codexRuntimeStateDBURL: URL? = nil
+    ) -> [String: Int] {
+        let cutoff = now.addingTimeInterval(-recentWriteWindow)
+        let fm = FileManager.default
+        var counts: [String: Int] = [:]
+        let codexRuntimeSnapshot = codexOpenSubagentSnapshot(stateDBURL: codexRuntimeStateDBURL)
+
+        for presence in presences where presence.source == .claude {
+            guard let logPath = presence.sessionLogPath else { continue }
+            guard let parentRef = activeSubagentSessionRef(
+                forLogPath: logPath,
+                source: .claude,
+                sessionsByLogPath: sessionsByLogPath
+            ) else {
+                continue
+            }
+
+            let logURL = URL(fileURLWithPath: logPath)
+            let subagentsDir = logURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(logURL.deletingPathExtension().lastPathComponent)
+                .appendingPathComponent("subagents")
+            guard fm.fileExists(atPath: subagentsDir.path) else { continue }
+            guard let contents = try? fm.contentsOfDirectory(
+                at: subagentsDir,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles
+            ) else { continue }
+
+            let activeCount = contents.reduce(into: 0) { partialResult, file in
+                guard file.pathExtension == "jsonl" else { return }
+                let mtime = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                if let mtime, mtime > cutoff {
+                    partialResult += 1
+                }
+            }
+            if activeCount > 0 {
+                for key in parentRef.lookupKeys {
+                    counts[key] = max(counts[key] ?? 0, activeCount)
+                }
+            }
+        }
+
+        for presence in presences where presence.source == .codex {
+            let resolved = resolveCodexSubagentPresence(presence, sessionsByLogPath: sessionsByLogPath)
+            let runtimeKeys = resolved.runtimeLookupIDs
+            if codexRuntimeSnapshot.isAvailable {
+                let activeCount = runtimeKeys.compactMap { codexRuntimeSnapshot.countsByParentThreadID[$0] }.max() ?? 0
+                if activeCount > 0 {
+                    let lookupKeys = resolved.parentRef?.lookupKeys ?? runtimeKeys
+                    for key in lookupKeys {
+                        counts[key] = max(counts[key] ?? 0, activeCount)
+                    }
+                }
+                continue
+            }
+
+            guard resolved.resolvedPaths.count > 1 else { continue }
+            let fallbackParentRef = resolved.parentRef
+            guard let fallbackParentRef else { continue }
+
+            let parentIDs = Set(fallbackParentRef.runtimeIDs)
+            var activeCount = 0
+
+            for resolvedPath in resolved.resolvedPaths {
+                guard let childRef = resolvedPath.ref else { continue }
+                if !fallbackParentRef.sessionID.isEmpty, childRef.sessionID == fallbackParentRef.sessionID { continue }
+                guard let rawParentID = childRef.parentSessionID, parentIDs.contains(rawParentID) else { continue }
+                let mtime = modificationDateForPath(resolvedPath.path) ?? .distantPast
+                if mtime > cutoff {
+                    activeCount += 1
+                }
+            }
+
+            if activeCount > 0 {
+                for key in fallbackParentRef.lookupKeys {
+                    counts[key] = max(counts[key] ?? 0, activeCount)
+                }
+            }
+        }
+
+        for presence in presences where presence.source == .opencode {
+            let uniquePaths = uniqueSessionLogPaths(from: presence.openSessionLogPaths)
+            guard uniquePaths.count > 1 else { continue }
+
+            let resolvedPaths = uniquePaths.map { path in
+                (
+                    path: path,
+                    ref: activeSubagentSessionRef(
+                        forLogPath: path,
+                        source: presence.source,
+                        sessionsByLogPath: sessionsByLogPath
+                    )
+                )
+            }
+
+            let parentRef = resolvedPaths.first(where: { $0.ref?.parentSessionID == nil })?.ref
+                ?? presence.sessionLogPath.flatMap {
+                    activeSubagentSessionRef(
+                        forLogPath: $0,
+                        source: presence.source,
+                        sessionsByLogPath: sessionsByLogPath
+                    )
+                }
+            guard let parentRef else { continue }
+
+            let parentIDs = Set(parentRef.runtimeIDs)
+            var activeCount = 0
+
+            for resolved in resolvedPaths {
+                guard let childRef = resolved.ref else { continue }
+                if !parentRef.sessionID.isEmpty, childRef.sessionID == parentRef.sessionID { continue }
+                guard let rawParentID = childRef.parentSessionID, parentIDs.contains(rawParentID) else { continue }
+                let mtime = modificationDateForPath(resolved.path) ?? .distantPast
+                if mtime > cutoff {
+                    activeCount += 1
+                }
+            }
+
+            if activeCount > 0 {
+                for key in parentRef.lookupKeys {
+                    counts[key] = max(counts[key] ?? 0, activeCount)
+                }
+            }
+        }
+
+        return counts
+    }
+
+    private struct CodexOpenSubagentSnapshot {
+        let isAvailable: Bool
+        let countsByParentThreadID: [String: Int]
+    }
+
+    private struct CodexRuntimeOpenSubagentEdge {
+        let parentThreadID: String
+        let childThreadID: String
+    }
+
+    nonisolated private static func codexOpenSubagentSnapshot(stateDBURL: URL? = nil) -> CodexOpenSubagentSnapshot {
+        guard let dbURL = resolvedCodexRuntimeStateDBURL(explicitURL: stateDBURL) else {
+            return CodexOpenSubagentSnapshot(isAvailable: false, countsByParentThreadID: [:])
+        }
+        guard let edges = readCodexRuntimeOpenSubagentEdges(from: dbURL) else {
+            return CodexOpenSubagentSnapshot(isAvailable: false, countsByParentThreadID: [:])
+        }
+        var counts: [String: Int] = [:]
+        for edge in edges {
+            let parentThreadID = cleanedSessionIdentifier(edge.parentThreadID) ?? edge.parentThreadID
+            counts[parentThreadID, default: 0] += 1
+        }
+        return CodexOpenSubagentSnapshot(isAvailable: true, countsByParentThreadID: counts)
+    }
+
+    nonisolated private static func runtimeCodexSubagentCountsByPresenceKey(presences: [CodexActivePresence],
+                                                                            stateDBURL: URL? = nil) -> [String: Int] {
+        let runtimeSnapshot = codexOpenSubagentSnapshot(stateDBURL: stateDBURL)
+        guard runtimeSnapshot.isAvailable else { return [:] }
+
+        var countsByPresenceKey: [String: Int] = [:]
+        for presence in presences where presence.source == .codex {
+            // This path only needs runtime thread IDs for badge counts. It runs
+            // after `runtimeSnapshot.isAvailable`, so session log path fallback is
+            // intentionally skipped here.
+            let runtimeIDs = resolveCodexSubagentPresence(presence, sessionsByLogPath: [:]).runtimeLookupIDs
+            guard !runtimeIDs.isEmpty else { continue }
+            let activeCount = runtimeIDs.compactMap { runtimeSnapshot.countsByParentThreadID[$0] }.max() ?? 0
+            guard activeCount > 0 else { continue }
+            countsByPresenceKey[presenceKey(for: presence)] = activeCount
+        }
+        return countsByPresenceKey
+    }
+
+    nonisolated private static func resolvedCodexRuntimeStateDBURL(explicitURL: URL?) -> URL? {
+        if let explicitURL { return explicitURL }
+        for codexRoot in codexRuntimeRoots() {
+            guard let urls = try? FileManager.default.contentsOfDirectory(
+                at: codexRoot,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+            let newestStateDB = urls
+                .filter { url in
+                    let name = url.lastPathComponent
+                    return name.hasPrefix("state_") && name.hasSuffix(".sqlite")
+                }
+                .sorted { lhs, rhs in
+                    let leftDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                    let rightDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                    if leftDate != rightDate { return leftDate > rightDate }
+                    return lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedDescending
+                }
+                .first
+            if let newestStateDB {
+                return newestStateDB
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func codexRuntimeRoots() -> [URL] {
+        var candidates: [URL] = []
+
+        if let sessionsOverride = UserDefaults.standard.string(forKey: "SessionsRootOverride"),
+           let sessionsURL = parseNonisolatedPath(sessionsOverride) {
+            candidates.append(sessionsURL.deletingLastPathComponent())
+        }
+
+        if let env = ProcessInfo.processInfo.environment["CODEX_HOME"],
+           let envURL = parseNonisolatedPath(env) {
+            candidates.append(envURL)
+        }
+
+        candidates.append(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true))
+        var roots: [URL] = []
+        var seen: Set<String> = []
+        for url in candidates {
+            let key = url.standardizedFileURL.path
+            if seen.insert(key).inserted {
+                roots.append(url)
+            }
+        }
+        return roots
+    }
+
+    nonisolated private static func parseNonisolatedPath(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        return URL(fileURLWithPath: expanded)
+    }
+
+    nonisolated private static func readCodexRuntimeOpenSubagentEdges(from dbURL: URL) -> [CodexRuntimeOpenSubagentEdge]? {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            return nil
+        }
+        defer { sqlite3_close(db) }
+
+        let sql = """
+            SELECT parent_thread_id, child_thread_id
+            FROM thread_spawn_edges
+            WHERE status = 'open';
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_finalize(stmt)
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var edges: [CodexRuntimeOpenSubagentEdge] = []
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            let parentThreadID = textColumn(stmt, 0)
+            let childThreadID = textColumn(stmt, 1)
+            if !parentThreadID.isEmpty, !childThreadID.isEmpty {
+                edges.append(CodexRuntimeOpenSubagentEdge(
+                    parentThreadID: parentThreadID,
+                    childThreadID: childThreadID
+                ))
+            }
+            stepResult = sqlite3_step(stmt)
+        }
+        guard stepResult == SQLITE_DONE else { return nil }
+        return edges
+    }
+
+    nonisolated private static func textColumn(_ stmt: OpaquePointer?, _ index: Int32) -> String {
+        guard let cString = sqlite3_column_text(stmt, index) else { return "" }
+        return String(cString: cString)
+    }
+
+    nonisolated private static func cleanedSessionIdentifier(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    nonisolated private static func sessionForLogPath(_ rawPath: String,
+                                                      source: SessionSource,
+                                                      sessionsByLogPath: [String: Session]) -> Session? {
+        let normalizedPath = normalizePath(rawPath)
+        guard !normalizedPath.isEmpty else { return nil }
+        let key = logLookupKey(source: source, normalizedPath: normalizedPath)
+        return sessionsByLogPath[key]
+    }
+
+    private struct ActiveSubagentSessionRef {
+        let sessionID: String
+        let parentSessionID: String?
+        let lookupKeys: [String]
+        let runtimeIDs: [String]
+    }
+
+    private typealias ResolvedActiveSubagentPath = (path: String, ref: ActiveSubagentSessionRef?)
+
+    private struct CodexSubagentPresenceResolution {
+        let resolvedPaths: [ResolvedActiveSubagentPath]
+        let parentRef: ActiveSubagentSessionRef?
+        let runtimeLookupIDs: [String]
+    }
+
+    nonisolated private static func resolveCodexSubagentPresence(_ presence: CodexActivePresence,
+                                                                 sessionsByLogPath: [String: Session]) -> CodexSubagentPresenceResolution {
+        let primaryRef = presence.sessionLogPath.flatMap {
+            activeSubagentSessionRef(
+                forLogPath: $0,
+                source: .codex,
+                sessionsByLogPath: sessionsByLogPath
+            )
+        }
+        var candidatePaths = presence.openSessionLogPaths
+        if let primaryPath = presence.sessionLogPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !primaryPath.isEmpty {
+            candidatePaths.insert(primaryPath, at: 0)
+        }
+
+        let uniquePaths = uniqueSessionLogPaths(from: candidatePaths)
+        let resolvedPaths: [ResolvedActiveSubagentPath] = uniquePaths.map { path in
+            (
+                path: path,
+                ref: activeSubagentSessionRef(
+                    forLogPath: path,
+                    source: .codex,
+                    sessionsByLogPath: sessionsByLogPath
+                )
+            )
+        }
+
+        let parentRef = resolvedPaths.first(where: { $0.ref?.parentSessionID == nil })?.ref
+            ?? primaryRef
+        let runtimeKeyCandidates = parentRef?.runtimeIDs
+            ?? [presence.sessionId, presence.sessionLogPath.flatMap {
+                extractSessionID(fromLogPath: $0, source: .codex)
+            }].compactMap { $0 }
+        let runtimeLookupIDs = Array(Set(runtimeKeyCandidates.compactMap { cleanedSessionIdentifier($0) }))
+
+        return CodexSubagentPresenceResolution(
+            resolvedPaths: resolvedPaths,
+            parentRef: parentRef,
+            runtimeLookupIDs: runtimeLookupIDs
+        )
+    }
+
+    nonisolated private static func activeSubagentSessionRef(forLogPath rawPath: String,
+                                                             source: SessionSource,
+                                                             sessionsByLogPath: [String: Session]) -> ActiveSubagentSessionRef? {
+        if let session = sessionForLogPath(rawPath, source: source, sessionsByLogPath: sessionsByLogPath) {
+            let runtimeIDs = liveSessionIDCandidates(for: session)
+            let lookupKeys = Array(Set([session.id] + runtimeIDs))
+            return ActiveSubagentSessionRef(
+                sessionID: session.id,
+                parentSessionID: session.parentSessionID,
+                lookupKeys: lookupKeys,
+                runtimeIDs: runtimeIDs.isEmpty ? [session.id] : runtimeIDs
+            )
+        }
+
+        guard let parsed = parseActiveSubagentSessionMeta(fromLogPath: rawPath, source: source) else {
+            return nil
+        }
+        let runtimeIDs = Array(Set([parsed.runtimeSessionID, extractSessionID(fromLogPath: rawPath, source: source)].compactMap { $0 }))
+        let lookupKeys = runtimeIDs
+        return ActiveSubagentSessionRef(
+            sessionID: parsed.runtimeSessionID,
+            parentSessionID: parsed.parentSessionID,
+            lookupKeys: lookupKeys,
+            runtimeIDs: runtimeIDs.isEmpty ? [parsed.runtimeSessionID] : runtimeIDs
+        )
+    }
+
+    private struct ParsedActiveSubagentSessionMeta {
+        let runtimeSessionID: String
+        let parentSessionID: String?
+    }
+
+    nonisolated private static func parseActiveSubagentSessionMeta(fromLogPath rawPath: String,
+                                                                   source: SessionSource) -> ParsedActiveSubagentSessionMeta? {
+        guard source == .codex || source == .opencode else { return nil }
+        let reader = JSONLReader(url: URL(fileURLWithPath: rawPath))
+        var parsed: ParsedActiveSubagentSessionMeta?
+        _ = try? reader.forEachLineWhile { line in
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let type = obj["type"] as? String,
+                  type == "session_meta",
+                  let payload = obj["payload"] as? [String: Any] else {
+                return true
+            }
+
+            let runtimeSessionID = (payload["id"] as? String)
+                ?? (payload["session_id"] as? String)
+                ?? (obj["session_id"] as? String)
+            guard let runtimeSessionID, !runtimeSessionID.isEmpty else { return false }
+
+            var parentSessionID: String?
+            if let sourceMeta = payload["source"] as? [String: Any],
+               let subagentInfo = sourceMeta["subagent"] as? [String: Any],
+               let threadSpawn = subagentInfo["thread_spawn"] as? [String: Any] {
+                parentSessionID = threadSpawn["parent_thread_id"] as? String
+            }
+
+            parsed = ParsedActiveSubagentSessionMeta(
+                runtimeSessionID: runtimeSessionID,
+                parentSessionID: parentSessionID
+            )
+            return false
+        }
+        return parsed
+    }
+
+    nonisolated private static func uniqueSessionLogPaths(from rawPaths: [String]) -> [String] {
+        var seen: Set<String> = []
+        var out: [String] = []
+        out.reserveCapacity(rawPaths.count)
+        for rawPath in rawPaths {
+            let normalizedPath = normalizePath(rawPath)
+            guard !normalizedPath.isEmpty else { continue }
+            if seen.insert(normalizedPath).inserted {
+                out.append(rawPath)
+            }
+        }
+        return out
+    }
+
     nonisolated static func normalizePath(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
@@ -901,11 +2201,14 @@ final class CodexActiveSessionsModel: ObservableObject {
     private func lookupCacheEntry(for session: Session) -> SessionLookupCacheEntry {
         let internalSessionIDHint = Self.nonEmptySessionID(session.codexInternalSessionIDHint)
         let runtimeSessionIDs = Self.liveSessionIDCandidates(for: session)
-        if let cached = sessionLookupCacheByID[session.id],
+        let accessTick = nextSessionLookupAccessTick()
+        if var cached = sessionLookupCacheByID[session.id],
            cached.source == session.source,
            cached.rawFilePath == session.filePath,
            cached.internalSessionIDHint == internalSessionIDHint,
            cached.runtimeSessionIDs == runtimeSessionIDs {
+            cached.lastAccessTick = accessTick
+            sessionLookupCacheByID[session.id] = cached
             return cached
         }
         let fresh = SessionLookupCacheEntry(
@@ -914,10 +2217,35 @@ final class CodexActiveSessionsModel: ObservableObject {
             normalizedLogPath: Self.normalizePath(session.filePath),
             internalSessionIDHint: internalSessionIDHint,
             filenameUUID: session.codexFilenameUUID,
-            runtimeSessionIDs: runtimeSessionIDs
+            runtimeSessionIDs: runtimeSessionIDs,
+            lastAccessTick: accessTick
         )
         sessionLookupCacheByID[session.id] = fresh
+        pruneSessionLookupCacheIfNeeded()
         return fresh
+    }
+
+    private func nextSessionLookupAccessTick() -> UInt64 {
+        sessionLookupAccessTick &+= 1
+        return sessionLookupAccessTick
+    }
+
+    private func pruneSessionLookupCacheIfNeeded() {
+        guard sessionLookupCacheByID.count > Self.sessionLookupCacheHardLimit else { return }
+        let removeCount = sessionLookupCacheByID.count - Self.sessionLookupCacheTargetSize
+        guard removeCount > 0 else { return }
+        let idsToRemove = sessionLookupCacheByID
+            .sorted { lhs, rhs in
+                if lhs.value.lastAccessTick == rhs.value.lastAccessTick {
+                    return lhs.key < rhs.key
+                }
+                return lhs.value.lastAccessTick < rhs.value.lastAccessTick
+            }
+            .prefix(removeCount)
+            .map(\.key)
+        for id in idsToRemove {
+            sessionLookupCacheByID.removeValue(forKey: id)
+        }
     }
 
     private static func nonEmptySessionID(_ raw: String?) -> String? {
@@ -938,10 +2266,19 @@ final class CodexActiveSessionsModel: ObservableObject {
     private func armForegroundProbeRamp() {
         guard hasVisibleConsumer else { return }
         resumeProbeBudgetIndex = 0
+        resetStablePollBackoff()
+    }
+
+    private func resetStablePollBackoff() {
+        consecutiveStableCycles = 0
     }
 
     private func plannedITermProbePresenceKeys(for presences: [CodexActivePresence],
-                                               hasVisibleConsumer: Bool) -> Set<String> {
+                                               previousLiveStates: [String: CodexLiveState],
+                                               hasVisibleConsumer: Bool,
+                                               appIsActive: Bool,
+                                               isCockpitVisible: Bool,
+                                               isPinnedCockpitVisible: Bool) -> Set<String> {
         guard hasVisibleConsumer else { return [] }
         let candidates = Self.itermProbeCandidateKeys(for: presences).sorted()
         guard !candidates.isEmpty else { return [] }
@@ -951,6 +2288,17 @@ final class CodexActiveSessionsModel: ObservableObject {
             resumeProbeBudgetIndex = nil
             itermProbeRoundRobinCursor = candidates.count == 0 ? 0 : (itermProbeRoundRobinCursor % candidates.count)
             return Set(candidates)
+        }
+
+        if !appIsActive, (isPinnedCockpitVisible || isCockpitVisible) {
+            let selection = Self.selectPinnedBackgroundITermProbeKeys(
+                sortedCandidateKeys: candidates,
+                previousLiveStates: previousLiveStates,
+                waitingBudget: Self.pinnedBackgroundWaitingITermProbeBudget,
+                start: itermProbeRoundRobinCursor
+            )
+            itermProbeRoundRobinCursor = selection.nextCursor
+            return Set(selection.selected)
         }
 
         let budget = nextITermProbeBudget()
@@ -970,20 +2318,59 @@ final class CodexActiveSessionsModel: ObservableObject {
     }
 
     private func pollIntervalSeconds() -> TimeInterval {
-        Self.effectivePollIntervalSeconds(
+        let baseInterval = Self.effectivePollIntervalSeconds(
             appIsActive: appIsActive,
             hasVisibleConsumer: hasVisibleConsumer,
+            isCockpitVisible: isCockpitVisible,
+            isPinnedCockpitVisible: isPinnedCockpitVisible
+        )
+        return Self.effectiveStableBackoffPollInterval(
+            baseInterval: baseInterval,
+            consecutiveStableCycles: consecutiveStableCycles,
+            appIsActive: appIsActive,
+            isCockpitVisible: isCockpitVisible,
             isPinnedCockpitVisible: isPinnedCockpitVisible
         )
     }
 
     nonisolated static func effectivePollIntervalSeconds(appIsActive: Bool,
                                                          hasVisibleConsumer: Bool,
+                                                         isCockpitVisible: Bool,
                                                          isPinnedCockpitVisible: Bool) -> TimeInterval {
         guard appIsActive else {
-            return isPinnedCockpitVisible ? Self.pinnedBackgroundPollInterval : Self.backgroundPollInterval
+            if isPinnedCockpitVisible || isCockpitVisible {
+                return Self.pinnedBackgroundPollInterval
+            }
+            return Self.backgroundPollInterval
         }
         return hasVisibleConsumer ? Self.defaultPollInterval : Self.backgroundPollInterval
+    }
+
+    nonisolated static func shouldProbeITermSessions(appIsActive: Bool,
+                                                     hasVisibleConsumer: Bool,
+                                                     isCockpitVisible: Bool,
+                                                     isPinnedCockpitVisible: Bool) -> Bool {
+        guard hasVisibleConsumer else { return false }
+        return appIsActive || isPinnedCockpitVisible || isCockpitVisible
+    }
+
+    nonisolated static func effectiveStableBackoffPollInterval(baseInterval: TimeInterval,
+                                                               consecutiveStableCycles: Int,
+                                                               appIsActive: Bool,
+                                                               isCockpitVisible: Bool,
+                                                               isPinnedCockpitVisible: Bool) -> TimeInterval {
+        guard !appIsActive, (isPinnedCockpitVisible || isCockpitVisible) else { return baseInterval }
+        guard consecutiveStableCycles >= Self.stableBackoffActivationCycles else { return baseInterval }
+        return max(
+            Self.stablePinnedBackgroundPollInterval,
+            baseInterval
+        )
+    }
+
+    nonisolated static func shouldResetStablePollBackoff(membershipChanged: Bool,
+                                                         liveStateChanged: Bool,
+                                                         metadataChanged: Bool) -> Bool {
+        membershipChanged || liveStateChanged || metadataChanged
     }
 
     nonisolated static func nextITermProbeBudget(resumeIndex: Int?) -> (budget: Int, nextResumeIndex: Int?) {
@@ -1017,11 +2404,29 @@ final class CodexActiveSessionsModel: ObservableObject {
         return (out, next)
     }
 
+    nonisolated static func selectPinnedBackgroundITermProbeKeys(sortedCandidateKeys: [String],
+                                                                 previousLiveStates: [String: CodexLiveState],
+                                                                 waitingBudget: Int,
+                                                                 start: Int) -> (selected: [String], nextCursor: Int) {
+        guard !sortedCandidateKeys.isEmpty else { return ([], 0) }
+
+        let activeKeys = sortedCandidateKeys.filter { previousLiveStates[$0] == .activeWorking }
+        let waitingKeys = sortedCandidateKeys.filter { previousLiveStates[$0] != .activeWorking }
+        guard !waitingKeys.isEmpty else { return (activeKeys, 0) }
+
+        let waitingSelection = selectRoundRobinKeys(
+            sortedKeys: waitingKeys,
+            start: start,
+            budget: waitingBudget
+        )
+        return (activeKeys + waitingSelection.selected, waitingSelection.nextCursor)
+    }
+
     nonisolated static func itermProbeCandidateKeys(for presences: [CodexActivePresence]) -> [String] {
         var out: [String] = []
         out.reserveCapacity(presences.count)
         for presence in presences {
-            guard presence.source == .codex || presence.source == .claude else { continue }
+            guard presence.source == .codex || presence.source == .claude || presence.source == .opencode else { continue }
             guard canAttemptITerm2TailProbe(
                 itermSessionId: presence.terminal?.itermSessionId,
                 tty: presence.tty,
@@ -1034,12 +2439,91 @@ final class CodexActiveSessionsModel: ObservableObject {
         return out
     }
 
-    nonisolated private static func processProbeMinIntervalSeconds(registryHasPresences: Bool,
-                                                                   hasVisibleConsumer: Bool,
-                                                                   appIsActive: Bool) -> TimeInterval {
-        // Keep process probes warm while a UI consumer is on screen, even if app is backgrounded.
+    nonisolated static func shouldSuppressTransientEmptyPublish(ui: [CodexActivePresence],
+                                                                cockpitVisible: Bool,
+                                                                cockpitRecentlyVisible: Bool = false,
+                                                                didProbeProcesses: Bool,
+                                                                didProbeITerm: Bool,
+                                                                registryHadPresences: Bool) -> Bool {
+        guard cockpitVisible || cockpitRecentlyVisible else { return false }
+        guard ui.isEmpty else { return false }
+        guard !registryHadPresences else { return true }
+        return !(didProbeProcesses && didProbeITerm)
+    }
+
+    /// Supplementary suppression: when presences transition from non-empty to empty
+    /// while the cockpit is visible, suppress for a few cycles to ride out transient
+    /// probe failures (lsof timing, AppleScript timeout, registry I/O race).
+    /// Unlike `resetStablePollBackoff()`, the cycle counter is intentionally NOT
+    /// reset during visibility or activation transitions — those are exactly the
+    /// moments where transient empty results are most likely.
+    nonisolated static func shouldSuppressEmptyTransition(
+        uiIsEmpty: Bool,
+        hadPreviouslyPublishedPresences: Bool,
+        cockpitIsOrWasVisible: Bool,
+        consecutiveSuppressedCycles: Int,
+        maxSuppressedCycles: Int = 3
+    ) -> Bool {
+        guard uiIsEmpty else { return false }
+        guard hadPreviouslyPublishedPresences else { return false }
+        guard cockpitIsOrWasVisible else { return false }
+        return consecutiveSuppressedCycles < maxSuppressedCycles
+    }
+
+    /// When the iTerm probe ran but returned empty title maps (transient AppleScript
+    /// failure), fall back to preserved cached maps to avoid a "—" flash. A probe
+    /// that returns GUID-keyed titles but no TTY-keyed titles is NOT a failure —
+    /// only fall back when both maps are empty.
+    nonisolated static func effectiveITermTitleMaps(
+        didProbeITerm: Bool,
+        probeTitleByTTY: [String: String],
+        probeTitleBySessionGuid: [String: String],
+        cachedTitleByTTY: [String: String],
+        cachedTitleBySessionGuid: [String: String]
+    ) -> (tty: [String: String], guid: [String: String]) {
+        if didProbeITerm, probeTitleByTTY.isEmpty, probeTitleBySessionGuid.isEmpty {
+            return (cachedTitleByTTY, cachedTitleBySessionGuid)
+        }
+        return (probeTitleByTTY, probeTitleBySessionGuid)
+    }
+
+    nonisolated static func effectiveCachedProcessPresenceTTL(baseTTL: TimeInterval,
+                                                              processProbeMinInterval: TimeInterval,
+                                                              pollInterval: TimeInterval,
+                                                              hasVisibleConsumer: Bool) -> TimeInterval {
+        let normalizedBaseTTL = max(0, baseTTL)
+        guard hasVisibleConsumer else { return normalizedBaseTTL }
+
+        // Keep cached process presences alive through deferred-probe windows so
+        // pinned/background UI does not oscillate between partial and full rows.
+        // When the probe interval exceeds the base TTL (deferred-probe modes like
+        // pinned/background), use 2x the probe interval to survive a missed or
+        // delayed cycle. In foreground mode (short probe intervals), the base TTL
+        // already provides sufficient coverage.
+        let normalizedProbeInterval = max(0, processProbeMinInterval)
+        let normalizedPollInterval = max(0, pollInterval)
+        let baseBridge = normalizedProbeInterval + normalizedPollInterval
+        let bridgedTTL = normalizedProbeInterval > normalizedBaseTTL
+            ? normalizedProbeInterval * 2 + normalizedPollInterval
+            : baseBridge
+        return max(normalizedBaseTTL, bridgedTTL)
+    }
+
+    nonisolated static func processProbeMinIntervalSeconds(registryHasPresences: Bool,
+                                                           hasVisibleConsumer: Bool,
+                                                           appIsActive: Bool,
+                                                           isCockpitVisible: Bool,
+                                                           isPinnedCockpitVisible: Bool) -> TimeInterval {
         if hasVisibleConsumer {
-            return Self.processProbeMinIntervalRegistryEmptyForeground
+            if appIsActive {
+                return Self.processProbeMinIntervalRegistryEmptyForeground
+            }
+            if isPinnedCockpitVisible || isCockpitVisible {
+                return Self.pinnedBackgroundProcessProbeMinInterval
+            }
+            return registryHasPresences
+                ? Self.processProbeMinIntervalRegistryPresentBackground
+                : Self.processProbeMinIntervalRegistryEmptyBackground
         }
         if registryHasPresences {
             return appIsActive
@@ -1050,7 +2534,49 @@ final class CodexActiveSessionsModel: ObservableObject {
         return Self.processProbeMinIntervalRegistryEmptyBackground
     }
 
+    nonisolated static func itermProbeMinIntervalSeconds(appIsActive: Bool,
+                                                         isCockpitVisible: Bool,
+                                                         isPinnedCockpitVisible: Bool) -> TimeInterval {
+        guard !appIsActive else { return 0 }
+        if isPinnedCockpitVisible || isCockpitVisible {
+            return Self.pinnedBackgroundITermProbeMinInterval
+        }
+        return Self.backgroundPollInterval
+    }
+
 #if DEBUG
+    struct DebugPerformanceSnapshot {
+        let refreshGeneration: UInt64
+        let staleRefreshResultsDropped: UInt64
+        let terminatedStaleProbeProcesses: UInt64
+        let currentProcessProbes: Int
+        let currentITermScans: Int
+        let currentITermBatchProbes: Int
+        let maxConcurrentRefreshes: Int
+        let maxConcurrentProcessProbes: Int
+        let maxConcurrentITermScans: Int
+        let maxConcurrentITermBatchProbes: Int
+    }
+
+    func debugPerformanceSnapshot() -> DebugPerformanceSnapshot {
+        DebugPerformanceSnapshot(
+            refreshGeneration: activeRefreshGeneration,
+            staleRefreshResultsDropped: debugMetrics.staleRefreshResultsDropped,
+            terminatedStaleProbeProcesses: debugMetrics.terminatedStaleProbeProcesses,
+            currentProcessProbes: debugMetrics.currentProcessProbes,
+            currentITermScans: debugMetrics.currentITermScans,
+            currentITermBatchProbes: debugMetrics.currentITermBatchProbes,
+            maxConcurrentRefreshes: debugMetrics.maxConcurrentRefreshes,
+            maxConcurrentProcessProbes: debugMetrics.maxConcurrentProcessProbes,
+            maxConcurrentITermScans: debugMetrics.maxConcurrentITermScans,
+            maxConcurrentITermBatchProbes: debugMetrics.maxConcurrentITermBatchProbes
+        )
+    }
+
+    static func debugProbeKindName(for kind: String) -> String {
+        kind
+    }
+
     nonisolated private static func recordNormalizedPathCacheLookup(hit: Bool) {
         normalizedPathCacheMetricsLock.lock()
         if hit {
@@ -1083,7 +2609,14 @@ final class CodexActiveSessionsModel: ObservableObject {
             "refresh count=\(debugMetrics.refreshCount) avgMs=\(String(format: "%.1f", averageRefreshMs)) maxMs=\(String(format: "%.1f", debugMetrics.refreshMaxDurationMs)) " +
             "probe runs=\(debugMetrics.processProbeRuns) skips=\(debugMetrics.processProbeSkips) " +
             "probeRegistryEmptyRuns=\(debugMetrics.processProbeRegistryEmptyRuns) probeRegistryPresentRuns=\(debugMetrics.processProbeRegistryPresentRuns) " +
-            "isActiveCalls=\(debugMetrics.isActiveCalls) normalizePathCache hits=\(cache.hits) misses=\(cache.misses)"
+            "suppressedTransientEmptyPublishes=\(debugMetrics.suppressedTransientEmptyPublishes) " +
+            "isActiveCalls=\(debugMetrics.isActiveCalls) staleDrops=\(debugMetrics.staleRefreshResultsDropped) " +
+            "terminatedStaleProbeProcesses=\(debugMetrics.terminatedStaleProbeProcesses) " +
+            "refreshGeneration=\(debugMetrics.latestRefreshGeneration) maxConcurrentRefreshes=\(debugMetrics.maxConcurrentRefreshes) " +
+            "processProbeConcurrency=\(debugMetrics.currentProcessProbes)/\(debugMetrics.maxConcurrentProcessProbes) " +
+            "iTermScans=\(debugMetrics.currentITermScans)/\(debugMetrics.maxConcurrentITermScans) " +
+            "iTermBatchProbes=\(debugMetrics.currentITermBatchProbes)/\(debugMetrics.maxConcurrentITermBatchProbes) " +
+            "normalizePathCache hits=\(cache.hits) misses=\(cache.misses)"
         )
 
         debugMetrics = DebugMetrics()
@@ -1123,7 +2656,7 @@ final class CodexActiveSessionsModel: ObservableObject {
             }()
 
             var parts: [String] = []
-            parts.reserveCapacity(13)
+            parts.reserveCapacity(14)
             parts.append(p.publisher ?? "")
             parts.append(p.kind ?? "")
             parts.append(p.source.rawValue)
@@ -1136,6 +2669,7 @@ final class CodexActiveSessionsModel: ObservableObject {
             parts.append(p.terminal?.termProgram ?? "")
             parts.append(p.terminal?.itermSessionId ?? "")
             parts.append(p.terminal?.revealUrl ?? "")
+            parts.append(p.terminal?.tabTitle ?? "")
             parts.append(p.sourceFilePath ?? "")
 
             out[key] = parts.joined(separator: "|")
@@ -1190,14 +2724,12 @@ final class CodexActiveSessionsModel: ObservableObject {
             "if targetTTYBase starts with \"/dev/\" then set targetTTYBase to text 6 thru -1 of targetTTYBase",
             "tell application \"iTerm2\"",
             "activate",
+            // Pass 1: GUID match only — exact session, no ambiguity
+            "if targetGuid is not \"\" then",
             "repeat with w in windows",
             "repeat with t in tabs of w",
             "repeat with s in sessions of t",
-            "set sid to id of s",
-            "set stty to tty of s",
-            "set sttyBase to stty",
-            "if sttyBase starts with \"/dev/\" then set sttyBase to text 6 thru -1 of sttyBase",
-            "if ((targetGuid is not \"\" and sid is targetGuid) or (targetTTYBase is not \"\" and (stty is targetTTY or stty is targetTTYBase or sttyBase is targetTTYBase))) then",
+            "if id of s is targetGuid then",
             "try",
             "select w",
             "end try",
@@ -1210,6 +2742,29 @@ final class CodexActiveSessionsModel: ObservableObject {
             "end repeat",
             "end repeat",
             "end repeat",
+            "end if",
+            // Pass 2: TTY fallback — only reached when GUID is absent or stale
+            "if targetTTYBase is not \"\" then",
+            "repeat with w in windows",
+            "repeat with t in tabs of w",
+            "repeat with s in sessions of t",
+            "set stty to tty of s",
+            "set sttyBase to stty",
+            "if sttyBase starts with \"/dev/\" then set sttyBase to text 6 thru -1 of sttyBase",
+            "if (stty is targetTTY or stty is targetTTYBase or sttyBase is targetTTYBase) then",
+            "try",
+            "select w",
+            "end try",
+            "try",
+            "select t",
+            "end try",
+            "select s",
+            "return \"ok\"",
+            "end if",
+            "end repeat",
+            "end repeat",
+            "end repeat",
+            "end if",
             "end tell",
             "return \"not found\"",
             "end run"
@@ -1241,6 +2796,43 @@ final class CodexActiveSessionsModel: ObservableObject {
     }
 
     // MARK: - Live State Classification
+
+    private struct LiveStateClassification {
+        let liveStates: [String: CodexLiveState]
+        let idleReasons: [String: HUDIdleReason]
+    }
+
+    nonisolated static func classifyIdleReason(
+        tail: String?,
+        source: SessionSource,
+        lastActivityAt: Date?,
+        now: Date
+    ) -> HUDIdleReason {
+        // Error/stuck: idle for >30 minutes with no detected prompt
+        if let lastActivity = lastActivityAt,
+           now.timeIntervalSince(lastActivity) > 30 * 60 {
+            let hasPrompt = tailHasPrompt(tail, source: source)
+            if !hasPrompt {
+                return .errorOrStuck
+            }
+        }
+        return .generic
+    }
+
+    nonisolated private static func tailHasPrompt(_ tail: String?, source: SessionSource) -> Bool {
+        guard let tail, !tail.isEmpty else { return false }
+        if source == .claude {
+            return hasLikelyClaudePromptNearBottom(tail)
+        }
+        let normalized = sanitizeITermTail(tail)
+        guard !normalized.isEmpty else { return false }
+        let lines = normalized
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        let nonEmptyLines = lines.filter { !$0.isEmpty }
+        guard !nonEmptyLines.isEmpty else { return false }
+        return nonEmptyLines.suffix(8).contains(where: { isLikelyPromptLine($0) })
+    }
 
     nonisolated static func classifyITermTail(_ tail: String) -> CodexLiveState? {
         let normalized = sanitizeITermTail(tail)
@@ -1275,11 +2867,8 @@ final class CodexActiveSessionsModel: ObservableObject {
             return .openIdle
         }
 
-        // If no busy marker is present, treat the session as open/idle by default.
-        if !lastNonEmptyLine.isEmpty {
-            return .openIdle
-        }
-        return .openIdle
+        // Ambiguous non-prompt Codex tails should defer to heuristic fallback.
+        return nil
     }
 
     // Internal for targeted unit tests.
@@ -1300,6 +2889,7 @@ final class CodexActiveSessionsModel: ObservableObject {
 
         let strongBusyMarkers = [
             "esc to interrupt",
+            "esc interrupt",      // OpenCode TUI omits "to"
             "re-connecting",
             "reconnecting"
         ]
@@ -1385,9 +2975,7 @@ final class CodexActiveSessionsModel: ObservableObject {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         if ["›", ">", "$", "#", "%", "❯", "λ"].contains(trimmed) { return true }
-        if let range = trimmed.range(of: #".*[\$#%]$"#, options: .regularExpression),
-           range.lowerBound == trimmed.startIndex,
-           range.upperBound == trimmed.endIndex {
+        if let last = trimmed.last, last == "$" || last == "#" || last == "%" {
             return true
         }
         return false
@@ -1409,9 +2997,7 @@ final class CodexActiveSessionsModel: ObservableObject {
             // This avoids treating status percentages like "78%" as prompt lines.
             if body.last?.isWhitespace == true { return true }
         }
-        if let range = trimmed.range(of: #".*[\$#]$"#, options: .regularExpression),
-           range.lowerBound == trimmed.startIndex,
-           range.upperBound == trimmed.endIndex {
+        if let last = trimmed.last, last == "$" || last == "#" {
             return true
         }
         return false
@@ -1504,6 +3090,21 @@ final class CodexActiveSessionsModel: ObservableObject {
         return recentWindow.contains(where: { isLikelyClaudePromptLine($0) })
     }
 
+    nonisolated private static func lastActivityByPresenceKey(for presences: [CodexActivePresence]) -> [String: Date] {
+        var out: [String: Date] = [:]
+        out.reserveCapacity(presences.count)
+        for presence in presences {
+            let key = presenceKey(for: presence)
+            guard key != "unknown" else { continue }
+            guard let activity = lastActivityAt(logPath: presence.sessionLogPath, sourceFilePath: presence.sourceFilePath) else {
+                continue
+            }
+            if let existing = out[key], existing >= activity { continue }
+            out[key] = activity
+        }
+        return out
+    }
+
     nonisolated private static func modificationDateForPath(_ rawPath: String?) -> Date? {
         guard let rawPath, !rawPath.isEmpty else { return nil }
         let expanded = (rawPath as NSString).expandingTildeInPath
@@ -1512,13 +3113,17 @@ final class CodexActiveSessionsModel: ObservableObject {
         return mtime
     }
 
+    nonisolated private static func lastActivityAt(logPath: String?, sourceFilePath: String?) -> Date? {
+        modificationDateForPath(logPath) ?? modificationDateForPath(sourceFilePath)
+    }
+
     nonisolated static func heuristicLiveStateFromLogMTime(logPath: String?,
                                                            sourceFilePath: String? = nil,
                                                            now: Date,
                                                            activeWriteWindow: TimeInterval = 2.5) -> CodexLiveState {
         // Prefer true session log writes when available; source file mtime is a
         // secondary fallback only for providers that omit sessionLogPath.
-        let mtime = modificationDateForPath(logPath) ?? modificationDateForPath(sourceFilePath)
+        let mtime = lastActivityAt(logPath: logPath, sourceFilePath: sourceFilePath)
         guard let mtime else { return .openIdle }
         if now.timeIntervalSince(mtime) <= activeWriteWindow {
             return .activeWorking
@@ -1529,10 +3134,11 @@ final class CodexActiveSessionsModel: ObservableObject {
     nonisolated private static func classifyLiveStates(for presences: [CodexActivePresence],
                                                        now: Date,
                                                        probeITerm: Bool,
-                                                       timeout: TimeInterval,
                                                        previousLiveStates: [String: CodexLiveState],
-                                                       probedITermPresenceKeys: Set<String>) -> [String: CodexLiveState] {
+                                                       probedITermPresenceKeys: Set<String>,
+                                                       batchProbeResults: [String: ITermProbeResult]) -> LiveStateClassification {
         var out: [String: CodexLiveState] = [:]
+        var idleOut: [String: HUDIdleReason] = [:]
         out.reserveCapacity(presences.count)
 
         for presence in presences {
@@ -1546,38 +3152,51 @@ final class CodexActiveSessionsModel: ObservableObject {
                 termProgram: presence.terminal?.termProgram
             )
             let shouldProbeThisPresence = probeEligible && probedITermPresenceKeys.contains(key)
-            let canProbeITerm = shouldProbeThisPresence
-            if canProbeITerm, presence.source == .codex {
-                if let tail = captureITermTail(
-                    itermSessionId: presence.terminal?.itermSessionId,
-                    tty: presence.tty,
-                    timeout: timeout
-                ) {
-                    state = classifyITermTail(tail)
-                } else {
-                    // When a session is known to exist in iTerm but tail capture fails transiently,
-                    // prefer open/idle over mtime heuristics to avoid false-active spikes.
-                    state = .openIdle
+            let matchedBatchProbe = batchProbeResults[key]
+            if shouldProbeThisPresence, presence.source == .codex {
+                if let probe = matchedBatchProbe {
+                    if let tail = probe.tail {
+                        state = classifyITermTail(tail)
+                    } else {
+                        // When a session is known to exist in iTerm but tail capture fails transiently,
+                        // prefer open/idle over mtime heuristics to avoid false-active spikes.
+                        state = .openIdle
+                    }
                 }
-            } else if canProbeITerm, presence.source == .claude {
-                if let probe = captureITermProbeResult(
-                    itermSessionId: presence.terminal?.itermSessionId,
-                    tty: presence.tty,
-                    timeout: timeout
-                ) {
+            } else if shouldProbeThisPresence, presence.source == .claude {
+                if let probe = matchedBatchProbe {
                     state = resolveClaudeStateFromITermProbe(
                         isProcessing: probe.isProcessing,
                         isAtShellPrompt: probe.isAtShellPrompt,
                         tail: probe.tail
                     )
                 }
+            } else if shouldProbeThisPresence, presence.source == .opencode {
+                if let probe = matchedBatchProbe {
+                    // iTerm2 `is processing` is the most reliable signal for
+                    // TUI apps running in the alternate screen buffer.
+                    if probe.isProcessing == true {
+                        state = .activeWorking
+                    } else if let tail = probe.tail {
+                        state = classifyGenericITermTail(tail)
+                    }
+                    // No match → fall through to mtime heuristic
+                }
             }
 
+            var activeWriteWindow = activeWriteWindow(for: presence.source)
+            if presence.source == .codex,
+               shouldProbeThisPresence,
+               state == nil,
+               previousLiveStates[key] == .activeWorking {
+                // Short grace window for inconclusive tail probes to avoid active->idle flicker.
+                activeWriteWindow = max(activeWriteWindow, codexInconclusiveTailActiveGraceWindow)
+            }
             let heuristic = heuristicLiveStateFromLogMTime(
                 logPath: presence.sessionLogPath,
                 sourceFilePath: presence.sourceFilePath,
                 now: now,
-                activeWriteWindow: activeWriteWindow(for: presence.source)
+                activeWriteWindow: activeWriteWindow
             )
             let resolved = resolveLiveState(
                 probedState: state,
@@ -1593,6 +3212,76 @@ final class CodexActiveSessionsModel: ObservableObject {
             } else {
                 out[key] = resolved
             }
+
+            // Classify idle reason for presences that resolved as idle.
+            if resolved == .openIdle {
+                let tail = matchedBatchProbe?.tail
+                let activityAt = lastActivityAt(logPath: presence.sessionLogPath, sourceFilePath: presence.sourceFilePath)
+                idleOut[key] = classifyIdleReason(
+                    tail: tail,
+                    source: presence.source,
+                    lastActivityAt: activityAt,
+                    now: now
+                )
+            }
+        }
+
+        // Remove idle reasons for any key that ended up as active due to priority resolution.
+        for key in Array(idleOut.keys) where out[key] == .activeWorking {
+            idleOut.removeValue(forKey: key)
+        }
+
+        return LiveStateClassification(liveStates: out, idleReasons: idleOut)
+    }
+
+    // Internal for targeted unit tests.
+    nonisolated static func classifyLiveStatesForTesting(for presences: [CodexActivePresence],
+                                                         now: Date,
+                                                         probeITerm: Bool,
+                                                         previousLiveStates: [String: CodexLiveState],
+                                                         probedITermPresenceKeys: Set<String>,
+                                                         batchProbeResults: [String: ITermProbeResult]) -> [String: CodexLiveState] {
+        classifyLiveStates(
+            for: presences,
+            now: now,
+            probeITerm: probeITerm,
+            previousLiveStates: previousLiveStates,
+            probedITermPresenceKeys: probedITermPresenceKeys,
+            batchProbeResults: batchProbeResults
+        ).liveStates
+    }
+
+    private struct ITermProbeTarget {
+        let presenceKey: String
+        let source: SessionSource
+        let guid: String
+        let tty: String
+    }
+
+    nonisolated private static func itermProbeTargets(from presences: [CodexActivePresence],
+                                                      selectedPresenceKeys: Set<String>,
+                                                      probeITerm: Bool) -> [ITermProbeTarget] {
+        guard probeITerm, !selectedPresenceKeys.isEmpty else { return [] }
+
+        var out: [ITermProbeTarget] = []
+        out.reserveCapacity(selectedPresenceKeys.count)
+        var seenKeys: Set<String> = []
+
+        for presence in presences {
+            let key = presenceKey(for: presence)
+            guard selectedPresenceKeys.contains(key), seenKeys.insert(key).inserted else { continue }
+            guard presence.source == .codex || presence.source == .claude || presence.source == .opencode else { continue }
+            let guid = itermSessionGuid(from: presence.terminal?.itermSessionId) ?? ""
+            let tty = (presence.tty ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !guid.isEmpty || !tty.isEmpty else { continue }
+            out.append(
+                ITermProbeTarget(
+                    presenceKey: key,
+                    source: presence.source,
+                    guid: guid,
+                    tty: tty
+                )
+            )
         }
 
         return out
@@ -1614,6 +3303,8 @@ final class CodexActiveSessionsModel: ObservableObject {
             return 2.5
         case .claude:
             return 15.0
+        case .opencode:
+            return 30.0
         default:
             return 2.5
         }
@@ -1675,10 +3366,115 @@ final class CodexActiveSessionsModel: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private struct ITermProbeResult {
+    struct ITermProbeResult: Equatable {
         let tail: String?
         let isProcessing: Bool?
         let isAtShellPrompt: Bool?
+    }
+
+    private func captureBatchedITermProbeResults(generation: UInt64,
+                                                 for targets: [ITermProbeTarget],
+                                                 timeout: TimeInterval) async -> [String: ITermProbeResult] {
+        guard !targets.isEmpty else { return [:] }
+
+        let rowSeparator = String(UnicodeScalar(0x1E)!)
+        let fieldSeparator = String(UnicodeScalar(0x1F)!)
+        let scriptLines = [
+            "on run argv",
+            "set rowSep to character id 30",
+            "set fieldSep to character id 31",
+            "set outRows to {}",
+            "set targetCount to ((count of argv) div 3)",
+            "tell application \"iTerm2\"",
+            "repeat with w in windows",
+            "repeat with t in tabs of w",
+            "repeat with s in sessions of t",
+            "set sid to id of s",
+            "set stty to tty of s",
+            "set sttyBase to stty",
+            "if sttyBase starts with \"/dev/\" then set sttyBase to text 6 thru -1 of sttyBase",
+            "repeat with idx from 1 to targetCount",
+            "set baseIndex to ((idx - 1) * 3)",
+            "set presenceKey to item (baseIndex + 1) of argv",
+            "set targetGuid to item (baseIndex + 2) of argv",
+            "set targetTTY to item (baseIndex + 3) of argv",
+            "set targetTTYBase to targetTTY",
+            "if targetTTYBase starts with \"/dev/\" then set targetTTYBase to text 6 thru -1 of targetTTYBase",
+            "if ((targetGuid is not \"\" and sid is targetGuid) or (targetTTYBase is not \"\" and (stty is targetTTY or stty is targetTTYBase or sttyBase is targetTTYBase))) then",
+            "set txt to \"\"",
+            "try",
+            "set txt to contents of s",
+            "on error",
+            "set txt to \"\"",
+            "end try",
+            "set txtLen to length of txt",
+            "if txtLen > 4000 then",
+            "set txt to text (txtLen - 3999) thru txtLen of txt",
+            "end if",
+            "set processing to false",
+            "try",
+            "set processing to is processing of s",
+            "on error",
+            "set processing to false",
+            "end try",
+            "set atPrompt to false",
+            "try",
+            "set atPrompt to is at shell prompt of s",
+            "on error",
+            "set atPrompt to false",
+            "end try",
+            "set end of outRows to (presenceKey & fieldSep & (processing as string) & fieldSep & (atPrompt as string) & fieldSep & txt)",
+            "exit repeat",
+            "end if",
+            "end repeat",
+            "end repeat",
+            "end repeat",
+            "end repeat",
+            "end tell",
+            "set AppleScript's text item delimiters to rowSep",
+            "return outRows as text",
+            "end run"
+        ]
+
+        let arguments = scriptLines.flatMap { ["-e", $0] } + targets.flatMap { target in
+            [target.presenceKey, target.guid, target.tty]
+        }
+        guard let out = await runManagedCommand(
+            kind: .iTermBatchProbe,
+            generation: generation,
+            executable: URL(fileURLWithPath: "/usr/bin/osascript"),
+            arguments: arguments,
+            timeout: timeout
+        ) else {
+            return [:]
+        }
+
+        let raw = String(decoding: out, as: UTF8.self)
+        return Self.parseBatchedITermProbeOutput(raw, rowSeparator: rowSeparator, fieldSeparator: fieldSeparator)
+    }
+
+    nonisolated static func parseBatchedITermProbeOutput(_ text: String,
+                                                         rowSeparator: String = String(UnicodeScalar(0x1E)!),
+                                                         fieldSeparator: String = String(UnicodeScalar(0x1F)!)) -> [String: ITermProbeResult] {
+        let normalized = text.replacingOccurrences(of: "\r", with: "")
+        guard !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [:] }
+
+        var out: [String: ITermProbeResult] = [:]
+        for rawRow in normalized.components(separatedBy: rowSeparator) {
+            if rawRow.isEmpty { continue }
+            let fields = rawRow.components(separatedBy: fieldSeparator)
+            guard fields.count >= 4 else { continue }
+            let presenceKey = fields[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !presenceKey.isEmpty else { continue }
+            let metadata = parseITermProbeMetadata(fields[1] + "\t" + fields[2])
+            let tail = fields[3].trimmingCharacters(in: .whitespacesAndNewlines)
+            out[presenceKey] = ITermProbeResult(
+                tail: tail.isEmpty ? nil : tail,
+                isProcessing: metadata.isProcessing,
+                isAtShellPrompt: metadata.isAtShellPrompt
+            )
+        }
+        return out
     }
 
     nonisolated private static func captureITermProbeResult(itermSessionId: String?,
@@ -1794,18 +3590,65 @@ final class CodexActiveSessionsModel: ObservableObject {
         return presencesFromITermSessions(sessions, source: source, now: now)
     }
 
+    private func loadITermSessions(generation: UInt64, timeout: TimeInterval) async -> [ITermSessionInfo] {
+        let scriptLines = [
+            "set outRows to {}",
+            "set sep to (ASCII character 9)",
+            "tell application \"iTerm2\"",
+            "repeat with w in windows",
+            "set wname to name of w",
+            "repeat with t in tabs of w",
+            "repeat with s in sessions of t",
+            "set sid to id of s",
+            "set stty to tty of s",
+            "set sname to name of s",
+            "set ttitle to \"\"",
+            "try",
+            "set ttitle to title of t",
+            "on error",
+            "set ttitle to \"\"",
+            "end try",
+            "if ttitle is missing value then set ttitle to \"\"",
+            "set end of outRows to (sid & sep & stty & sep & sname & sep & ttitle & sep & wname)",
+            "end repeat",
+            "end repeat",
+            "end repeat",
+            "end tell",
+            "set AppleScript's text item delimiters to linefeed",
+            "return outRows as text"
+        ]
+        guard let out = await runManagedCommand(
+            kind: .iTermInventory,
+            generation: generation,
+            executable: URL(fileURLWithPath: "/usr/bin/osascript"),
+            arguments: scriptLines.flatMap { ["-e", $0] },
+            timeout: timeout
+        ) else {
+            return []
+        }
+        return Self.parseITermSessionListOutput(String(decoding: out, as: UTF8.self))
+    }
+
     nonisolated private static func loadITermSessions(timeout: TimeInterval) -> [ITermSessionInfo] {
         let scriptLines = [
             "set outRows to {}",
             "set sep to (ASCII character 9)",
             "tell application \"iTerm2\"",
             "repeat with w in windows",
+            "set wname to name of w",
             "repeat with t in tabs of w",
             "repeat with s in sessions of t",
             "set sid to id of s",
             "set stty to tty of s",
             "set sname to name of s",
-            "set end of outRows to (sid & sep & stty & sep & sname)",
+            "set ttitle to \"\"",
+            "try",
+            "set ttitle to title of t",
+            "on error",
+            "set ttitle to \"\"",
+            "end try",
+            "if ttitle is missing value then set ttitle to \"\"",
+            "set end of outRows to (sid & sep & stty & sep & sname & sep & ttitle & sep & wname)",
             "end repeat",
             "end repeat",
             "end repeat",
@@ -1843,6 +3686,8 @@ final class CodexActiveSessionsModel: ObservableObject {
             var t = CodexActivePresence.Terminal()
             t.termProgram = "iTerm2"
             t.itermSessionId = session.sessionID
+            let trimmedName = (session.displayName ?? session.name).trimmingCharacters(in: .whitespacesAndNewlines)
+            t.tabTitle = trimmedName.isEmpty ? nil : trimmedName
             p.terminal = t
             presences.append(p)
         }
@@ -2000,6 +3845,8 @@ final class CodexActiveSessionsModel: ObservableObject {
         var tty: String?
         var sessionID: String?
         var sessionLogPath: String?
+        var sessionLogFD: Int = Int.max       // Numeric FD of sessionLogPath (for lowest-FD selection)
+        var openSessionLogPaths: [String] = []  // All JSONL files open by this PID
         var termProgram: String?
         var itermSessionId: String?
     }
@@ -2008,6 +3855,7 @@ final class CodexActiveSessionsModel: ObservableObject {
         var sessionID: String
         var tty: String?
         var name: String
+        var displayName: String?
     }
 
     /// Run a local command with a small timeout. Returns stdout on success.
@@ -2056,18 +3904,33 @@ final class CodexActiveSessionsModel: ObservableObject {
         out.reserveCapacity(16)
 
         func parseLine(_ line: String, separator: String) -> ITermSessionInfo? {
-            guard let first = line.range(of: separator) else { return nil }
-            let afterFirst = first.upperBound
-            guard let second = line[afterFirst...].range(of: separator) else { return nil }
+            let fields = line.components(separatedBy: separator)
+            guard fields.count >= 3 else { return nil }
 
-            let sid = String(line[..<first.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let sid = fields[0].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !sid.isEmpty else { return nil }
-            let ttyRaw = String(line[afterFirst..<second.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let name = String(line[second.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let ttyRaw = fields[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            let sessionName = fields[2].trimmingCharacters(in: .whitespacesAndNewlines)
+            let tabName: String
+            let windowName: String
+            if fields.count > 4 {
+                tabName = fields[3].trimmingCharacters(in: .whitespacesAndNewlines)
+                windowName = fields[4].trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                tabName = ""
+                windowName = fields.count > 3 ? fields[3].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            }
+            let matchName = firstNonEmpty([sessionName, tabName, windowName])
+            let displayName = preferredITermDisplayName(
+                sessionName: sessionName,
+                tabName: tabName,
+                windowName: windowName
+            )
             return ITermSessionInfo(
                 sessionID: sid,
                 tty: ttyRaw.isEmpty ? nil : ttyRaw,
-                name: name
+                name: matchName,
+                displayName: displayName
             )
         }
 
@@ -2081,32 +3944,170 @@ final class CodexActiveSessionsModel: ObservableObject {
         return out
     }
 
+    nonisolated private static func firstNonEmpty(_ candidates: [String]) -> String {
+        for candidate in candidates {
+            if !candidate.isEmpty { return candidate }
+        }
+        return ""
+    }
+
+    nonisolated private static func preferredITermDisplayName(sessionName: String,
+                                                              tabName: String,
+                                                              windowName: String) -> String? {
+        let session = sessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tab = tabName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let window = windowName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSession = normalizeITermSessionNameForMatching(session)
+        let shouldPreferContainerTitle = genericITermSessionNameTokens.contains(normalizedSession)
+
+        if !tab.isEmpty, !equalsIgnoringCaseAndDiacritics(tab, session) {
+            return tab
+        }
+        if shouldPreferContainerTitle,
+           !window.isEmpty,
+           !equalsIgnoringCaseAndDiacritics(window, session) {
+            return window
+        }
+
+        let fallback = firstNonEmpty([session, tab, window])
+        return fallback.isEmpty ? nil : fallback
+    }
+
+    nonisolated private static func equalsIgnoringCaseAndDiacritics(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.compare(rhs, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+    }
+
+    nonisolated private static let genericITermSessionNameTokens: Set<String> = [
+        "codex",
+        "claude",
+        "claude code",
+        "opencode",
+        "open code",
+        "zsh",
+        "bash",
+        "fish",
+        "sh",
+        "shell"
+    ]
+
+    nonisolated static func itermTabTitleByTTY(_ sessions: [ITermSessionInfo]) -> [String: String] {
+        var out: [String: String] = [:]
+        out.reserveCapacity(sessions.count)
+        for session in sessions {
+            guard let tty = normalizedTTY(session.tty) else { continue }
+            let title = (session.displayName ?? session.name).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { continue }
+            if out[tty] == nil {
+                out[tty] = title
+            }
+        }
+        return out
+    }
+
+    nonisolated static func itermTabTitleBySessionGuid(_ sessions: [ITermSessionInfo]) -> [String: String] {
+        var out: [String: String] = [:]
+        out.reserveCapacity(sessions.count)
+        for session in sessions {
+            guard let guid = itermSessionGuid(from: session.sessionID), !guid.isEmpty else { continue }
+            let title = (session.displayName ?? session.name).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { continue }
+            if out[guid] == nil {
+                out[guid] = title
+            }
+        }
+        return out
+    }
+
+    nonisolated static func enrichPresencesWithITermTabTitles(_ presences: [CodexActivePresence],
+                                                              tabTitleByTTY: [String: String],
+                                                              tabTitleBySessionGuid: [String: String] = [:]) -> [CodexActivePresence] {
+        guard !tabTitleByTTY.isEmpty || !tabTitleBySessionGuid.isEmpty else { return presences }
+        var out: [CodexActivePresence] = []
+        out.reserveCapacity(presences.count)
+
+        for var presence in presences {
+            guard presence.source == .codex || presence.source == .claude || presence.source == .opencode else {
+                out.append(presence)
+                continue
+            }
+            let existingTitle = presence.terminal?.tabTitle?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let guid = itermSessionGuid(from: presence.terminal?.itermSessionId)
+            let lookupTitle = firstNonEmpty([
+                guid.flatMap { tabTitleBySessionGuid[$0] } ?? "",
+                normalizedTTY(presence.tty).flatMap { tabTitleByTTY[$0] } ?? ""
+            ])
+            if lookupTitle.isEmpty, !existingTitle.isEmpty {
+                out.append(presence)
+                continue
+            }
+            if lookupTitle.isEmpty {
+                out.append(presence)
+                continue
+            }
+            if !existingTitle.isEmpty, equalsIgnoringCaseAndDiacritics(existingTitle, lookupTitle) {
+                out.append(presence)
+                continue
+            }
+            var terminal = presence.terminal ?? CodexActivePresence.Terminal()
+            terminal.tabTitle = lookupTitle
+            presence.terminal = terminal
+            out.append(presence)
+        }
+
+        return out
+    }
+
     nonisolated static func isLikelyCodexITermSessionName(_ rawName: String) -> Bool {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !name.isEmpty else { return false }
-        if name == "codex" { return true }
-        if name.contains("(codex)") { return true }
-        if name.hasPrefix("codex ") || name.hasSuffix(" codex") { return true }
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return false }
+        let normalized = normalizeITermSessionNameForMatching(rawName)
+        guard !normalized.isEmpty else { return false }
+        if normalized == "codex" { return true }
+        if normalized.hasSuffix(" codex") { return true }
+        if trimmed.hasPrefix("codex ") { return true }
         return false
     }
 
     nonisolated static func isLikelyClaudeITermSessionName(_ rawName: String) -> Bool {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !name.isEmpty else { return false }
-        if name == "claude" { return true }
-        if name.contains("(claude)") { return true }
-        if name.hasPrefix("claude ") || name.hasSuffix(" claude") { return true }
-        if name.contains("claude code") { return true }
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return false }
+        let normalized = normalizeITermSessionNameForMatching(rawName)
+        guard !normalized.isEmpty else { return false }
+        if normalized == "claude" || normalized == "claude code" { return true }
+        if normalized.hasSuffix(" claude") || normalized.hasSuffix(" claude code") { return true }
+        if trimmed.hasPrefix("claude ") || trimmed.hasPrefix("claude-code ") { return true }
         return false
     }
 
     nonisolated static func isLikelyOpenCodeITermSessionName(_ rawName: String) -> Bool {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !name.isEmpty else { return false }
-        if name == "opencode" { return true }
-        if name.contains("(opencode)") { return true }
-        if name.hasPrefix("opencode ") || name.hasSuffix(" opencode") { return true }
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return false }
+        let normalized = normalizeITermSessionNameForMatching(rawName)
+        guard !normalized.isEmpty else { return false }
+        if normalized == "opencode" { return true }
+        if normalized.hasSuffix(" opencode") { return true }
+        if trimmed.hasPrefix("opencode ") { return true }
         return false
+    }
+
+    nonisolated private static func normalizeITermSessionNameForMatching(_ rawName: String) -> String {
+        let lowered = rawName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lowered.isEmpty else { return "" }
+
+        var sanitized = String()
+        sanitized.reserveCapacity(lowered.count)
+        for scalar in lowered.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                sanitized.unicodeScalars.append(scalar)
+            } else {
+                sanitized.append(" ")
+            }
+        }
+
+        return sanitized
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
     }
 
     nonisolated static func isLikelyITermSessionName(_ rawName: String, source: SessionSource) -> Bool {
@@ -2186,11 +4187,20 @@ final class CodexActiveSessionsModel: ObservableObject {
                     continue
                 }
 
-                // Session log path: prefer Codex rollout JSONL under configured sessions roots.
+                // Session log path: pick the lowest numeric FD among matching session logs.
+                // The parent session's JSONL is typically opened first (lowest FD), while
+                // subagent files get higher FDs. This makes selection deterministic.
                 if matchesSessionLogPath(name, source: source, sessionsRoots: sessionsRoots) {
-                    // Prefer a writable fd if present (e.g., 26w).
-                    let isWrite = (currentFD?.contains("w") ?? false)
-                    if info.sessionLogPath == nil || isWrite {
+                    if !info.openSessionLogPaths.contains(name) {
+                        info.openSessionLogPaths.append(name)
+                    }
+                    let fdNum: Int = {
+                        guard let fd = currentFD else { return Int.max }
+                        let digits = fd.prefix { $0.isNumber }
+                        return Int(digits) ?? Int.max
+                    }()
+                    if fdNum < info.sessionLogFD {
+                        info.sessionLogFD = fdNum
                         info.sessionLogPath = name
                         info.sessionID = extractSessionID(fromLogPath: name, source: source)
                     }
@@ -2254,6 +4264,37 @@ final class CodexActiveSessionsModel: ObservableObject {
         default:
             return nil
         }
+    }
+
+    /// Scan the Claude project directory for JSONL session files, sorted newest-first.
+    /// Used to infer session log paths when lsof can't find the file open.
+    nonisolated static func claudeSessionLogCandidates(cwd: String, claudeRoot: String, recencyCutoff: Date? = nil) -> [(path: String, sessionID: String?)] {
+        let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+        let projectDir = URL(fileURLWithPath: claudeRoot)
+            .appendingPathComponent("projects")
+            .appendingPathComponent(encoded)
+
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: projectDir.path, isDirectory: &isDir), isDir.boolValue else { return [] }
+        guard let contents = try? fm.contentsOfDirectory(
+            at: projectDir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var candidates: [(url: URL, date: Date)] = []
+        for file in contents {
+            let ext = file.pathExtension.lowercased()
+            guard ext == "jsonl" || ext == "ndjson" else { continue }
+            guard file.lastPathComponent.lowercased() != "history.jsonl" else { continue }
+            let mdate = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            if let cutoff = recencyCutoff, mdate < cutoff { continue }
+            candidates.append((file, mdate))
+        }
+
+        candidates.sort { $0.date > $1.date }
+        return candidates.map { ($0.url.path, extractSessionID(fromLogPath: $0.url.path, source: .claude)) }
     }
 
     nonisolated static func parsePSEnvironmentOutput(_ text: String) -> [Int: PSProcessEnvMeta] {

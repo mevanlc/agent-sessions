@@ -180,7 +180,7 @@ extension PreferencesView {
                             .foregroundStyle(.red)
                     }
                 }
-                Text("Primary tracking remains the JSONL log parser; /status is a secondary source.")
+                Text("Auth-backed tracking is primary for Codex limits. JSONL remains fallback-only for limits, and /status is used as a last resort.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -243,11 +243,15 @@ extension PreferencesView {
 	                    .multilineTextAlignment(.leading)
 	            }
 
+
 	            // Debug visibility
 	            sectionHeader("Debug")
 	            Toggle("Show system probe sessions for debugging", isOn: $showSystemProbeSessions)
 	                .toggleStyle(.switch)
 	                .help("Reveal probe sessions in the Sessions list. Leave OFF for normal use to avoid noise.")
+	            Toggle("Show probe sessions in Cockpit HUD (debug)", isOn: $showProbeSessionsInHUD)
+	                .toggleStyle(.switch)
+	                .help("Reveal internal probe sessions in the Cockpit HUD. Leave OFF for normal use to avoid noise.")
 
 	        }
 	        .onReceive(NotificationCenter.default.publisher(for: CodexProbeCleanup.didRunCleanupNotification)) { note in

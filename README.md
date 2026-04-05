@@ -21,7 +21,7 @@ Search, browse, and resume your past AI-coding sessions in a local-first macOS a
 - Security & Privacy: Local-only. No telemetry. Details: `docs/PRIVACY.md` and `docs/security.md`
 
 <p align="center">
-  <a href="https://github.com/jazzyalex/agent-sessions/releases/download/v2.12/AgentSessions-2.12.dmg"><b>Download Agent Sessions 2.12 (DMG)</b></a>
+  <a href="https://github.com/jazzyalex/agent-sessions/releases/download/v3.4.1/AgentSessions-3.4.1.dmg"><b>Download Agent Sessions 3.4.1 (DMG)</b></a>
   •
   <a href="https://github.com/jazzyalex/agent-sessions/releases">All Releases</a>
   •
@@ -40,29 +40,64 @@ Agent Sessions helps you search across large session histories, quickly find the
   <p style="margin:0 0 0px 0;"><em>Transcript view with search (Dark Mode)</em></p>
   <img src="docs/assets/screenshot-H.png" alt="Transcript view with search (Dark Mode)" width="100%" style="max-width:960px;border-radius:8px;margin:5px 0;"/>
 
-  <p style="margin:0 0 0px 0;"><em>Resume Codex CLI and Claude Code sessions</em></p>
-  <img src="docs/assets/screenshot-V.png" alt="Resume Codex CLI and Claude Code sessions" width="100%" style="max-width:960px;border-radius:8px;margin:5px;"/>
+  <p style="margin:0 0 0px 0;"><em>Resume Codex CLI, Claude Code, and OpenCode sessions</em></p>
+  <img src="docs/assets/screenshot-V.png" alt="Resume Codex CLI, Claude Code, and OpenCode sessions" width="100%" style="max-width:960px;border-radius:8px;margin:5px;"/>
 </div>
+
+## What's New in 3.4
+
+**3.4.1** — Custom session titles across Claude, Codex, and Copilot; subagent indicator in flat list; auto-expanding Cockpit limits bar; and indexing reliability fixes.
+
+**Highlights:** All three major agents now support custom session titles. Claude sessions respect names set with the `/rename` CLI command (e.g. `/rename my-feature`). Codex titles are read from `thread_name` in `session_index.jsonl`. Copilot titles are read from `workspace.yaml`. Subagent sessions now show an `s` badge in flat list view. Agent Cockpit limits bar auto-expands when usage is amber/red.
+
+**3.4** — Subagent session hierarchy in session history and Agent Cockpit, plus important performance, security, and reliability fixes.
+
+**Highlights:** Codex subagent sessions now nest under their parent in the unified session list (`Cmd+H` to toggle). Agent Cockpit shows a live subagent count badge per session. Performance fix eliminates a CPU drain in session rows. SQL queries are fully parameterized throughout.
 
 ## Core Features
 
+- Agent Cockpit live HUD for active Codex CLI, Claude Code, and OpenCode iTerm2 sessions.
 - Unified browsing across supported agents, with strict filtering and a single session list.
-- Unified Search across all sessions plus in-session Find for fast transcript navigation.
+- Unified Search and image browsing across sessions, plus in-session Find for fast transcript navigation.
 - Readable tool calls/outputs and navigation between prompts, tools, and errors.
+- Right-click Copy Resume Command for Claude, Codex, OpenCode, Copilot, and Gemini sessions.
 - Local-only indexing designed for large histories.
 
-## Documentation
+## Agent Cockpit (Beta)
 
-- Release notes: `docs/CHANGELOG.md`
-- Monthly summaries: `docs/summaries/`
-- Privacy: `docs/PRIVACY.md`
-- Security: `docs/security.md`
-- Maintainers: `docs/deployment.md`
+Agent Cockpit is the live command center for active iTerm2 Codex CLI, Claude Code, and OpenCode sessions, with shared active/waiting summaries and live Claude usage tracking.
+
+<div align="center">
+  <p style="margin:0 0 0px 0;"><em>Agent Cockpit</em></p>
+  <img src="docs/assets/screenshot-cockpit-light.png" alt="Agent Cockpit in light mode" width="100%" style="max-width:820px;border-radius:8px;margin:5px 0;"/>
+</div>
+
+## Agent Cockpit Setup
+
+### Prerequisites
+
+- Agent Sessions with Live Sessions enabled
+- iTerm2
+- Agents running in iTerm2
+
+### Ideal Setup
+
+- Set the iTerm window title to the repo name
+- Run that repo's agents in that window
+- Give each tab/session its own clear name
+- Use the same name for the tab, session, and badge
+
+### Layout
+
+- One repo per desktop/Space if possible
+- Or keep several on one desktop if you prefer
+- Keep Agent Cockpit pinned in a corner so you can always see activity
+- Click from the cockpit to jump straight to a session
 
 ## Install
 
 ### Option A — Download DMG
-1. [Download AgentSessions-2.12.dmg](https://github.com/jazzyalex/agent-sessions/releases/download/v2.12/AgentSessions-2.12.dmg)
+1. [Download AgentSessions-3.4.1.dmg](https://github.com/jazzyalex/agent-sessions/releases/download/v3.4.1/AgentSessions-3.4.1.dmg)
 2. Drag **Agent Sessions.app** into Applications.
 
 ### Option B — Homebrew
@@ -81,10 +116,18 @@ defaults delete com.triada.AgentSessions SULastCheckTime
 open "/Applications/Agent Sessions.app"
 ```
 
+## Documentation
+
+- Release notes: `docs/CHANGELOG.md`
+- Monthly summaries: `docs/summaries/`
+- Privacy: `docs/PRIVACY.md`
+- Security: `docs/security.md`
+- Maintainers: `docs/deployment.md`
+
 ## Resume Workflows
 
+- Right-click any Claude, Codex, OpenCode, Copilot, or Gemini session and choose **Copy Resume Command** to get the exact CLI command for that session.
 - Open a session in your preferred terminal (Terminal.app or iTerm).
-- Copy a session ID, command, or snippet to reuse in a new run.
 - Use Unified Search (across sessions) and Find (within a session) to jump to relevant tool calls and outputs quickly.
 
 ## Privacy & Security
@@ -96,22 +139,8 @@ open "/Applications/Agent Sessions.app"
   - `~/.gemini/tmp`
   - `~/.copilot/session-state`
   - `~/.factory/sessions` and `~/.factory/projects`
-  - `~/.local/share/opencode/storage/session`
+  - `~/.local/share/opencode/opencode.db` and `~/.local/share/opencode/storage/session`
 - Details: `docs/PRIVACY.md` and `docs/security.md`
-
----
-
-## What's New in 2.12
-
-Short version:
-- Major update: Transcript rendering now recognizes semantic plans/code/diffs/review cards and improves file-link behavior for faster navigation.
-- Major update: Added crash diagnostics controls in Preferences with local queueing plus explicit email/export reporting workflows.
-- Major bug fix: Live transcript refresh/render paths are more stable during rapid updates, mode switches, and table/list churn.
-- Major bug fix: Focused-session monitoring is now consistent across supported agents with source-aware cadence and better window-focus handling.
-- Codex usage tracking now keeps token usage fresher by continuing JSONL parsing while selecting preferred rate-limit streams.
-- OpenClaw parsing is more resilient with normalized tool-call/result variants and improved tool-result error classification.
-
-Details: `docs/CHANGELOG.md` and `docs/summaries/`.
 
 ## Development
 

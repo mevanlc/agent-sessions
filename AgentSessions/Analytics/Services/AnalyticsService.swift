@@ -7,6 +7,10 @@ final class AnalyticsService: ObservableObject {
     @Published private(set) var snapshot: AnalyticsSnapshot = .empty
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var isReady: Bool = false
+    @Published var analyticsPhase: AnalyticsIndexPhase = .idle
+    @Published private(set) var buildProgress: AnalyticsBuildProgress = .empty
+    @Published private(set) var lastBuiltAt: Date? = nil
+    @Published private(set) var isStaleSinceLastBuild: Bool = false
 
     // Parsing progress tracking
     @Published private(set) var isParsingSessions: Bool = false
@@ -18,21 +22,29 @@ final class AnalyticsService: ObservableObject {
     private let geminiIndexer: GeminiSessionIndexer
     private let opencodeIndexer: OpenCodeSessionIndexer
     private let copilotIndexer: CopilotSessionIndexer
+    private let droidIndexer: DroidSessionIndexer
 
     private var cancellables = Set<AnyCancellable>()
     private var parsingTask: Task<Void, Never>?
     private let repository: AnalyticsRepository?
 
+    private static let analyticsSupportedSources: Set<SessionSource> = [
+        .codex, .claude, .gemini, .opencode, .copilot, .droid
+    ]
+    private static var analyticsBackfillVersion: Int { AnalyticsIndexPhase.backfillVersion }
+
     init(codexIndexer: SessionIndexer,
          claudeIndexer: ClaudeSessionIndexer,
          geminiIndexer: GeminiSessionIndexer,
          opencodeIndexer: OpenCodeSessionIndexer,
-         copilotIndexer: CopilotSessionIndexer) {
+         copilotIndexer: CopilotSessionIndexer,
+         droidIndexer: DroidSessionIndexer) {
         self.codexIndexer = codexIndexer
         self.claudeIndexer = claudeIndexer
         self.geminiIndexer = geminiIndexer
         self.opencodeIndexer = opencodeIndexer
         self.copilotIndexer = copilotIndexer
+        self.droidIndexer = droidIndexer
         if let db = try? IndexDB() {
             self.repository = AnalyticsRepository(db: db)
         } else {
@@ -41,6 +53,30 @@ final class AnalyticsService: ObservableObject {
 
         // Observe indexer changes for auto-refresh
         setupObservers()
+    }
+
+    func setBuildProgress(_ progress: AnalyticsBuildProgress) {
+        buildProgress = progress
+    }
+
+    func setLastBuiltAt(_ date: Date?) {
+        lastBuiltAt = date
+    }
+
+    func setAnalyticsStale(_ stale: Bool) {
+        isStaleSinceLastBuild = stale
+    }
+
+    func requestBuild() {
+        NotificationCenter.default.post(name: .requestAnalyticsBuild, object: nil)
+    }
+
+    func requestUpdate() {
+        NotificationCenter.default.post(name: .requestAnalyticsUpdate, object: nil)
+    }
+
+    func requestCancelBuild() {
+        NotificationCenter.default.post(name: .cancelAnalyticsBuild, object: nil)
     }
 
     /// Calculate analytics for given filters
@@ -55,6 +91,7 @@ final class AnalyticsService: ObservableObject {
         if AgentEnablement.isEnabled(.gemini) { allSessions.append(contentsOf: geminiIndexer.allSessions) }
         if AgentEnablement.isEnabled(.opencode) { allSessions.append(contentsOf: opencodeIndexer.allSessions) }
         if AgentEnablement.isEnabled(.copilot) { allSessions.append(contentsOf: copilotIndexer.allSessions) }
+        if AgentEnablement.isEnabled(.droid) { allSessions.append(contentsOf: droidIndexer.allSessions) }
 
         // Apply filters for current period
         let filtered = filterSessions(allSessions, dateRange: dateRange, agentFilter: agentFilter, projectFilter: projectFilter)
@@ -85,6 +122,7 @@ final class AnalyticsService: ObservableObject {
         if AgentEnablement.isEnabled(.gemini) { allSessions.append(contentsOf: geminiIndexer.allSessions) }
         if AgentEnablement.isEnabled(.opencode) { allSessions.append(contentsOf: opencodeIndexer.allSessions) }
         if AgentEnablement.isEnabled(.copilot) { allSessions.append(contentsOf: copilotIndexer.allSessions) }
+        if AgentEnablement.isEnabled(.droid) { allSessions.append(contentsOf: droidIndexer.allSessions) }
 
         // Apply message count filters (same as Sessions List)
         let hideZero = UserDefaults.standard.object(forKey: "HideZeroMessageSessions") as? Bool ?? true
@@ -258,7 +296,7 @@ final class AnalyticsService: ObservableObject {
         // Use DB for sessions/messages/duration/avg session length; skip commands for performance
         // Note: DB path currently only supports agent filtering, not project filtering
         // When project filter is active, use fallback path
-        if projectFilter == .all, let repo = repository, await repo.isReady() {
+        if projectFilter == .all, let repo = repository, await isRepositoryReady(repo) {
             let (startDay, endDay) = dayBounds(for: dateRange)
             let sources = sourcesFor(agentFilter)
             let cur = await repo.summary(sources: sources, dayStart: startDay, dayEnd: endDay)
@@ -530,11 +568,11 @@ final class AnalyticsService: ObservableObject {
             case .day:
                 return calendar.startOfDay(for: date)
             case .weekOfYear:
-                return calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date))!
+                return calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)) ?? calendar.startOfDay(for: date)
             case .month:
-                return calendar.date(from: calendar.dateComponents([.year, .month], from: date))!
+                return calendar.date(from: calendar.dateComponents([.year, .month], from: date)) ?? calendar.startOfDay(for: date)
             case .hour:
-                return calendar.date(from: calendar.dateComponents([.year, .month, .day, .hour], from: date))!
+                return calendar.date(from: calendar.dateComponents([.year, .month, .day, .hour], from: date)) ?? calendar.startOfDay(for: date)
             default:
                 return calendar.startOfDay(for: date)
             }
@@ -657,7 +695,7 @@ final class AnalyticsService: ObservableObject {
 
     private func calculateAgentBreakdownFastOrFallback(dateRange: AnalyticsDateRange, agentFilter: AnalyticsAgentFilter, projectFilter: AnalyticsProjectFilter, fallbackSessions: [Session]) async -> [AnalyticsAgentBreakdown] {
         // DB path only supports agent filtering, not project filtering
-        if projectFilter == .all, let repo = repository, await repo.isReady(), agentFilter == .all {
+        if projectFilter == .all, let repo = repository, await isRepositoryReady(repo), agentFilter == .all {
             let (startDay, endDay) = dayBounds(for: dateRange)
             let slices = await repo.breakdownByAgent(sources: sourcesFor(.all), dayStart: startDay, dayEnd: endDay)
             let totalSessions = slices.reduce(0) { $0 + $1.sessionsDistinct }
@@ -777,9 +815,10 @@ final class AnalyticsService: ObservableObject {
 
     private func setupObservers() {
         // Observe when session data changes (for auto-refresh when window visible)
-        Publishers.CombineLatest(
+        Publishers.CombineLatest3(
             Publishers.CombineLatest4(codexIndexer.$allSessions, claudeIndexer.$allSessions, geminiIndexer.$allSessions, opencodeIndexer.$allSessions),
-            copilotIndexer.$allSessions
+            copilotIndexer.$allSessions,
+            droidIndexer.$allSessions
         )
             .debounce(for: .seconds(1), scheduler: DispatchQueue.main)
             .sink { _ in
@@ -787,12 +826,13 @@ final class AnalyticsService: ObservableObject {
             }
             .store(in: &cancellables)
 
-        Publishers.CombineLatest(
+        Publishers.CombineLatest3(
             Publishers.CombineLatest4(codexIndexer.$launchPhase, claudeIndexer.$launchPhase, geminiIndexer.$launchPhase, opencodeIndexer.$launchPhase),
-            copilotIndexer.$launchPhase
+            copilotIndexer.$launchPhase,
+            droidIndexer.$launchPhase
         )
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _, _ in
+            .sink { [weak self] _, _, _ in
                 self?.updateReadiness()
             }
             .store(in: &cancellables)
@@ -808,7 +848,8 @@ final class AnalyticsService: ObservableObject {
                 (SessionSource.claude, claudeIndexer.launchPhase),
                 (SessionSource.gemini, geminiIndexer.launchPhase),
                 (SessionSource.opencode, opencodeIndexer.launchPhase),
-                (SessionSource.copilot, copilotIndexer.launchPhase)
+                (SessionSource.copilot, copilotIndexer.launchPhase),
+                (SessionSource.droid, droidIndexer.launchPhase)
             ].filter { enabled.contains($0.0) }.map { $0.1 }
             let phasesReady = phases.allSatisfy { phase in
                 switch phase {
@@ -819,12 +860,13 @@ final class AnalyticsService: ObservableObject {
                 }
             }
 
-            // A repository is considered ready once the rollup DB has data. If repo is unavailable, fall back to phase readiness.
+            // A repository is considered ready once all enabled analytics-supported sources
+            // have completed a full backfill. If repo is unavailable, fall back to phase readiness.
             let repoReady: Bool
             if !phasesReady {
                 repoReady = false
             } else if let repo = repository {
-                repoReady = await repo.isReady()
+                repoReady = await self.isRepositoryReady(repo)
             } else {
                 repoReady = true
             }
@@ -839,5 +881,12 @@ final class AnalyticsService: ObservableObject {
     /// Manually trigger a readiness check (used when analytics indexing finishes).
     func refreshReadiness() {
         updateReadiness()
+    }
+
+    /// Check if repository has all enabled analytics sources backfilled.
+    private func isRepositoryReady(_ repo: AnalyticsRepository) async -> Bool {
+        let enabled = AgentEnablement.enabledSources().intersection(Self.analyticsSupportedSources)
+        let sourceStrings = Set(enabled.map(\.rawValue))
+        return await repo.isReady(for: sourceStrings, version: Self.analyticsBackfillVersion)
     }
 }

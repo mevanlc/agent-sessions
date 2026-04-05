@@ -38,6 +38,51 @@ PANE_PID=""
 
 error_json() { local code="$1"; local hint="$2"; echo "{\"ok\":false,\"error\":\"$code\",\"hint\":\"$hint\"}"; }
 
+is_managed_probe_label() {
+    local label="$1"
+    # Accept any 12-char alphanumeric suffix after "as-cx-".
+    # Swift-generated tokens start with alpha and end with digit, but bash-generated
+    # UUID fallbacks may start with a hex digit — so we match the full set here.
+    # The "as-cx-" prefix itself is the meaningful guard against removing unrelated sockets.
+    [[ "$label" =~ ^as-cx-[A-Za-z0-9]{12}$ ]]
+}
+
+remove_managed_socket_files() {
+    local label="$1"
+    if ! is_managed_probe_label "$label"; then return; fi
+    local uid
+    uid="$(id -u 2>/dev/null || echo "")"
+    if [[ -z "$uid" ]]; then return; fi
+    local roots=("/private/tmp/tmux-$uid" "/tmp/tmux-$uid")
+    for root in "${roots[@]}"; do
+        local socket_path="${root}/${label}"
+        if [[ -e "$socket_path" ]]; then
+            rm -f -- "$socket_path" 2>/dev/null || true
+        fi
+    done
+}
+
+# Iteratively collect ALL descendant PIDs of $1 (children, grandchildren, etc.)
+# Needed because Node.js/codex may setsid into its own process group,
+# making process-group kills miss grandchild processes.
+collect_descendants() {
+  local queue="$1"
+  local all=""
+  while [[ -n "$queue" ]]; do
+    local next_queue=""
+    for pid in $queue; do
+      all="$all $pid"
+      local ch
+      ch=$(pgrep -P "$pid" 2>/dev/null || true)
+      if [[ -n "$ch" ]]; then
+        next_queue="$next_queue $ch"
+      fi
+    done
+    queue="$next_queue"
+  done
+  echo "$all"
+}
+
 cleanup() {
   set +e
   set +o pipefail
@@ -48,21 +93,37 @@ cleanup() {
       pane_pid=$("$tmux_cmd" -L "$LABEL" display-message -p -t "$SESSION:0.0" "#{pane_pid}" 2>/dev/null || true)
     fi
     if [[ -n "$pane_pid" ]]; then
+      # Collect ALL descendants recursively (catches grandchildren in separate
+      # process groups, e.g. Node.js native binary after setsid)
+      local all_desc=""
+      all_desc=$(collect_descendants "$pane_pid")
+      # SIGTERM every descendant individually
+      for dpid in $all_desc; do
+        kill -TERM "$dpid" 2>/dev/null || true
+      done
+      # Also SIGTERM the pane's process group as a belt-and-suspenders measure
       local pgid=""
       pgid=$(ps -o pgid= -p "$pane_pid" 2>/dev/null | tr -d ' ')
       if [[ -n "$pgid" ]]; then
         kill -TERM -"$pgid" 2>/dev/null || true
-        sleep 0.4
-        kill -KILL -"$pgid" 2>/dev/null || true
       else
         kill -TERM "$pane_pid" 2>/dev/null || true
-        sleep 0.4
+      fi
+      sleep 0.4
+      # SIGKILL every descendant
+      for dpid in $all_desc; do
+        kill -KILL "$dpid" 2>/dev/null || true
+      done
+      if [[ -n "$pgid" ]]; then
+        kill -KILL -"$pgid" 2>/dev/null || true
+      else
         kill -KILL "$pane_pid" 2>/dev/null || true
       fi
     fi
     "$tmux_cmd" -L "$LABEL" kill-session -t "$SESSION" 2>/dev/null || true
     "$tmux_cmd" -L "$LABEL" kill-server 2>/dev/null || true
   fi
+  remove_managed_socket_files "$LABEL"
 }
 trap cleanup EXIT INT TERM HUP
 
@@ -228,8 +289,8 @@ fi
 cat <<EOF
 {
   "ok": true,
-  "five_hour": { "pct_left": ${p5:-0}, "resets": "${r5}" },
-  "weekly": { "pct_left": ${pw:-0}, "resets": "${rw}" }
+  "five_hour": { "pct_left": ${p5:-null}, "resets": "${r5}" },
+  "weekly": { "pct_left": ${pw:-null}, "resets": "${rw}" }
 }
 EOF
 

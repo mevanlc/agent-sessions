@@ -33,11 +33,10 @@ import IOKit.ps
 // - ClaudeUsageSnapshot.weekOpusRemainingPercent: Stores "% remaining"
 // - UI displays use helper methods to convert between used/remaining as needed
 //
-// TODO (Future Work - Quota Tracking):
-// - Add absolute quota tracking (e.g., "42 of 200 messages remaining")
-// - Implement quota-based feature gating if needed
-// - Support mobile/team subscription quota display
-// - See original plan step 7 for detailed requirements
+// Future Work — Quota Tracking:
+// - Absolute quota tracking (e.g., "42 of 200 messages remaining")
+// - Quota-based feature gating
+// - Mobile/team subscription quota display
 //
 // ## Staleness Semantics
 //
@@ -129,6 +128,7 @@ actor ClaudeStatusService {
         }
     }
     private var refresherTask: Task<Void, Never>?
+    private var deferredTmuxCleanupTask: Task<Void, Never>?
     private var tmuxAvailable: Bool = false
     private var claudeAvailable: Bool = false
     private var cachedScriptURL: URL? = nil
@@ -136,7 +136,8 @@ actor ClaudeStatusService {
     private let maxBackoffSeconds: UInt64 = 60 * 60
     private let hiddenIdleIntervalNanoseconds: UInt64 = 24 * 60 * 60 * 1_000_000_000
     private let batteryRecheckIntervalNanoseconds: UInt64 = 30 * 60 * 1_000_000_000
-    private var didRunOrphanCleanup: Bool = false
+    private var lastOrphanCleanupAt: Date? = nil
+    private let orphanCleanupMinInterval: TimeInterval = 3600 // 1 hour
     private var didRunMenuBarOrphanCleanup: Bool = false
     private var tmuxCleanupInProgress: Bool = false
     private var tmuxCleanupFollowUpTask: Task<Void, Never>?
@@ -147,6 +148,13 @@ actor ClaudeStatusService {
     private var refresherLoopGeneration: UInt64 = 0
     private var tmuxPathCache: ClaudeTmuxPathCache
     private var terminalPathCache: ClaudeTerminalPathCache
+    private var claudeUsageEnabledPreference: Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "ClaudeUsageEnabled") == nil {
+            return defaults.bool(forKey: "ShowClaudeUsageStrip")
+        }
+        return defaults.bool(forKey: "ClaudeUsageEnabled")
+    }
 
     init(updateHandler: @escaping @Sendable (ClaudeUsageSnapshot) -> Void,
          availabilityHandler: @escaping @Sendable (ClaudeServiceAvailability) -> Void) {
@@ -162,6 +170,10 @@ actor ClaudeStatusService {
     }
 
     func start() async {
+        guard claudeUsageEnabledPreference else {
+            shouldRun = false
+            return
+        }
         shouldRun = true
 
         // Check dependencies once at startup
@@ -187,10 +199,16 @@ actor ClaudeStatusService {
         refresherTask?.cancel()
         refresherTask = nil
         refresherLoopGeneration &+= 1
+        tmuxCleanupFollowUpTask?.cancel()
+        tmuxCleanupFollowUpTask = nil
         if let label = activeProbeLabel {
             await cleanupTmuxProbe(label: label, session: Self.probeSessionName)
             activeProbeLabel = nil
         }
+        await cleanupOrphanedProbeProcesses()
+        await cleanupOrphanedTmuxLabels()
+        lastOrphanCleanupAt = nil
+        didRunMenuBarOrphanCleanup = false
         if state == .running {
             state = .idle
         }
@@ -202,6 +220,12 @@ actor ClaudeStatusService {
     }
 
     func setVisibility(menuVisible: Bool, stripVisible: Bool, appIsActive: Bool) {
+        guard claudeUsageEnabledPreference else {
+            visibilityContext = VisibilityContext(menuVisible: false, stripVisible: false, appIsActive: appIsActive)
+            visible = false
+            restartRefresherLoopIfNeeded()
+            return
+        }
         let previousContext = visibilityContext
         let previousMode = visibilityMode
         let wasVisible = visible
@@ -241,13 +265,16 @@ actor ClaudeStatusService {
     }
 
     private func ensureOrphanCleanupIfNeeded() async {
-        guard !didRunOrphanCleanup else { return }
-        didRunOrphanCleanup = true
+        if let last = lastOrphanCleanupAt, Date().timeIntervalSince(last) < orphanCleanupMinInterval { return }
+        lastOrphanCleanupAt = Date()
         await cleanupOrphanedProbeProcesses()
     }
 
     private func ensureMenuBarOrphanCleanupIfNeeded() async {
-        if didRunOrphanCleanup { return }
+        if let last = lastOrphanCleanupAt, Date().timeIntervalSince(last) < orphanCleanupMinInterval { return }
+        // didRunMenuBarOrphanCleanup is intentionally one-shot per session: the menu-bar
+        // path only needs to run once on launch. Periodic re-runs are handled by
+        // ensureOrphanCleanupIfNeeded (which calls cleanupOrphanedProbeProcesses).
         guard !didRunMenuBarOrphanCleanup else { return }
         didRunMenuBarOrphanCleanup = true
 
@@ -284,10 +311,14 @@ actor ClaudeStatusService {
                 }
                 updateHandler(snapshot)
             } else {
+                #if DEBUG
                 print("ClaudeStatusService: Failed to parse JSON: \(json)")
+                #endif
             }
         } catch {
+            #if DEBUG
             print("ClaudeStatusService: Script execution failed: \(error)")
+            #endif
             // Silent failure - keep last known good data
         }
     }
@@ -382,6 +413,11 @@ actor ClaudeStatusService {
         if !didExit {
             return ClaudeProbeDiagnostics(success: false, exitCode: 124, scriptPath: scriptURL.path, workdir: workDir, claudeBin: claudeBin, tmuxBin: tmuxBin, timeoutSecs: env["TIMEOUT_SECS"], stdout: stdout, stderr: stderr.isEmpty ? "Script timed out" : stderr)
         }
+        deferredTmuxCleanupTask?.cancel()
+        deferredTmuxCleanupTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return } // 2s grace for shell trap
+            await self?.cleanupOrphanedTmuxLabels()
+        }
 	        if process.terminationStatus == 0 {
 	            if let parsed = parseUsageJSON(stdout) {
 	                snapshot = parsed
@@ -445,7 +481,9 @@ actor ClaudeStatusService {
         activeProbeLabel = probeLabel
         defer { activeProbeLabel = nil }
 
+        #if DEBUG
         print("ClaudeStatusService: Executing script with WORKDIR=\(workDir), CLAUDE_BIN=\(env["CLAUDE_BIN"] ?? "not set"), TMUX_BIN=\(env["TMUX_BIN"] ?? "not set")")
+        #endif
 
         process.environment = env
         let timeoutValue = Int(env["TIMEOUT_SECS"] ?? "") ?? Self.defaultScriptBootTimeoutSeconds
@@ -460,8 +498,15 @@ actor ClaudeStatusService {
 
         let didExit = await waitForProcessExit(process, timeoutSeconds: scriptTimeoutSeconds, label: probeLabel, session: Self.probeSessionName)
         if !didExit {
+            #if DEBUG
             print("ClaudeStatusService: Script timed out after \(scriptTimeoutSeconds)s, terminating")
+            #endif
             throw ClaudeServiceError.scriptFailed(exitCode: 124, output: "Script timed out")
+        }
+        deferredTmuxCleanupTask?.cancel()
+        deferredTmuxCleanupTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return } // 2s grace for shell trap
+            await self?.cleanupOrphanedTmuxLabels()
         }
 
         let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
@@ -469,9 +514,11 @@ actor ClaudeStatusService {
         let output = String(data: outputData, encoding: .utf8) ?? ""
         let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
 
+        #if DEBUG
         if !errorOutput.isEmpty {
             print("ClaudeStatusService: Script stderr: \(errorOutput)")
         }
+        #endif
 
         // Check exit code
         let exitCode = process.terminationStatus
@@ -574,6 +621,30 @@ actor ClaudeStatusService {
                 protectedLabels.insert(label)
             }
         }
+        // Secondary: find claude processes whose CWD matches the probe working directory.
+        // The ps-eww check above misses processes inside tmux (no inherited env markers).
+        // "-c claude" is a prefix match and may capture unrelated processes (e.g. claude-something),
+        // but the CWD equality check below provides a sufficient safety filter.
+        let lsofResult = await runProcess(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-w", "-a", "-c", "claude", "-d", "cwd", "-nP", "-F", "pn"],
+            timeoutSeconds: 3
+        )
+        if !lsofResult.stdout.isEmpty {
+            let normalizedWD = normalizeProbePath(workDir)
+            var cwdPID: Int32? = nil
+            for line in lsofResult.stdout.split(separator: "\n") {
+                let s = String(line)
+                if s.hasPrefix("p"), let pid = Int32(s.dropFirst()) {
+                    cwdPID = pid
+                } else if s.hasPrefix("n"), let pid = cwdPID {
+                    if normalizeProbePath(String(s.dropFirst())) == normalizedWD,
+                       !pids.contains(pid_t(pid)) {
+                        pids.append(pid_t(pid))
+                    }
+                }
+            }
+        }
         let scannedLabels = scanTmuxLabels(prefix: Self.probeLabelPrefix)
         enqueueTmuxCleanup(labels: scannedLabels.union(protectedLabels), protectedLabels: protectedLabels)
         if tmuxCleanupInProgress {
@@ -592,6 +663,11 @@ actor ClaudeStatusService {
         for pid in pids {
             await terminateProcessGroup(pid: pid)
         }
+        // Kill socketless probe tmux servers: these survive when kill-server can't reach
+        // them because the socket was already deleted by a prior partial cleanup.
+        // Reuse the snapshot already captured above to avoid a redundant ps -A call.
+        terminateSocketlessProbeServers(labelPrefix: Self.probeLabelPrefix,
+                                       psOutput: snapshot.stdout)
 
         // Labels discovered on live orphan processes are protected during PID shutdown.
         // After termination, unprotect and requeue so kill-server runs in this cycle.
@@ -743,7 +819,9 @@ actor ClaudeStatusService {
 
         if !liveCandidates.isEmpty {
             guard let tmuxPath = resolveTmuxPathCached() else {
+                #if DEBUG
                 print("ClaudeStatusService: tmux cleanup skipped; tmux path unavailable")
+                #endif
                 clearTmuxCleanupQueue()
                 return false
             }
@@ -767,6 +845,18 @@ actor ClaudeStatusService {
                     staleRemoved += 1
                     continue
                 }
+                let fallbackPIDs = managedProbePIDs(for: label)
+                if !fallbackPIDs.isEmpty {
+                    for pid in fallbackPIDs {
+                        await terminateProcessGroup(pid: pid)
+                    }
+                    if tmuxSocketState(for: label) != .live {
+                        removeTmuxSocketFiles(label: label)
+                        tmuxCleanupRetryCounts.removeValue(forKey: label)
+                        staleRemoved += 1
+                        continue
+                    }
+                }
                 tmuxCleanupRetryCounts[label, default: 0] += 1
                 skipped += 1
             }
@@ -774,19 +864,77 @@ actor ClaudeStatusService {
 
         if invalidPath {
             invalidateTmuxPathCache()
+            #if DEBUG
             print("ClaudeStatusService: tmux cleanup invalidated cached tmux path after status=127")
+            #endif
             clearTmuxCleanupQueue()
             return false
         }
 
         tmuxCleanupNextIndex = end
         let remaining = max(0, tmuxCleanupPendingLabels.count - tmuxCleanupNextIndex)
+        #if DEBUG
         print("ClaudeStatusService: tmux cleanup pass processed=\(batch.count) liveCandidates=\(liveCandidates.count) removed=\(removed) staleRemoved=\(staleRemoved) skipped=\(skipped) remaining=\(remaining)")
+        #endif
         if remaining == 0 {
             clearTmuxCleanupQueue()
             return false
         }
         return true
+    }
+
+    private func managedProbePIDs(for label: String) -> [pid_t] {
+        let snapshot = scanProcessSnapshot()
+        return Self.parseManagedProbePIDs(
+            from: snapshot,
+            label: label,
+            uid: getuid()
+        )
+    }
+
+    nonisolated static func parseManagedProbePIDs(from processSnapshot: String,
+                                                  label: String,
+                                                  uid: uid_t) -> [pid_t] {
+        guard tmuxCleanupPlanner.isManagedProbeLabel(label) else { return [] }
+        guard !processSnapshot.isEmpty else { return [] }
+        var pids: [pid_t] = []
+        let socketMarkers = tmuxCleanupPlanner.socketPaths(uid: uid, label: label)
+        for line in processSnapshot.split(separator: "\n") {
+            let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let splitIndex = trimmed.firstIndex(where: { $0.isWhitespace }) else { continue }
+            let pidString = String(trimmed[..<splitIndex])
+            let command = String(trimmed[splitIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let pidValue = Int32(pidString) else { continue }
+            let commandTokens = command.split(separator: " ").map(String.init)
+            let isManagedTmux =
+                commandTokens.contains(where: { ($0 as NSString).lastPathComponent == "tmux" }) &&
+                command.contains(" -L \(label) ")
+            let isManagedClaudeProbe =
+                command.contains("claude --model sonnet") &&
+                socketMarkers.contains(where: { command.contains($0) })
+            if isManagedTmux || isManagedClaudeProbe {
+                pids.append(pid_t(pidValue))
+            }
+        }
+        return Array(Set(pids)).sorted()
+    }
+
+    private func scanProcessSnapshot() -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-A", "-o", "pid=", "-o", "command="]
+        let out = Pipe()
+        task.standardOutput = out
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+        } catch {
+            return ""
+        }
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else { return "" }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     private func workDirMarkers(_ workDir: String) -> [String] {

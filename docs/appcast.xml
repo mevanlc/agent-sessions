@@ -3,45 +3,46 @@
     <channel>
         <title>AgentSessions</title>
         <item>
-            <title>2.12</title>
-            <pubDate>Mon, 23 Feb 2026 21:24:08 -0800</pubDate>
+            <title>3.4.1</title>
+            <pubDate>Fri, 03 Apr 2026 12:30:40 -0700</pubDate>
             <description><![CDATA[
-<h2>What&#x27;s New in 2.12</h2>
-<h3>Highlights</h3>
+<h2>What&#x27;s New in 3.4.1</h2>
+<h3>Features</h3>
 <ul>
-<li>Onboarding (updates): Auto-onboarding is now suppressed for upgrades from `2.11.x` to `2.12`; update onboarding continues for users upgrading from older major/minor versions.</li>
-<li>Codex usage tracking: JSONL backward scans now continue extracting token-usage fields while searching for the preferred `codex` rate-limit stream, preventing stale token values when newer non-codex limit buckets are present.</li>
-<li>Sessions (OpenClaw): Tool format scanning now recognizes underscore/case variants for tool-call and tool-result blocks, and `is_error` tool-result flags are now classified as errors in transcript events.</li>
-<li>Transcript (Session view): Added semantic transcript rendering for plans, code blocks, diffs, and Codex review summaries, including distinct block accents and improved block grouping boundaries.</li>
-<li>Transcript (Session view): Added clickable local file references (for example `Foo.swift:56`, `Foo.swift#L56`) with configurable editor open behavior (System default, Cursor, VS Code) and optional CLI path override.</li>
-<li>Preferences (Unified Window): Added Rich Transcript controls for review cards, file linkification, code/diff line numbers, and preferred editor target.</li>
+<li>Analytics: Build lifecycle UI now includes not-built, building, canceled, failed, and stale states with visible progress details (percent, sessions processed, source progress, and indexed date span).</li>
+<li>Session list: Subagent sessions now show an `s` indicator in flat list view so they are identifiable without the hierarchy expanded. The indicator is hidden in hierarchy view where nesting already conveys subagent status.</li>
+<li>Agent Cockpit: Limits bar now auto-expands the detail panel when any quota indicator is amber/red and reset times no longer fit inline, so constrained usage is always visible without a hover.</li>
+<li>Claude: Custom session titles set via the `/rename` CLI command are now reliably restored after relaunch.</li>
+<li>Codex: Session custom titles are now parsed from `session_index.jsonl` (`thread_name` field) using a lock-protected mtime/size/path cache and tail-read for large files.</li>
+<li>Copilot: Session custom titles are now parsed from `workspace.yaml` (`name` field), gated to directory-based layouts to prevent cross-session contamination.</li>
 </ul>
-<h3>Other Changes</h3>
+<h3>Improvements</h3>
 <ul>
-<li>Preferences/About: Added a new Diagnostics section for crash reporting with local pending queue controls (`Email Crash Report`, `Export Report`, `Clear Pending`) and a direct support email link.</li>
-<li>Crash reporting: Crash diagnostics are queued locally on launch and shared only through an explicit pre-filled email draft action; no automatic startup/background upload occurs.</li>
-<li>Crash reporting UX: Crash capture is always on (toggle removed), and when a new crash report is detected at launch the app now prompts to either `Email Crash Report` or `Export + Open GitHub Issue`.</li>
-<li>Transcript (Session view): Code-fence opening detection now requires line-start fences, preventing inline triple-backtick snippets from consuming later fenced blocks and misclassifying narrative text as code.</li>
-<li>Transcript (Session view): Codex review-card parsing now skips malformed fenced JSON candidates and continues scanning later candidates, so one invalid payload block no longer suppresses a valid review summary.</li>
-<li>Transcript (Session view): `path:line:column` file references now preserve their column target when linkified, avoiding overlap with `path:line` parsing that could drop column navigation.</li>
-<li>Transcript (Session view): Opening file links in Cursor/VS Code no longer blocks transcript interaction while the editor CLI starts; CLI launches now run asynchronously with fallback behavior preserved.</li>
-<li>Transcript (Session view): Multiple Cursor/VS Code file-link opens now run concurrently, so slow/unavailable editor CLIs no longer serialize later clicks behind earlier timeout waits.</li>
-<li>Session view (Unified): Jump-to-latest arrow visibility is now driven by transcript position for every agent/session type, so it appears whenever the viewport is away from the end (including immediately after switching sessions) and no longer depends on active-session refresh paths.</li>
-<li>Session view (Unified): The floating jump-to-latest control now uses a smaller compact circle and now appears immediately after session selection whenever the transcript is not at the tail (no initial scroll required).</li>
+<li>Analytics: Index building is now explicit and on-demand. Opening Analytics no longer auto-starts indexing from the Unified toolbar; users can start, cancel, and manually update analytics index builds from the Analytics window.</li>
+<li>Performance: Analytics indexing work is decoupled from routine provider refresh paths so Unified/Cockpit stay responsive when Analytics is idle.</li>
+<li>Performance: Core session indexing now uses a lower-impact foreground execution profile, reduced focused-session monitor cadence, and no longer cancels in-flight refreshes when the app deactivates.</li>
+<li>Unified toolbar: Refresh indicator now explicitly represents core session indexing (not analytics), with clearer status/help copy to distinguish it from Analytics index builds.</li>
+<li>Performance: Automatic core refresh monitors now pause while the app is foreground/active and resume in background, reducing sustained CPU and avoiding near-continuous “indexing” status during active Unified use.</li>
+<li>Unified footer: Core indexing status now shows live session progress (`X/Y` and `%`) instead of a generic “refreshing” message.</li>
 </ul>
-<h3>Reminder: What You Got in 2.11</h3>
+<h3>Bug Fixes</h3>
 <ul>
-<li>OpenClaw sessions: Added OpenClaw (clawdbot) session support, including Advanced visibility for deleted transcripts.</li>
-<li>Images: Expanded image workflows across both Session view (inline thumbnails) and Image Browser (cross-agent browsing, filters, and actions).</li>
-<li>Search completeness: Reduced missing/incomplete search results for some sessions with incremental changed-file indexing, search backfill paths, and stale-row cleanup.</li>
-<li>Energy spikes: Reduced Energy Warning spikes by replacing always-on idle refresh with app-activation/event-driven behavior and power-aware probing/indexing cadence.</li>
+<li>Claude: Custom session titles set via `/rename` were not restored after relaunch because `upsertSessionMetaCore` omitted `custom_title` from its `UPDATE SET`; non-NULL parsed values now update the DB while NULL preserves the existing title.</li>
+<li>Custom title scan in the lightweight parser now uses a chunked gap scan (64KB chunks, 8MB budget) so title records in the middle of large session files are no longer missed.</li>
 </ul>
-<p>Full release notes: <a href="https://github.com/jazzyalex/agent-sessions/releases/tag/v2.12">https://github.com/jazzyalex/agent-sessions/releases/tag/v2.12</a></p>
+<h3>Reminder: What You Got in 3.4</h3>
+<ul>
+<li>Session list: Codex subagent sessions now appear as nested children under their parent in the unified session list. A toggle shows or hides the hierarchy; `Cmd+H` controls visibility from the keyboard.</li>
+<li>Agent Cockpit: Active Codex subagent count badge added to HUD rows. `Cmd+Shift+S` toggles subagent display.</li>
+<li>Agent Cockpit HUD: Codex active subagent badges now use the runtime `thread_spawn` state DB when available, so open worker agents stay counted even when their rollout files go quiet; passive rollout/`lsof` heuristics remain as a fallback.</li>
+<li>Agent Cockpit HUD: Codex runtime subagent counts now resolve the parent session before runtime edge lookup (even when the primary log path is a child rollout), and runtime state DB discovery now honors `CODEX_HOME`/`SessionsRootOverride` before falling back to `~/.codex`.</li>
+</ul>
+<p>Full release notes: <a href="https://github.com/jazzyalex/agent-sessions/releases/tag/v3.4.1">https://github.com/jazzyalex/agent-sessions/releases/tag/v3.4.1</a></p>
             ]]></description>
-            <sparkle:version>22</sparkle:version>
-            <sparkle:shortVersionString>2.12</sparkle:shortVersionString>
+            <sparkle:version>34</sparkle:version>
+            <sparkle:shortVersionString>3.4.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/jazzyalex/agent-sessions/releases/download/v2.12/AgentSessions-2.12.dmg" length="12268846" type="application/octet-stream" sparkle:edSignature="JN+pHHLEt8nTsAFdyR8ZHmg9mK1HRBwCbBzNjZkcrTtVj0chwcP6QFvXMscXIVQpSGll9yXAhn2zSLYs07A4AQ=="/>
+            <enclosure url="https://github.com/jazzyalex/agent-sessions/releases/download/v3.4.1/AgentSessions-3.4.1.dmg" length="15483821" type="application/octet-stream" sparkle:edSignature="w0H4IgWKEAd8FBN9n+4YwrYAfv1GIKsvG/2Rburo4iqWV4AhRJ4MJ5xMF46LgqnfHDvo4VcZoJQFvtkJqwChAw=="/>
         </item>
     </channel>
 </rss>

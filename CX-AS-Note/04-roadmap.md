@@ -6,6 +6,12 @@
   - Goal:
     - Add branch display to Agent Cockpit rows after backend/data support is explicitly approved.
     - Keep compact mode branch-free even after branch support ships.
+  - Update [2026-03-03]:
+    - Branch support explicitly deferred for current HUD stabilization pass.
+    - Evaluate branch source strategy before implementation:
+      1. `Session.gitBranch` only (cheap, may be sparse in lightweight rows),
+      2. `Session.gitBranch` + live git fallback from `cwd` (more complete, async),
+      3. tab-title heuristic fallback (low confidence).
   - Inputs:
     - Current release intentionally hides branch in all Agent Cockpit modes to avoid introducing new backend capability.
   - Dependencies:
@@ -54,6 +60,21 @@
     - Manual rename: user can set/edit/clear custom session title.
     - Agent-assisted rename: user can trigger rename suggestion/application flow.
     - Renames persist across refresh/reindex/restart and do not break sorting/filtering/search.
+
+- [ ] [2026-03-11] [Feature] Session bookmarks / collections
+  - Goal:
+    - Let users save important sessions for quick return.
+    - Support lightweight organization beyond a flat session list.
+  - Inputs:
+    - User feedback requests bookmark-style saving and collections/grouping for frequently revisited sessions.
+  - Dependencies:
+    - Stable persisted metadata keyed by session identity.
+    - UX entry points in Session list and/or detail views for add/remove/manage actions.
+    - Clear model choice for v1: simple bookmarks first vs full user-defined collections.
+  - Definition of done:
+    - Users can mark sessions as saved/bookmarked and find them quickly later.
+    - If collections ship in v1, users can assign a saved session to at least one named collection.
+    - Behavior persists across refresh/reindex/restart.
 
 - [ ] [2026-02-28] [Bug] Session handoff after restart is delayed until first prompt (Codex + Claude)
   - Goal:

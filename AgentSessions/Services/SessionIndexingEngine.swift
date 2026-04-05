@@ -28,8 +28,24 @@ struct IndexRefreshExecutionProfile: Equatable {
 
     static let lightBackground = IndexRefreshExecutionProfile(
         workerCount: 1,
-        sliceSize: 4,
-        interSliceYieldNanoseconds: 80_000_000,
+        sliceSize: 1,
+        interSliceYieldNanoseconds: 250_000_000,
+        deferNonCriticalWork: true
+    )
+
+    // Prioritize UI responsiveness while still making indexing progress.
+    static let uiFriendly = IndexRefreshExecutionProfile(
+        workerCount: 1,
+        sliceSize: 1,
+        interSliceYieldNanoseconds: 300_000_000,
+        deferNonCriticalWork: true
+    )
+
+    // Prioritize foreground smoothness over throughput.
+    static let foregroundCapped = IndexRefreshExecutionProfile(
+        workerCount: 1,
+        sliceSize: 1,
+        interSliceYieldNanoseconds: 650_000_000,
         deferNonCriticalWork: true
     )
 }

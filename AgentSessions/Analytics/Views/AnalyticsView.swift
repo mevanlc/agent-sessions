@@ -23,10 +23,38 @@ struct AnalyticsView: View {
             header
             Divider()
 
-            if service.isLoading {
-                loadingState
-            } else {
-                content
+            switch service.analyticsPhase {
+            case .idle:
+                buildStateView(
+                    message: "Analytics index not built yet",
+                    detail: "Build once to enable charts. Unified and Cockpit stay fast while analytics is idle.",
+                    showProgress: false,
+                    primaryAction: ("Build Analytics Index", { service.requestBuild() })
+                )
+            case .queued:
+                buildStateView(message: "Preparing analytics build…", detail: nil, showProgress: true)
+            case .building:
+                buildingStateView
+            case .failed:
+                buildStateView(
+                    message: "Analytics build failed",
+                    detail: nil,
+                    showProgress: false,
+                    primaryAction: ("Retry Build", { service.requestBuild() })
+                )
+            case .canceled:
+                buildStateView(
+                    message: "Analytics build canceled",
+                    detail: nil,
+                    showProgress: false,
+                    primaryAction: ("Restart Build", { service.requestBuild() })
+                )
+            case .ready:
+                if service.isLoading {
+                    loadingState
+                } else {
+                    content
+                }
             }
         }
         .overlay {
@@ -35,11 +63,16 @@ struct AnalyticsView: View {
             }
         }
         .onAppear {
-            // Load available projects
             availableProjects = service.getAvailableProjects()
-            // Do not parse all sessions here; indexing provides precomputed metrics (next phase).
-            // Keep UI responsive and avoid heavy work on appear.
-            refreshData()
+            if service.analyticsPhase == .ready {
+                refreshData()
+            }
+        }
+        .onChange(of: service.analyticsPhase) { _, phase in
+            if phase == .ready {
+                availableProjects = service.getAvailableProjects()
+                refreshData()
+            }
         }
         .onChange(of: dateRange) { _, _ in refreshData() }
         .onChange(of: agentFilter) { _, _ in refreshData() }
@@ -74,6 +107,22 @@ struct AnalyticsView: View {
                 Text("Showing active agents only")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+            if service.analyticsPhase == .ready {
+                if service.isStaleSinceLastBuild {
+                    Text("Stale")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.14), in: Capsule())
+                }
+                if let lastBuiltAt = service.lastBuiltAt {
+                    Text("Last updated \(AppDateFormatting.dateTimeShort(lastBuiltAt))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
 
@@ -114,8 +163,16 @@ struct AnalyticsView: View {
                     .rotationEffect(.degrees(isRefreshing ? 360 : 0))
             }
             .buttonStyle(.plain)
-            .help("Refresh analytics")
-            .disabled(isRefreshing)
+            .help(service.analyticsPhase == .ready ? "Refresh analytics view" : "Refresh unavailable")
+            .disabled(isRefreshing || service.analyticsPhase != .ready)
+
+            if service.analyticsPhase == .ready {
+                Button("Update Index") {
+                    service.requestUpdate()
+                }
+                .buttonStyle(.bordered)
+                .disabled(service.analyticsPhase == .building || service.analyticsPhase == .queued)
+            }
         }
         .padding(.horizontal, AnalyticsDesign.windowPadding)
         .padding(.vertical, 12)
@@ -179,6 +236,74 @@ struct AnalyticsView: View {
             Text("Loading analytics...")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private func buildStateView(message: String,
+                                detail: String?,
+                                showProgress: Bool,
+                                primaryAction: (title: String, action: () -> Void)? = nil) -> some View {
+        VStack(spacing: 16) {
+            Spacer()
+            if showProgress {
+                ProgressView()
+                    .controlSize(.large)
+            }
+            Text(message)
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            if let detail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+            }
+            if let primaryAction {
+                Button(primaryAction.title) {
+                    primaryAction.action()
+                }
+                .buttonStyle(.bordered)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var buildingStateView: some View {
+        let progress = service.buildProgress
+        return VStack(spacing: 14) {
+            Spacer()
+            ProgressView(value: progress.percent)
+                .frame(maxWidth: 320)
+            Text("Building analytics index… \(Int(progress.percent * 100))%")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            Text("\(progress.processedSessions)/\(max(progress.totalSessions, 1)) sessions")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if progress.totalSources > 0 {
+                Text("Sources \(progress.completedSources)/\(progress.totalSources)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let currentSource = progress.currentSource {
+                Text("Current source: \(currentSource)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let start = progress.dateStart, let end = progress.dateEnd {
+                Text("Indexed date range: \(start) to \(end)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Button("Cancel Build") {
+                service.requestCancelBuild()
+            }
+            .buttonStyle(.bordered)
+            Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -319,7 +444,8 @@ extension View {
         claudeIndexer: claudeIndexer,
         geminiIndexer: geminiIndexer,
         opencodeIndexer: opencodeIndexer,
-        copilotIndexer: copilotIndexer
+        copilotIndexer: copilotIndexer,
+        droidIndexer: DroidSessionIndexer()
     )
 
     AnalyticsView(service: service)

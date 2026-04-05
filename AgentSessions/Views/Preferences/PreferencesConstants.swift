@@ -9,6 +9,8 @@ enum PreferencesKey {
     static let codexAllowStatusProbe = "CodexAllowStatusProbe"
     static let codexProbeCleanupMode = "CodexProbeCleanupMode"
     static let claudeUsageEnabled = "ClaudeUsageEnabled"
+    static let claudeUsageMode = "ClaudeUsageMode"       // ClaudeUsageMode.rawValue, default "auto"
+    static let claudeWebApiEnabled = "ClaudeWebApiEnabled"  // Bool, default false
     static let claudeProbeCleanupMode = "ClaudeProbeCleanupMode"
     static let showSystemProbeSessions = "ShowSystemProbeSessions"
     static let showHousekeepingSessions = "ShowHousekeepingSessions"
@@ -61,10 +63,12 @@ enum PreferencesKey {
         static let showClaudeToolbarFilter = "UnifiedShowClaudeToolbarFilter"
         static let showGeminiToolbarFilter = "UnifiedShowGeminiToolbarFilter"
         static let showOpenCodeToolbarFilter = "UnifiedShowOpenCodeToolbarFilter"
+        static let showSubagentHierarchy = "UnifiedShowSubagentHierarchy"
     }
 
     enum MenuBar {
         static let source = "MenuBarSource"
+        static let showLiveSessionIcons = "MenuBarShowLiveSessionIcons"
         static let showCodexResetTimes = "MenuBarShowCodexResetTimes"
         static let showClaudeResetTimes = "MenuBarShowClaudeResetTimes"
         static let showPills = "MenuBarShowPills"
@@ -75,10 +79,12 @@ enum PreferencesKey {
         static let enableDeepToolOutputSearch = "EnableDeepToolOutputSearch"
         static let enableRecentToolIOIndex = "EnableRecentToolIOIndex"
         static let includeOpenClawDeletedSessions = "OpenClawIncludeDeletedSessions"
+        static let hideDockIcon = "HideDockIcon"
     }
 
     enum Paths {
         static let claudeSessionsRootOverride = "ClaudeSessionsRootOverride"
+        static let opencodeSessionsRootOverride = "OpenCodeSessionsRootOverride"
         static let copilotSessionsRootOverride = "CopilotSessionsRootOverride"
         static let droidSessionsRootOverride = "DroidSessionsRootOverride"
         static let droidProjectsRootOverride = "DroidProjectsRootOverride"
@@ -110,12 +116,18 @@ enum PreferencesKey {
     enum Cockpit {
         static let codexActiveSessionsEnabled = "CockpitCodexActiveSessionsEnabled"
         static let codexActiveRegistryRootOverride = "CockpitCodexActiveRegistryRootOverride"
+        static let hudShowAgentNameInCompact = "CockpitHUDShowAgentNameInCompact"
+        static let hudCompactBaselineRows = "CockpitHUDCompactBaselineRows"
+        static let hudCompactAutoFitEnabled = "CockpitHUDCompactAutoFitEnabled"
+        static let showTabSubtitleInFullMode = "CockpitShowTabSubtitleInFullMode"
         static let codexLiveFilterMode = "CockpitCodexLiveFilterMode"
-        static let legacyCodexLiveFilterMode = "LegacyCockpitCodexLiveFilterMode"
         static let hudOpen = "CockpitHUDOpen"
         static let hudGroupByProject = "CockpitHUDGroupByProject"
         static let hudCompact = "CockpitHUDCompact"
         static let hudPinned = "CockpitHUDPinned"
+        static let hudShowLimits = "CockpitHUDShowLimits"
+        static let showProbeSessionsInHUD = "CockpitShowProbeSessionsInHUD"
+        static let hudReduceTransparency = "CockpitHUDReduceTransparency"
     }
 }
 

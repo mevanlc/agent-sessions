@@ -42,11 +42,7 @@ struct ClaudeResumeCommandBuilder {
     }
 
     // MARK: - Helpers
-    private func shellQuote(_ string: String) -> String {
-        if string.isEmpty { return "''" }
-        if !string.contains("'") { return "'\(string)'" }
-        let escaped = string.replacingOccurrences(of: "'", with: "'\\''")
-        return "'\(escaped)'"
-    }
+    func shellQuote(_ string: String) -> String { ShellQuoting.quote(string) }
+    func shellQuoteIfNeeded(_ string: String) -> String { ShellQuoting.quoteIfNeeded(string) }
 }
 

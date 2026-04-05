@@ -5,8 +5,40 @@ import SwiftUI
 import IOKit.ps
 #endif
 
+/// Composite snapshot of all monitored files in a source's directories.
+/// Changes to ANY tracked file (not just the global latest) produce a different snapshot.
+struct DirectorySignatureSnapshot: Equatable {
+    let fileCount: Int
+    /// Hasher uses a per-process random seed (SE-0206), so this value is only
+    /// meaningful for comparisons within the same process lifetime.
+    let combinedHash: Int
+    let newestModifiedAt: Date?
+
+    static let empty = DirectorySignatureSnapshot(fileCount: 0, combinedHash: 0, newestModifiedAt: nil)
+
+    static func from(_ signatures: [(path: String, modifiedAt: Date)]) -> DirectorySignatureSnapshot {
+        guard !signatures.isEmpty else { return .empty }
+        var hasher = Hasher()
+        for sig in signatures.sorted(by: { $0.path < $1.path }) {
+            hasher.combine(sig.path)
+            hasher.combine(sig.modifiedAt)
+        }
+        return DirectorySignatureSnapshot(
+            fileCount: signatures.count,
+            combinedHash: hasher.finalize(),
+            newestModifiedAt: signatures.max(by: { $0.modifiedAt < $1.modifiedAt })?.modifiedAt
+        )
+    }
+}
+
 /// Aggregates all agent sessions into a single list with unified filters and search.
 final class UnifiedSessionIndexer: ObservableObject {
+    enum CoreIndexingDisplayMode: Equatable {
+        case idle
+        case indexing
+        case syncing
+    }
+
     struct FocusedSessionRefreshIntervals {
         let activeOnAC: TimeInterval
         let activeOnBattery: TimeInterval
@@ -15,22 +47,22 @@ final class UnifiedSessionIndexer: ObservableObject {
     }
 
     private static let defaultFocusedSessionRefreshIntervals = FocusedSessionRefreshIntervals(
-        activeOnAC: 5,
-        activeOnBattery: 8,
-        inactiveOnAC: 15,
+        activeOnAC: 8,
+        activeOnBattery: 12,
+        inactiveOnAC: 20,
         inactiveOnBattery: 60
     )
     private static let focusedSessionRefreshIntervalsBySource: [SessionSource: FocusedSessionRefreshIntervals] = [
         .codex: FocusedSessionRefreshIntervals(
-            activeOnAC: 1,
-            activeOnBattery: 3,
-            inactiveOnAC: 10,
+            activeOnAC: 4,
+            activeOnBattery: 8,
+            inactiveOnAC: 20,
             inactiveOnBattery: 60
         ),
         .claude: FocusedSessionRefreshIntervals(
-            activeOnAC: 2,
-            activeOnBattery: 5,
-            inactiveOnAC: 15,
+            activeOnAC: 6,
+            activeOnBattery: 10,
+            inactiveOnAC: 25,
             inactiveOnBattery: 60
         ),
         .gemini: defaultFocusedSessionRefreshIntervals,
@@ -270,12 +302,94 @@ final class UnifiedSessionIndexer: ObservableObject {
 
     // Lightweight favorites store (UserDefaults overlay)
     struct FavoritesStore {
+        struct Snapshot {
+            let legacyIDs: Set<String>
+            let scopedKeys: Set<StarredSessionKey>
+
+            func contains(id: String, source: SessionSource) -> Bool {
+                if scopedKeys.contains(.init(source: source, id: id)) { return true }
+                return legacyIDs.contains(id)
+            }
+        }
+
         init(defaults: UserDefaults = .standard) {
             store = StarredSessionsStore(defaults: defaults)
         }
         private(set) var store: StarredSessionsStore
         func contains(id: String, source: SessionSource) -> Bool { store.contains(id: id, source: source) }
         mutating func toggle(id: String, source: SessionSource) -> Bool { store.toggle(id: id, source: source) }
+        func snapshot() -> Snapshot {
+            Snapshot(legacyIDs: store.legacyIDs, scopedKeys: store.scopedKeys)
+        }
+    }
+
+    struct AgentEnablementSnapshot {
+        let codex: Bool
+        let claude: Bool
+        let gemini: Bool
+        let openCode: Bool
+        let copilot: Bool
+        let droid: Bool
+        let openClaw: Bool
+    }
+
+    struct SessionAggregationWork {
+        let codexList: [Session]
+        let claudeList: [Session]
+        let geminiList: [Session]
+        let opencodeList: [Session]
+        let copilotList: [Session]
+        let droidList: [Session]
+        let openclawList: [Session]
+        let favoritesSnapshot: FavoritesStore.Snapshot
+        let favoritesVersion: UInt64
+        let enablement: AgentEnablementSnapshot
+
+        static let empty = SessionAggregationWork(
+            codexList: [],
+            claudeList: [],
+            geminiList: [],
+            opencodeList: [],
+            copilotList: [],
+            droidList: [],
+            openclawList: [],
+            favoritesSnapshot: FavoritesStore.Snapshot(legacyIDs: [], scopedKeys: []),
+            favoritesVersion: 0,
+            enablement: AgentEnablementSnapshot(
+                codex: false,
+                claude: false,
+                gemini: false,
+                openCode: false,
+                copilot: false,
+                droid: false,
+                openClaw: false
+            )
+        )
+    }
+    struct SessionAggregationResult {
+        let sessions: [Session]
+        let favoritesVersion: UInt64
+    }
+    struct CoreIndexingProgress: Equatable {
+        let processed: Int
+        let total: Int
+        let activeSources: Int
+        let totalSources: Int
+
+        static let empty = CoreIndexingProgress(processed: 0, total: 0, activeSources: 0, totalSources: 0)
+
+        var percent: Int? {
+            guard total > 0 else { return nil }
+            let clamped = min(max(processed, 0), total)
+            return Int((Double(clamped) / Double(total)) * 100.0)
+        }
+    }
+    struct CoreProviderSnapshot {
+        let source: SessionSource
+        let enabled: Bool
+        let indexing: Bool
+        let processed: Int
+        let total: Int
     }
     @Published private(set) var allSessions: [Session] = []
     @Published private(set) var sessions: [Session] = []
@@ -347,7 +461,7 @@ final class UnifiedSessionIndexer: ObservableObject {
     @Published private(set) var openCodeAgentEnabled: Bool = AgentEnablement.isEnabled(.opencode)
     @Published private(set) var copilotAgentEnabled: Bool = AgentEnablement.isEnabled(.copilot)
     @Published private(set) var droidAgentEnabled: Bool = AgentEnablement.isEnabled(.droid)
-    @Published private(set) var openClawAgentEnabled: Bool = AgentEnablement.isEnabled(.openclaw)
+    @Published private(set) var openClawAgentEnabled: Bool = UserDefaults.standard.object(forKey: PreferencesKey.Agents.openClawEnabled) as? Bool ?? false
 
     // Sorting
     struct SessionSortDescriptor: Equatable { let key: Key; let ascending: Bool; enum Key { case modified, msgs, repo, title, agent, size } }
@@ -356,6 +470,8 @@ final class UnifiedSessionIndexer: ObservableObject {
     // Indexing state aggregation
     @Published private(set) var isIndexing: Bool = false
     @Published private(set) var isProcessingTranscripts: Bool = false
+    @Published private(set) var coreIndexingProgress: CoreIndexingProgress = .empty
+    @Published private(set) var coreIndexingDisplayMode: CoreIndexingDisplayMode = .idle
     @Published private(set) var indexingError: String? = nil
     @Published var showFavoritesOnly: Bool = UserDefaults.standard.bool(forKey: "ShowFavoritesOnly") {
         didSet {
@@ -381,45 +497,47 @@ final class UnifiedSessionIndexer: ObservableObject {
     private let copilot: CopilotSessionIndexer
     private let droid: DroidSessionIndexer
     private let openclaw: OpenClawSessionIndexer
+    private static let aggregationQueue = DispatchQueue(label: "UnifiedSessionIndexer.Aggregation", qos: .userInitiated)
     private var cancellables = Set<AnyCancellable>()
+    private var notificationObserverTokens: [NSObjectProtocol] = []
     private var favorites = FavoritesStore()
+    private var favoritesSnapshotVersion: UInt64 = 0
+    private let favoritesAggregationVersion = CurrentValueSubject<UInt64, Never>(0)
     private var hasPublishedInitialSessions = false
-    @Published private(set) var isAnalyticsIndexing: Bool = false
-    private var lastAnalyticsRefreshStartedAt: Date? = nil
-    private var pendingAnalyticsSources: Set<String> = []
-    private let analyticsRefreshTTLSeconds: TimeInterval = 5 * 60  // 5 minutes
-    private let analyticsStartDelaySeconds: TimeInterval = 2.0     // small delay to avoid launch contention
+    @Published private(set) var analyticsPhase: AnalyticsIndexPhase = .idle
+    @Published private(set) var analyticsBuildProgress: AnalyticsBuildProgress = .empty
+    @Published private(set) var analyticsLastBuiltAt: Date? = nil
+    @Published private(set) var analyticsIsStale: Bool = false
+    @MainActor private var analyticsProgressBySource: [String: (processed: Int, total: Int)] = [:]
+    private var analyticsBuildTask: Task<Void, Never>?
+    var isAnalyticsIndexing: Bool { analyticsPhase == .queued || analyticsPhase == .building }
+    private static let analyticsSupportedSources: Set<String> = [
+        "codex", "claude", "gemini", "opencode", "copilot", "droid"
+    ]
+    private static var analyticsBackfillVersion: Int { AnalyticsIndexPhase.backfillVersion }
+    private static let analyticsLastBuiltAtDefaultsKey = "AnalyticsLastBuiltAt"
     private let providerRefreshCoordinator = ProviderRefreshCoordinator(coalesceWindowSeconds: 10)
-    private let newSessionMonitorIntervalSeconds: UInt64 = 60
-    private let monitorRefreshMinimumIntervalSeconds: TimeInterval = 3 * 60
+    private let backgroundNewSessionMonitorIntervalSeconds: UInt64 = 60
+    private let foregroundNewSessionMonitorIntervalSeconds: UInt64 = 5 * 60
+    private let backgroundMonitorRefreshMinimumIntervalSeconds: TimeInterval = 3 * 60
+    private let foregroundMonitorRefreshMinimumIntervalSeconds: TimeInterval = 10 * 60
     private var newSessionMonitorTask: Task<Void, Never>? = nil
     private var focusedSessionMonitorTask: Task<Void, Never>? = nil
-    private var lastSeenCodexSignature: FileSignature? = nil
-    private var lastSeenClaudeSignature: FileSignature? = nil
+    private var lastSeenCodexSnapshot: DirectorySignatureSnapshot? = nil
+    private var lastSeenClaudeSnapshot: DirectorySignatureSnapshot? = nil
     private var focusedSessionContext: FocusedSessionContext? = nil
     private var lastFocusedSignatureBySource: [SessionSource: FileSignature] = [:]
     private var consecutiveMissingFocusedSignatureCountBySource: [SessionSource: Int] = [:]
     private var lastMonitorRefreshBySource: [SessionSource: Date] = [:]
-    private var pendingMonitorRefreshSignatureBySource: [SessionSource: FileSignature] = [:]
+    private var pendingMonitorRefreshSnapshotBySource: [SessionSource: DirectorySignatureSnapshot] = [:]
     private var pendingRefreshSourcesWhileInactive: Set<SessionSource> = []
     private var pendingManualFocusedReloadSources: Set<SessionSource> = []
     private var hasInitializedNewSessionMonitorBaseline: Bool = false
     private var appIsActive: Bool = false
-    private var lastFullReconcileBySource: [SessionSource: Date] = [:]
-    private let manualFullFallbackIntervalSeconds: TimeInterval = 15 * 60
 
     // Debouncing for expensive operations
     private var recomputeDebouncer: DispatchWorkItem? = nil
     
-    // Auto-refresh recency guards (per provider)
-    private var lastAutoRefreshCodex: Date? = nil
-    private var lastAutoRefreshClaude: Date? = nil
-    private var lastAutoRefreshGemini: Date? = nil
-    private var lastAutoRefreshOpenCode: Date? = nil
-    private var lastAutoRefreshCopilot: Date? = nil
-    private var lastAutoRefreshDroid: Date? = nil
-    private var lastAutoRefreshOpenClaw: Date? = nil
-
     init(codexIndexer: SessionIndexer,
          claudeIndexer: ClaudeSessionIndexer,
          geminiIndexer: GeminiSessionIndexer,
@@ -434,51 +552,71 @@ final class UnifiedSessionIndexer: ObservableObject {
         self.copilot = copilotIndexer
         self.droid = droidIndexer
         self.openclaw = openclawIndexer
+        self.analyticsLastBuiltAt = UserDefaults.standard.object(forKey: Self.analyticsLastBuiltAtDefaultsKey) as? Date
 
         syncAgentEnablementFromDefaults()
         // Observe UserDefaults changes to sync external toggles (Preferences) to this model
-        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: UserDefaults.standard, queue: .main) { [weak self] _ in
+        notificationObserverTokens.append(NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: UserDefaults.standard, queue: .main) { [weak self] _ in
             guard let self else { return }
             let v = UserDefaults.standard.bool(forKey: "UnifiedHasCommandsOnly")
             if v != self.hasCommandsOnly { self.hasCommandsOnly = v }
             self.syncAgentEnablementFromDefaults()
-        }
+        })
+
+        let agentEnabledFlags = Publishers.CombineLatest(
+            Publishers.CombineLatest4($codexAgentEnabled, $claudeAgentEnabled, $geminiAgentEnabled, $openCodeAgentEnabled),
+            Publishers.CombineLatest3($copilotAgentEnabled, $droidAgentEnabled, $openClawAgentEnabled)
+        )
 
         // Merge underlying allSessions whenever any changes
         Publishers.CombineLatest(
             Publishers.CombineLatest4(codex.$allSessions, claude.$allSessions, gemini.$allSessions, opencode.$allSessions),
             Publishers.CombineLatest3(copilot.$allSessions, droid.$allSessions, openclaw.$allSessions)
         )
-            .map { [weak self] combined, tail -> [Session] in
-                guard let self else { return [] }
+            .combineLatest(agentEnabledFlags, favoritesAggregationVersion)
+            .receive(on: DispatchQueue.main)
+            .map { [weak self] sourceLists, flags, favoritesVersion -> SessionAggregationWork in
+                guard let self else { return .empty }
+                let (combined, tail) = sourceLists
                 let (codexList, claudeList, geminiList, opencodeList) = combined
                 let (copilotList, droidList, openclawList) = tail
-                var merged: [Session] = []
-                if self.codexAgentEnabled { merged.append(contentsOf: codexList) }
-                if self.claudeAgentEnabled { merged.append(contentsOf: claudeList) }
-                if self.geminiAgentEnabled { merged.append(contentsOf: geminiList) }
-                if self.openCodeAgentEnabled { merged.append(contentsOf: opencodeList) }
-                if self.copilotAgentEnabled { merged.append(contentsOf: copilotList) }
-                if self.droidAgentEnabled { merged.append(contentsOf: droidList) }
-                if self.openClawAgentEnabled { merged.append(contentsOf: openclawList) }
-                for i in merged.indices { merged[i].isFavorite = self.favorites.contains(id: merged[i].id, source: merged[i].source) }
-                return merged.sorted { lhs, rhs in
-                    if lhs.modifiedAt == rhs.modifiedAt { return lhs.id > rhs.id }
-                    return lhs.modifiedAt > rhs.modifiedAt
-                }
+                let (enabled4, tailEnabled) = flags
+                let (codexEnabled, claudeEnabled, geminiEnabled, openCodeEnabled) = enabled4
+                let (copilotEnabled, droidEnabled, openClawEnabled) = tailEnabled
+                return SessionAggregationWork(
+                    codexList: codexList,
+                    claudeList: claudeList,
+                    geminiList: geminiList,
+                    opencodeList: opencodeList,
+                    copilotList: copilotList,
+                    droidList: droidList,
+                    openclawList: openclawList,
+                    favoritesSnapshot: self.favorites.snapshot(),
+                    favoritesVersion: favoritesVersion,
+                    enablement: AgentEnablementSnapshot(
+                        codex: codexEnabled,
+                        claude: claudeEnabled,
+                        gemini: geminiEnabled,
+                        openCode: openCodeEnabled,
+                        copilot: copilotEnabled,
+                        droid: droidEnabled,
+                        openClaw: openClawEnabled
+                    )
+                )
             }
+            .receive(on: Self.aggregationQueue)
+            .map(Self.mergedAggregationResult(from:))
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] value in
-                self?.publishAfterCurrentUpdate { [weak self] in
-                    self?.allSessions = value
+            .sink { [weak self] result in
+                guard let self,
+                      Self.shouldPublishAggregationResult(result, currentFavoritesVersion: self.favoritesSnapshotVersion) else { return }
+                self.publishAfterCurrentUpdate { [weak self] in
+                    guard let self,
+                          Self.shouldPublishAggregationResult(result, currentFavoritesVersion: self.favoritesSnapshotVersion) else { return }
+                    self.allSessions = result.sessions
                 }
             }
             .store(in: &cancellables)
-
-        let agentEnabledFlags = Publishers.CombineLatest(
-            Publishers.CombineLatest4($codexAgentEnabled, $claudeAgentEnabled, $geminiAgentEnabled, $openCodeAgentEnabled),
-            Publishers.CombineLatest3($copilotAgentEnabled, $droidAgentEnabled, $openClawAgentEnabled)
-        )
 
         // isIndexing reflects any enabled indexer working
         Publishers.CombineLatest(
@@ -499,9 +637,41 @@ final class UnifiedSessionIndexer: ObservableObject {
             .sink { [weak self] value in
                 self?.publishAfterCurrentUpdate { [weak self] in
                     self?.isIndexing = value
+                    if value == false {
+                        self?.coreIndexingDisplayMode = .idle
+                    }
                 }
             }
             .store(in: &cancellables)
+
+        // Aggregate core indexing progress across enabled providers.
+        // Provider tuple order is fixed: codex, claude, gemini, opencode, copilot, droid, openclaw.
+        Publishers.CombineLatest3(
+            Publishers.CombineLatest(
+                Publishers.CombineLatest4(codex.$filesProcessed, claude.$filesProcessed, gemini.$filesProcessed, opencode.$filesProcessed),
+                Publishers.CombineLatest3(copilot.$filesProcessed, droid.$filesProcessed, openclaw.$filesProcessed)
+            ),
+            Publishers.CombineLatest(
+                Publishers.CombineLatest4(codex.$totalFiles, claude.$totalFiles, gemini.$totalFiles, opencode.$totalFiles),
+                Publishers.CombineLatest3(copilot.$totalFiles, droid.$totalFiles, openclaw.$totalFiles)
+            ),
+            Publishers.CombineLatest(
+                Publishers.CombineLatest4(codex.$isIndexing, claude.$isIndexing, gemini.$isIndexing, opencode.$isIndexing),
+                Publishers.CombineLatest3(copilot.$isIndexing, droid.$isIndexing, openclaw.$isIndexing)
+            )
+        )
+        .combineLatest(agentEnabledFlags)
+        .map { metrics, flags in
+            let snapshots = Self.coreProviderSnapshots(metrics: metrics, flags: flags)
+            return Self.aggregateProgress(from: snapshots)
+        }
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] progress in
+            self?.publishAfterCurrentUpdate { [weak self] in
+                self?.coreIndexingProgress = progress
+            }
+        }
+        .store(in: &cancellables)
 
         // isProcessingTranscripts reflects any enabled indexer processing transcripts
         Publishers.CombineLatest(
@@ -655,77 +825,6 @@ final class UnifiedSessionIndexer: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Auto-refresh providers when toggled ON (10s recency guard, debounced)
-        $includeCodex
-            .dropFirst()
-            .removeDuplicates()
-            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard let self else { return }
-                if enabled { self.maybeAutoRefreshCodex() }
-            }
-            .store(in: &cancellables)
-
-        $includeClaude
-            .dropFirst()
-            .removeDuplicates()
-            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard let self else { return }
-                if enabled { self.maybeAutoRefreshClaude() }
-            }
-            .store(in: &cancellables)
-
-        $includeGemini
-            .dropFirst()
-            .removeDuplicates()
-            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard let self else { return }
-                if enabled { self.maybeAutoRefreshGemini() }
-            }
-            .store(in: &cancellables)
-
-        $includeOpenCode
-            .dropFirst()
-            .removeDuplicates()
-            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard let self else { return }
-                if enabled { self.maybeAutoRefreshOpenCode() }
-            }
-            .store(in: &cancellables)
-
-        $includeCopilot
-            .dropFirst()
-            .removeDuplicates()
-            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard let self else { return }
-                if enabled { self.maybeAutoRefreshCopilot() }
-            }
-            .store(in: &cancellables)
-
-        $includeDroid
-            .dropFirst()
-            .removeDuplicates()
-            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard let self else { return }
-                if enabled { self.maybeAutoRefreshDroid() }
-            }
-            .store(in: &cancellables)
-
-        $includeOpenClaw
-            .dropFirst()
-            .removeDuplicates()
-            .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] enabled in
-                guard let self else { return }
-                if enabled { self.maybeAutoRefreshOpenClaw() }
-            }
-            .store(in: &cancellables)
-
         Publishers.CombineLatest(Publishers.CombineLatest4(codex.$launchPhase, claude.$launchPhase, gemini.$launchPhase, opencode.$launchPhase),
                                 Publishers.CombineLatest3(copilot.$launchPhase, droid.$launchPhase, openclaw.$launchPhase))
             .receive(on: DispatchQueue.main)
@@ -747,21 +846,22 @@ final class UnifiedSessionIndexer: ObservableObject {
         updateLaunchState()
 
         // When probe cleanups succeed, refresh underlying providers and analytics rollups
-        NotificationCenter.default.addObserver(forName: CodexProbeCleanup.didRunCleanupNotification, object: nil, queue: .main) { [weak self] note in
+        notificationObserverTokens.append(NotificationCenter.default.addObserver(forName: CodexProbeCleanup.didRunCleanupNotification, object: nil, queue: .main) { [weak self] note in
             guard let self = self else { return }
             if let info = note.userInfo as? [String: Any], let status = info["status"] as? String, status == "success" {
                 self.refresh()
             }
-        }
-        NotificationCenter.default.addObserver(forName: ClaudeProbeProject.didRunCleanupNotification, object: nil, queue: .main) { [weak self] note in
+        })
+        notificationObserverTokens.append(NotificationCenter.default.addObserver(forName: ClaudeProbeProject.didRunCleanupNotification, object: nil, queue: .main) { [weak self] note in
             guard let self = self else { return }
             if let info = note.userInfo as? [String: Any], let status = info["status"] as? String, status == "success" {
                 self.refresh()
             }
-        }
+        })
     }
 
-    private func syncAgentEnablementFromDefaults(defaults: UserDefaults = .standard) {
+    func syncAgentEnablementFromDefaults(defaults: UserDefaults = .standard) {
+        let beforeSources = enabledAnalyticsSources()
         let c1 = AgentEnablement.isEnabled(.codex, defaults: defaults)
         let c2 = AgentEnablement.isEnabled(.claude, defaults: defaults)
         let c3 = AgentEnablement.isEnabled(.gemini, defaults: defaults)
@@ -776,9 +876,14 @@ final class UnifiedSessionIndexer: ObservableObject {
         if c5 != copilotAgentEnabled { copilotAgentEnabled = c5 }
         if c6 != droidAgentEnabled { droidAgentEnabled = c6 }
         if c7 != openClawAgentEnabled { openClawAgentEnabled = c7 }
+
+        let afterSources = enabledAnalyticsSources()
+        if analyticsLastBuiltAt != nil && !afterSources.subtracting(beforeSources).isEmpty {
+            analyticsIsStale = true
+        }
     }
 
-    func refresh() {
+    func refresh(trigger: IndexRefreshTrigger = .manual) {
         LaunchProfiler.log("Unified.refresh: request enqueued")
         let sources: [SessionSource] = [
             codexAgentEnabled ? .codex : nil,
@@ -790,7 +895,101 @@ final class UnifiedSessionIndexer: ObservableObject {
             openClawAgentEnabled ? .openclaw : nil
         ].compactMap { $0 }
         for source in sources {
-            requestProviderRefresh(source: source, reason: "unified-refresh", trigger: .manual)
+            requestProviderRefresh(source: source, reason: "unified-refresh", trigger: trigger)
+        }
+    }
+
+    static func aggregateProgress(from snapshots: [CoreProviderSnapshot]) -> CoreIndexingProgress {
+        let enabledRows = snapshots.filter(\.enabled)
+        guard !enabledRows.isEmpty else {
+            return CoreIndexingProgress.empty
+        }
+        let anyIndexing = enabledRows.contains(where: \.indexing)
+        guard anyIndexing else {
+            return CoreIndexingProgress.empty
+        }
+
+        let activeRows = enabledRows.filter(\.indexing)
+        let processed = activeRows.reduce(into: 0) { partial, provider in
+            let rowProcessed = max(0, provider.processed)
+            let rowTotal = max(0, provider.total)
+            partial += min(rowProcessed, rowTotal > 0 ? rowTotal : rowProcessed)
+        }
+        let total = activeRows.reduce(into: 0) { partial, provider in
+            let rowTotal = max(0, provider.total)
+            let rowProcessed = max(0, provider.processed)
+            partial += max(rowTotal, rowProcessed)
+        }
+
+        return CoreIndexingProgress(
+            processed: processed,
+            total: total,
+            activeSources: activeRows.count,
+            totalSources: enabledRows.count
+        )
+    }
+
+    private static func coreProviderSnapshots(
+        metrics: (
+            (
+                (Int, Int, Int, Int),
+                (Int, Int, Int)
+            ),
+            (
+                (Int, Int, Int, Int),
+                (Int, Int, Int)
+            ),
+            (
+                (Bool, Bool, Bool, Bool),
+                (Bool, Bool, Bool)
+            )
+        ),
+        flags: (
+            (Bool, Bool, Bool, Bool),
+            (Bool, Bool, Bool)
+        )
+    ) -> [CoreProviderSnapshot] {
+        let (processedTuple, totalsTuple, indexingTuple) = metrics
+        let (processed4, processedTail) = processedTuple
+        let (pCodex, pClaude, pGemini, pOpenCode) = processed4
+        let (pCopilot, pDroid, pOpenClaw) = processedTail
+        let (totals4, totalsTail) = totalsTuple
+        let (tCodex, tClaude, tGemini, tOpenCode) = totals4
+        let (tCopilot, tDroid, tOpenClaw) = totalsTail
+        let (index4, indexTail) = indexingTuple
+        let (iCodex, iClaude, iGemini, iOpenCode) = index4
+        let (iCopilot, iDroid, iOpenClaw) = indexTail
+        let (f4, tailFlags) = flags
+        let (eCodex, eClaude, eGemini, eOpenCode) = f4
+        let (eCopilot, eDroid, eOpenClaw) = tailFlags
+
+        return [
+            CoreProviderSnapshot(source: .codex, enabled: eCodex, indexing: iCodex, processed: pCodex, total: tCodex),
+            CoreProviderSnapshot(source: .claude, enabled: eClaude, indexing: iClaude, processed: pClaude, total: tClaude),
+            CoreProviderSnapshot(source: .gemini, enabled: eGemini, indexing: iGemini, processed: pGemini, total: tGemini),
+            CoreProviderSnapshot(source: .opencode, enabled: eOpenCode, indexing: iOpenCode, processed: pOpenCode, total: tOpenCode),
+            CoreProviderSnapshot(source: .copilot, enabled: eCopilot, indexing: iCopilot, processed: pCopilot, total: tCopilot),
+            CoreProviderSnapshot(source: .droid, enabled: eDroid, indexing: iDroid, processed: pDroid, total: tDroid),
+            CoreProviderSnapshot(source: .openclaw, enabled: eOpenClaw, indexing: iOpenClaw, processed: pOpenClaw, total: tOpenClaw)
+        ]
+    }
+
+    func rebuildCoreIndex() {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            do {
+                let db = try IndexDB()
+                for source in SessionSource.allCases {
+                    try await db.purgeSource(source.rawValue)
+                }
+            } catch {
+                #if DEBUG
+                print("[Indexing] Core rebuild purge failed: \(error)")
+                #endif
+            }
+            await MainActor.run { [weak self] in
+                self?.refresh(trigger: .cleanup)
+            }
         }
     }
 
@@ -828,14 +1027,15 @@ final class UnifiedSessionIndexer: ObservableObject {
     @MainActor
     func setAppActive(_ active: Bool) {
         appIsActive = active
+        newSessionMonitorTask?.cancel()
+        newSessionMonitorTask = nil
         if active {
-            if newSessionMonitorTask == nil {
-                let task = Task.detached(priority: .utility) { [weak self] in
-                    guard let self else { return }
-                    await self.runNewSessionMonitorLoop()
-                }
-                newSessionMonitorTask = task
+            // Foreground: keep lightweight monitor loop running at low cadence.
+            let task = Task.detached(priority: .utility) { [weak self] in
+                guard let self else { return }
+                await self.runNewSessionMonitorLoop()
             }
+            newSessionMonitorTask = task
 
             let pending = pendingRefreshSourcesWhileInactive
             pendingRefreshSourcesWhileInactive.removeAll()
@@ -847,21 +1047,25 @@ final class UnifiedSessionIndexer: ObservableObject {
 
             if let context = focusedSessionContext,
                Self.supportsFocusedSessionMonitoring(source: context.source) {
+                focusedSessionMonitorTask?.cancel()
+                focusedSessionMonitorTask = Task.detached(priority: .utility) { [weak self, context] in
+                    await self?.runFocusedSessionMonitorLoop(context: context)
+                }
                 scheduleImmediateFocusedSessionCheck(context: context, trigger: .monitor)
             }
         } else {
-            newSessionMonitorTask?.cancel()
-            newSessionMonitorTask = nil
-
-            let wasCodexBusy = codex.isIndexing || codex.isProcessingTranscripts
-            if wasCodexBusy {
-                pendingRefreshSourcesWhileInactive.insert(.codex)
-                codex.cancelInFlightWork()
+            // Background: restart monitor loop with background cadence immediately.
+            let task = Task.detached(priority: .utility) { [weak self] in
+                guard let self else { return }
+                await self.runNewSessionMonitorLoop()
             }
-            let wasClaudeBusy = claude.isIndexing || claude.isProcessingTranscripts
-            if wasClaudeBusy {
-                pendingRefreshSourcesWhileInactive.insert(.claude)
-                claude.cancelInFlightWork()
+            newSessionMonitorTask = task
+            if focusedSessionMonitorTask == nil,
+               let context = focusedSessionContext,
+               Self.supportsFocusedSessionMonitoring(source: context.source) {
+                focusedSessionMonitorTask = Task.detached(priority: .utility) { [weak self, context] in
+                    await self?.runFocusedSessionMonitorLoop(context: context)
+                }
             }
         }
     }
@@ -869,7 +1073,13 @@ final class UnifiedSessionIndexer: ObservableObject {
     private func runNewSessionMonitorLoop() async {
         await checkForNewSessions(establishBaselineIfNeeded: true)
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: newSessionMonitorIntervalSeconds * 1_000_000_000)
+            let intervalSeconds = await MainActor.run { [weak self] () -> UInt64 in
+                guard let self else { return 60 }
+                return self.appIsActive
+                    ? self.foregroundNewSessionMonitorIntervalSeconds
+                    : self.backgroundNewSessionMonitorIntervalSeconds
+            }
+            try? await Task.sleep(nanoseconds: intervalSeconds * 1_000_000_000)
             if Task.isCancelled { break }
             await checkForNewSessions()
         }
@@ -894,15 +1104,15 @@ final class UnifiedSessionIndexer: ObservableObject {
     }
 
     private func checkForNewSessions(establishBaselineIfNeeded: Bool = false) async {
-        let codexSignature = detectLatestCodexSignature()
-        let claudeSignature = detectLatestClaudeSignature()
+        let codexSnapshot = detectCodexDirectorySnapshot()
+        let claudeSnapshot = detectClaudeDirectorySnapshot()
         await MainActor.run { [weak self] in
             guard let self else { return }
             if establishBaselineIfNeeded && !self.hasInitializedNewSessionMonitorBaseline {
-                self.lastSeenCodexSignature = codexSignature
-                self.lastSeenClaudeSignature = claudeSignature
-                self.pendingMonitorRefreshSignatureBySource[.codex] = nil
-                self.pendingMonitorRefreshSignatureBySource[.claude] = nil
+                self.lastSeenCodexSnapshot = codexSnapshot
+                self.lastSeenClaudeSnapshot = claudeSnapshot
+                self.pendingMonitorRefreshSnapshotBySource[.codex] = nil
+                self.pendingMonitorRefreshSnapshotBySource[.claude] = nil
                 self.hasInitializedNewSessionMonitorBaseline = true
                 return
             }
@@ -910,55 +1120,43 @@ final class UnifiedSessionIndexer: ObservableObject {
                 self.hasInitializedNewSessionMonitorBaseline = true
             }
 
-            if codexSignature != self.lastSeenCodexSignature {
-                self.lastSeenCodexSignature = codexSignature
-                if codexSignature != nil {
-                    if self.shouldTriggerMonitorRefresh(source: .codex, now: Date()) {
-                        // Preserve the pending marker until the refresh is actually accepted
-                        // (performProviderRefresh clears it when it triggers).
-                        if let codexSignature {
-                            self.pendingMonitorRefreshSignatureBySource[.codex] = codexSignature
-                        }
-                        self.requestProviderRefresh(source: .codex, reason: "foreground-new-session", trigger: .monitor)
-                    } else if let codexSignature {
-                        self.pendingMonitorRefreshSignatureBySource[.codex] = codexSignature
-                    }
+            self.processSnapshotDelta(source: .codex, snapshot: codexSnapshot,
+                                      lastSnapshot: &self.lastSeenCodexSnapshot)
+            self.processSnapshotDelta(source: .claude, snapshot: claudeSnapshot,
+                                      lastSnapshot: &self.lastSeenClaudeSnapshot)
+        }
+    }
+
+    @MainActor
+    private func processSnapshotDelta(source: SessionSource,
+                                      snapshot: DirectorySignatureSnapshot,
+                                      lastSnapshot: inout DirectorySignatureSnapshot?) {
+        if snapshot != lastSnapshot {
+            lastSnapshot = snapshot
+            if snapshot.fileCount > 0 {
+                if self.shouldTriggerMonitorRefresh(source: source, now: Date()) {
+                    self.pendingMonitorRefreshSnapshotBySource[source] = snapshot
+                    self.requestProviderRefresh(source: source, reason: "directory-snapshot-delta", trigger: .monitor)
                 } else {
-                    self.pendingMonitorRefreshSignatureBySource[.codex] = nil
+                    self.pendingMonitorRefreshSnapshotBySource[source] = snapshot
                 }
-            } else if self.pendingMonitorRefreshSignatureBySource[.codex] != nil {
-                if self.shouldTriggerMonitorRefresh(source: .codex, now: Date()) {
-                    self.requestProviderRefresh(source: .codex, reason: "foreground-new-session", trigger: .monitor)
-                }
+            } else {
+                self.pendingMonitorRefreshSnapshotBySource[source] = nil
             }
-            if claudeSignature != self.lastSeenClaudeSignature {
-                self.lastSeenClaudeSignature = claudeSignature
-                if claudeSignature != nil {
-                    if self.shouldTriggerMonitorRefresh(source: .claude, now: Date()) {
-                        // Preserve the pending marker until the refresh is actually accepted
-                        // (performProviderRefresh clears it when it triggers).
-                        if let claudeSignature {
-                            self.pendingMonitorRefreshSignatureBySource[.claude] = claudeSignature
-                        }
-                        self.requestProviderRefresh(source: .claude, reason: "foreground-new-session", trigger: .monitor)
-                    } else if let claudeSignature {
-                        self.pendingMonitorRefreshSignatureBySource[.claude] = claudeSignature
-                    }
-                } else {
-                    self.pendingMonitorRefreshSignatureBySource[.claude] = nil
-                }
-            } else if self.pendingMonitorRefreshSignatureBySource[.claude] != nil {
-                if self.shouldTriggerMonitorRefresh(source: .claude, now: Date()) {
-                    self.requestProviderRefresh(source: .claude, reason: "foreground-new-session", trigger: .monitor)
-                }
+        } else if self.pendingMonitorRefreshSnapshotBySource[source] != nil {
+            if self.shouldTriggerMonitorRefresh(source: source, now: Date()) {
+                self.requestProviderRefresh(source: source, reason: "directory-snapshot-delta", trigger: .monitor)
             }
         }
     }
 
     @MainActor
     private func shouldTriggerMonitorRefresh(source: SessionSource, now: Date) -> Bool {
+        let minimumInterval = appIsActive
+            ? foregroundMonitorRefreshMinimumIntervalSeconds
+            : backgroundMonitorRefreshMinimumIntervalSeconds
         if let last = lastMonitorRefreshBySource[source],
-           now.timeIntervalSince(last) < monitorRefreshMinimumIntervalSeconds {
+           now.timeIntervalSince(last) < minimumInterval {
             return false
         }
         lastMonitorRefreshBySource[source] = now
@@ -991,6 +1189,29 @@ final class UnifiedSessionIndexer: ObservableObject {
         }
 
         return newest
+    }
+
+    private func detectCodexDirectorySnapshot() -> DirectorySignatureSnapshot {
+        let root = codexSessionsRoot()
+        let calendar = Calendar(identifier: .gregorian)
+        let now = Date()
+        var allSignatures: [(path: String, modifiedAt: Date)] = []
+
+        for offset in 0...2 {
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: now) else { continue }
+            let comps = calendar.dateComponents([.year, .month, .day], from: day)
+            guard let y = comps.year, let m = comps.month, let d = comps.day else { continue }
+            let folder = root
+                .appendingPathComponent(String(format: "%04d", y))
+                .appendingPathComponent(String(format: "%02d", m))
+                .appendingPathComponent(String(format: "%02d", d))
+
+            allSignatures.append(contentsOf: collectFileSignatures(in: folder, matching: { file in
+                file.lastPathComponent.hasPrefix("rollout-") && file.pathExtension.lowercased() == "jsonl"
+            }))
+        }
+
+        return DirectorySignatureSnapshot.from(allSignatures)
     }
 
     private func fileSignature(atPath path: String) -> FileSignature? {
@@ -1026,6 +1247,30 @@ final class UnifiedSessionIndexer: ObservableObject {
         return mostRecentSignature(in: [projectsRoot], fileLimitPerDirectory: 500)
     }
 
+    private func detectClaudeDirectorySnapshot() -> DirectorySignatureSnapshot {
+        let projectsRoot = claudeProjectsRoot()
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .contentModificationDateKey]
+        guard let children = try? fm.contentsOfDirectory(at: projectsRoot,
+                                                         includingPropertiesForKeys: Array(keys),
+                                                         options: [.skipsHiddenFiles]) else {
+            return .empty
+        }
+
+        var directories: [(url: URL, modifiedAt: Date)] = []
+        directories.reserveCapacity(children.count)
+        for child in children {
+            let values = try? child.resourceValues(forKeys: keys)
+            guard values?.isDirectory == true else { continue }
+            directories.append((child, values?.contentModificationDate ?? .distantPast))
+        }
+
+        let sorted = directories.sorted { lhs, rhs in lhs.modifiedAt > rhs.modifiedAt }
+        let selected = Array(sorted.prefix(5)).map(\.url)
+        let scanDirs = selected.isEmpty ? [projectsRoot] : selected
+        return collectDirectorySnapshot(in: scanDirs, fileLimitPerDirectory: 500)
+    }
+
     private func codexSessionsRoot() -> URL {
         if let custom = UserDefaults.standard.string(forKey: "SessionsRootOverride"),
            !custom.isEmpty {
@@ -1057,6 +1302,7 @@ final class UnifiedSessionIndexer: ObservableObject {
     private func mostRecentSignature(in directories: [URL], fileLimitPerDirectory: Int) -> FileSignature? {
         let fm = FileManager.default
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
+        let scanCap = fileLimitPerDirectory * 10
         var newest: FileSignature? = nil
 
         for directory in directories {
@@ -1068,14 +1314,17 @@ final class UnifiedSessionIndexer: ObservableObject {
                 continue
             }
 
-            var visited = 0
+            var scanned = 0
+            var matched = 0
             for case let file as URL in enumerator {
                 let values = try? file.resourceValues(forKeys: keys)
                 guard values?.isRegularFile == true else { continue }
-                visited += 1
-                if visited > fileLimitPerDirectory { break }
+                scanned += 1
+                if scanned > scanCap { break }
                 let ext = file.pathExtension.lowercased()
                 guard ext == "jsonl" || ext == "ndjson" else { continue }
+                matched += 1
+                if matched > fileLimitPerDirectory { break }
                 let modifiedAt = values?.contentModificationDate ?? .distantPast
                 let signature = FileSignature(path: file.path, modifiedAt: modifiedAt)
                 if newest == nil || signature.modifiedAt > newest!.modifiedAt {
@@ -1110,6 +1359,63 @@ final class UnifiedSessionIndexer: ObservableObject {
             }
         }
         return newest
+    }
+
+    private func collectFileSignatures(in folder: URL,
+                                       matching predicate: (URL) -> Bool) -> [(path: String, modifiedAt: Date)] {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: folder.path, isDirectory: &isDir), isDir.boolValue else {
+            return []
+        }
+        guard let items = try? fm.contentsOfDirectory(at: folder,
+                                                      includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                                                      options: [.skipsHiddenFiles]) else {
+            return []
+        }
+
+        var result: [(path: String, modifiedAt: Date)] = []
+        for file in items where predicate(file) {
+            let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+            guard values?.isRegularFile == true else { continue }
+            result.append((path: file.path, modifiedAt: values?.contentModificationDate ?? .distantPast))
+        }
+        return result
+    }
+
+    private func collectDirectorySnapshot(in directories: [URL],
+                                          fileLimitPerDirectory: Int) -> DirectorySignatureSnapshot {
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
+        let scanCap = fileLimitPerDirectory * 10
+        var allSignatures: [(path: String, modifiedAt: Date)] = []
+
+        for directory in directories {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: directory.path, isDirectory: &isDir), isDir.boolValue else { continue }
+            guard let enumerator = fm.enumerator(at: directory,
+                                                 includingPropertiesForKeys: Array(keys),
+                                                 options: [.skipsHiddenFiles]) else {
+                continue
+            }
+
+            var scanned = 0
+            var matched = 0
+            for case let file as URL in enumerator {
+                let values = try? file.resourceValues(forKeys: keys)
+                guard values?.isRegularFile == true else { continue }
+                scanned += 1
+                if scanned > scanCap { break }
+                let ext = file.pathExtension.lowercased()
+                guard ext == "jsonl" || ext == "ndjson" else { continue }
+                matched += 1
+                if matched > fileLimitPerDirectory { break }
+                let modifiedAt = values?.contentModificationDate ?? .distantPast
+                allSignatures.append((path: file.path, modifiedAt: modifiedAt))
+            }
+        }
+
+        return DirectorySignatureSnapshot.from(allSignatures)
     }
 
     private func requestProviderRefresh(source: SessionSource,
@@ -1159,31 +1465,31 @@ final class UnifiedSessionIndexer: ObservableObject {
     private func performProviderRefresh(source: SessionSource,
                                         reason: String,
                                         trigger: IndexRefreshTrigger) async {
-        let context = await MainActor.run { [weak self] in
-            guard let self else {
-                return (didTrigger: false,
-                        requestGlobalAnalytics: false)
-            }
-            guard self.shouldRefreshSource(source) else {
-                return (didTrigger: false,
-                        requestGlobalAnalytics: false)
-            }
-            if !self.appIsActive && trigger != .manual {
+        await AppReadyGate.waitUntilReady()
+        let didTrigger = await MainActor.run { [weak self] in
+            guard let self else { return false }
+            guard self.shouldRefreshSource(source) else { return false }
+            if !self.appIsActive && trigger != .manual && trigger != .launch {
                 self.pendingRefreshSourcesWhileInactive.insert(source)
                 LaunchProfiler.log("Unified.refresh[\(source.rawValue)]: deferred (inactive, trigger=\(trigger.rawValue))")
-                return (didTrigger: false,
-                        requestGlobalAnalytics: false)
+                return false
             }
-            self.pendingMonitorRefreshSignatureBySource[source] = nil
+            self.pendingMonitorRefreshSnapshotBySource[source] = nil
             let mode = self.refreshMode(for: source, trigger: trigger)
-            let executionProfile = self.refreshExecutionProfile(for: source)
+            let executionProfile = self.refreshExecutionProfile(for: source, trigger: trigger)
+            switch trigger {
+            case .launch, .manual:
+                self.coreIndexingDisplayMode = .indexing
+            case .monitor, .providerEnabled, .cleanup:
+                if self.coreIndexingDisplayMode != .indexing {
+                    self.coreIndexingDisplayMode = .syncing
+                }
+            }
             LaunchProfiler.log("Unified.refresh[\(source.rawValue)]: trigger (\(reason), mode=\(mode), trigger=\(trigger.rawValue))")
             self.triggerRefresh(for: source, mode: mode, trigger: trigger, executionProfile: executionProfile)
-            let shouldRunGlobalAnalytics = source != .codex && source != .claude
-            return (didTrigger: true,
-                    requestGlobalAnalytics: shouldRunGlobalAnalytics)
+            return true
         }
-        guard context.didTrigger else { return }
+        guard didTrigger else { return }
 
         var waits = 0
         while waits < 240 {
@@ -1194,6 +1500,15 @@ final class UnifiedSessionIndexer: ObservableObject {
             if !indexing { break }
             waits += 1
             try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+
+        await MainActor.run { [weak self] in
+            guard let self else { return }
+            if !self.isIndexing {
+                self.coreIndexingDisplayMode = .idle
+            } else if self.coreIndexingDisplayMode != .indexing {
+                self.coreIndexingDisplayMode = .syncing
+            }
         }
 
         let shouldForceFocusedReload = await MainActor.run { [weak self] () -> Bool in
@@ -1216,10 +1531,12 @@ final class UnifiedSessionIndexer: ObservableObject {
             }
         }
 
-        if context.requestGlobalAnalytics {
+        if Self.analyticsSupportedSources.contains(source.rawValue) {
             await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.requestAnalyticsRefreshIfNeeded(enabledSourcesOverride: [source.rawValue])
+                guard let self, self.analyticsLastBuiltAt != nil else { return }
+                if self.analyticsPhase != .building && self.analyticsPhase != .queued {
+                    self.analyticsIsStale = true
+                }
             }
         }
     }
@@ -1239,61 +1556,22 @@ final class UnifiedSessionIndexer: ObservableObject {
 
     @MainActor
     private func refreshMode(for source: SessionSource, trigger: IndexRefreshTrigger) -> IndexRefreshMode {
-        guard trigger == .manual else { return .incremental }
-        let now = Date()
-        if source == .claude {
-            lastFullReconcileBySource[source] = now
-            return .fullReconcile
-        }
-        guard source == .codex else { return .incremental }
-        guard let last = lastFullReconcileBySource[source] else {
-            lastFullReconcileBySource[source] = now
-            return .incremental
-        }
-        if now.timeIntervalSince(last) >= manualFullFallbackIntervalSeconds {
-            lastFullReconcileBySource[source] = now
+        if trigger == .cleanup {
             return .fullReconcile
         }
         return .incremental
     }
 
     @MainActor
-    private func refreshExecutionProfile(for source: SessionSource) -> IndexRefreshExecutionProfile {
-        let onAC = Self.onACPower()
-        let isHighVolumeProvider = (source == .codex || source == .claude)
-
-        if isHighVolumeProvider && appIsActive && onAC {
+    private func refreshExecutionProfile(for _: SessionSource,
+                                         trigger: IndexRefreshTrigger) -> IndexRefreshExecutionProfile {
+        if trigger == .cleanup {
             return .interactive
         }
-        if isHighVolumeProvider && appIsActive && !onAC {
-            return IndexRefreshExecutionProfile(
-                workerCount: 1,
-                sliceSize: 6,
-                interSliceYieldNanoseconds: 50_000_000,
-                deferNonCriticalWork: true
-            )
-        }
-        if isHighVolumeProvider {
+        if !appIsActive {
             return .lightBackground
         }
-
-        if appIsActive && onAC {
-            return IndexRefreshExecutionProfile(
-                workerCount: 1,
-                sliceSize: 8,
-                interSliceYieldNanoseconds: 20_000_000,
-                deferNonCriticalWork: false
-            )
-        }
-        if appIsActive && !onAC {
-            return IndexRefreshExecutionProfile(
-                workerCount: 1,
-                sliceSize: 6,
-                interSliceYieldNanoseconds: 60_000_000,
-                deferNonCriticalWork: true
-            )
-        }
-        return .lightBackground
+        return .foregroundCapped
     }
 
     private static func onACPower() -> Bool {
@@ -1487,83 +1765,158 @@ final class UnifiedSessionIndexer: ObservableObject {
         }
     }
 
+    /// Returns the subset of currently enabled agents that support analytics.
+    func enabledAnalyticsSources() -> Set<String> {
+        var enabled = Set<String>()
+        if codexAgentEnabled { enabled.insert("codex") }
+        if claudeAgentEnabled { enabled.insert("claude") }
+        if geminiAgentEnabled { enabled.insert("gemini") }
+        if openCodeAgentEnabled { enabled.insert("opencode") }
+        if copilotAgentEnabled { enabled.insert("copilot") }
+        if droidAgentEnabled { enabled.insert("droid") }
+        return enabled.intersection(Self.analyticsSupportedSources)
+    }
+
+    /// Returns the set of analytics-supported sources that haven't completed a full backfill.
+    func missingAnalyticsBackfillSources(db: IndexDB) async throws -> Set<String> {
+        let needed = enabledAnalyticsSources()
+        let completed = try await db.analyticsBackfillCompleteSources(version: Self.analyticsBackfillVersion)
+        return needed.subtracting(completed)
+    }
+
     @MainActor
-    private func requestAnalyticsRefreshIfNeeded(enabledSourcesOverride: Set<String>? = nil) {
-        let enabledSources: Set<String> = {
-            let effective = enabledSourcesOverride ?? {
-                var s: Set<String> = []
-                if codexAgentEnabled { s.insert("codex") }
-                if claudeAgentEnabled { s.insert("claude") }
-                if geminiAgentEnabled { s.insert("gemini") }
-                if openCodeAgentEnabled { s.insert("opencode") }
-                if copilotAgentEnabled { s.insert("copilot") }
-                if droidAgentEnabled { s.insert("droid") }
-                if openClawAgentEnabled { s.insert("openclaw") }
-                return s
-            }()
-            var filtered: Set<String> = []
-            if codexAgentEnabled && effective.contains("codex") { filtered.insert("codex") }
-            if claudeAgentEnabled && effective.contains("claude") { filtered.insert("claude") }
-            if geminiAgentEnabled && effective.contains("gemini") { filtered.insert("gemini") }
-            if openCodeAgentEnabled && effective.contains("opencode") { filtered.insert("opencode") }
-            if copilotAgentEnabled && effective.contains("copilot") { filtered.insert("copilot") }
-            if droidAgentEnabled && effective.contains("droid") { filtered.insert("droid") }
-            if openClawAgentEnabled && effective.contains("openclaw") { filtered.insert("openclaw") }
-            return filtered
-        }()
-        if enabledSources.isEmpty {
-            return
+    private func updateAnalyticsProgress(_ bySource: [String: (processed: Int, total: Int)], enabledSources: Set<String>, dateSpan: (String?, String?)) {
+        let totals = bySource.values.reduce(into: (processed: 0, total: 0)) { partial, row in
+            partial.processed += row.processed
+            partial.total += row.total
         }
-
-        if isAnalyticsIndexing {
-            pendingAnalyticsSources.formUnion(enabledSources)
-            return
-        }
-
-        let now = Date()
-        if let last = lastAnalyticsRefreshStartedAt,
-           now.timeIntervalSince(last) < analyticsRefreshTTLSeconds {
-            LaunchProfiler.log("Unified.refresh: Analytics refresh skipped (within TTL)")
-            return
-        }
-
-        lastAnalyticsRefreshStartedAt = now
-        isAnalyticsIndexing = true
-        let delaySeconds = analyticsStartDelaySeconds
-
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            defer {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.isAnalyticsIndexing = false
-                    if !self.pendingAnalyticsSources.isEmpty {
-                        let pending = self.pendingAnalyticsSources
-                        self.pendingAnalyticsSources.removeAll()
-                        self.requestAnalyticsRefreshIfNeeded(enabledSourcesOverride: pending)
-                    }
-                }
+        let currentSource = enabledSources.first(where: { src in
+            let row = bySource[src] ?? (0, 0)
+            return row.total > 0 && row.processed < row.total
+        })
+        let completedSources = enabledSources.reduce(into: 0) { count, src in
+            let row = bySource[src] ?? (0, 0)
+            if row.total == 0 || row.processed >= row.total {
+                count += 1
             }
+        }
+        analyticsBuildProgress = AnalyticsBuildProgress(
+            processedSessions: totals.processed,
+            totalSessions: totals.total,
+            currentSource: currentSource,
+            completedSources: completedSources,
+            totalSources: enabledSources.count,
+            dateStart: dateSpan.0,
+            dateEnd: dateSpan.1
+        )
+    }
+
+    @MainActor
+    func requestAnalyticsBuildIfNeeded() {
+        startAnalyticsBuild()
+    }
+
+    @MainActor
+    func startAnalyticsBuild() {
+        runAnalyticsBuild(preferIncremental: false)
+    }
+
+    @MainActor
+    func updateAnalyticsNow() {
+        runAnalyticsBuild(preferIncremental: true)
+    }
+
+    @MainActor
+    func cancelAnalyticsBuild() {
+        analyticsBuildTask?.cancel()
+        analyticsBuildTask = nil
+        analyticsProgressBySource = [:]
+        analyticsPhase = .canceled
+    }
+
+    @MainActor
+    private func runAnalyticsBuild(preferIncremental: Bool) {
+        if analyticsPhase == .building || analyticsPhase == .queued { return }
+
+        analyticsPhase = .queued
+        analyticsBuildProgress = .empty
+
+        let enabledSources = enabledAnalyticsSources()
+        guard !enabledSources.isEmpty else {
+            analyticsPhase = .idle
+            return
+        }
+
+        analyticsBuildTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
             do {
-                if delaySeconds > 0 {
-                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
-                }
-                LaunchProfiler.log("Unified.refresh: Analytics warmup (open IndexDB)")
                 let db = try IndexDB()
+                let missing = try await self.missingAnalyticsBackfillSources(db: db)
+                let hasPriorBuild = await MainActor.run { self.analyticsLastBuiltAt != nil }
+                let incremental = preferIncremental && hasPriorBuild && missing.isEmpty
+                let profile = AnalyticsIndexer.BuildProfile(chunkSize: 1, skipToolIO: true, yieldNanoseconds: 20_000_000)
+                let version = Self.analyticsBackfillVersion
                 let indexer = AnalyticsIndexer(db: db, enabledSources: enabledSources)
-                if try await db.isEmpty() {
-                    LaunchProfiler.log("Unified.refresh: Analytics fullBuild start")
-                    await indexer.fullBuild()
-                    LaunchProfiler.log("Unified.refresh: Analytics fullBuild complete")
+
+                await MainActor.run {
+                    self.analyticsPhase = .building
+                    self.analyticsBuildProgress = .empty
+                    self.analyticsProgressBySource = Dictionary(uniqueKeysWithValues: enabledSources.map { ($0, (0, 0)) })
+                }
+
+                if incremental {
+                    LaunchProfiler.log("Unified: Analytics manual incremental update start")
+                    await indexer.refresh(onSourceProgress: { source, processed, total in
+                        if Task.isCancelled { return }
+                        let span = (try? await db.analyticsSessionDaySpan(sources: Array(enabledSources))) ?? (nil, nil)
+                        await MainActor.run {
+                            self.analyticsProgressBySource[source] = (processed, total)
+                            self.updateAnalyticsProgress(self.analyticsProgressBySource, enabledSources: enabledSources, dateSpan: span)
+                        }
+                    })
+                    LaunchProfiler.log("Unified: Analytics manual incremental update complete")
                 } else {
-                    LaunchProfiler.log("Unified.refresh: Analytics refresh start")
-                    await indexer.refresh()
-                    LaunchProfiler.log("Unified.refresh: Analytics refresh complete")
+                    LaunchProfiler.log("Unified: Analytics on-demand build start")
+                    await indexer.fullBuild(profile: profile, onSourceComplete: { source in
+                        if Task.isCancelled { return }
+                        try? await db.setAnalyticsBackfillComplete(source: source, version: version)
+                    }, onSourceProgress: { source, processed, total in
+                        if Task.isCancelled { return }
+                        let span = (try? await db.analyticsSessionDaySpan(sources: Array(enabledSources))) ?? (nil, nil)
+                        await MainActor.run {
+                            self.analyticsProgressBySource[source] = (processed, total)
+                            self.updateAnalyticsProgress(self.analyticsProgressBySource, enabledSources: enabledSources, dateSpan: span)
+                        }
+                    })
+                    LaunchProfiler.log("Unified: Analytics on-demand build complete")
+                }
+
+                if Task.isCancelled {
+                    await MainActor.run {
+                        self.analyticsProgressBySource = [:]
+                        self.analyticsPhase = .canceled
+                        self.analyticsBuildTask = nil
+                    }
+                    return
+                }
+
+                await MainActor.run {
+                    self.analyticsProgressBySource = [:]
+                    self.analyticsLastBuiltAt = Date()
+                    UserDefaults.standard.set(self.analyticsLastBuiltAt, forKey: Self.analyticsLastBuiltAtDefaultsKey)
+                    self.analyticsIsStale = false
+                    self.analyticsPhase = .ready
+                    self.analyticsBuildTask = nil
                 }
             } catch {
                 #if DEBUG
-                print("[Indexing] Analytics refresh failed: \(error)")
+                print("[Indexing] Analytics build failed: \(error)")
                 #endif
+                await MainActor.run { [weak self] in
+                    self?.analyticsProgressBySource = [:]
+                    self?.analyticsPhase = .failed
+                    self?.analyticsBuildTask = nil
+                }
             }
         }
     }
@@ -1636,6 +1989,39 @@ final class UnifiedSessionIndexer: ObservableObject {
                 work()
             }
         }
+    }
+
+    static func mergedAggregationResult(from work: SessionAggregationWork) -> SessionAggregationResult {
+        var merged: [Session] = []
+        if work.enablement.codex { merged.append(contentsOf: work.codexList) }
+        if work.enablement.claude { merged.append(contentsOf: work.claudeList) }
+        if work.enablement.gemini { merged.append(contentsOf: work.geminiList) }
+        if work.enablement.openCode { merged.append(contentsOf: work.opencodeList) }
+        if work.enablement.copilot { merged.append(contentsOf: work.copilotList) }
+        if work.enablement.droid { merged.append(contentsOf: work.droidList) }
+        if work.enablement.openClaw { merged.append(contentsOf: work.openclawList) }
+        for index in merged.indices {
+            merged[index].isFavorite = work.favoritesSnapshot.contains(id: merged[index].id, source: merged[index].source)
+        }
+        let sessions = merged.sorted { lhs, rhs in
+            if lhs.modifiedAt == rhs.modifiedAt { return lhs.id > rhs.id }
+            return lhs.modifiedAt > rhs.modifiedAt
+        }
+        return SessionAggregationResult(sessions: sessions, favoritesVersion: work.favoritesVersion)
+    }
+
+    static func mergedSessions(from work: SessionAggregationWork) -> [Session] {
+        mergedAggregationResult(from: work).sessions
+    }
+
+    static func shouldPublishAggregationResult(_ result: SessionAggregationResult,
+                                               currentFavoritesVersion: UInt64) -> Bool {
+        result.favoritesVersion == currentFavoritesVersion
+    }
+
+    private func bumpFavoritesSnapshotVersion() {
+        favoritesSnapshotVersion &+= 1
+        favoritesAggregationVersion.send(favoritesSnapshotVersion)
     }
 
     /// Apply current UI filters and sort preferences to a list of sessions.
@@ -1741,73 +2127,13 @@ final class UnifiedSessionIndexer: ObservableObject {
         }
     }
 
-    // MARK: - Auto-refresh helpers
-    private func withinGuard(_ last: Date?) -> Bool {
-        guard let last else { return false }
-        return Date().timeIntervalSince(last) < 10.0
-    }
-
-    private func maybeAutoRefreshCodex() {
-        if !codexAgentEnabled { return }
-        if codex.isIndexing { return }
-        if withinGuard(lastAutoRefreshCodex) { return }
-        lastAutoRefreshCodex = Date()
-        requestProviderRefresh(source: .codex, reason: "provider-enabled", trigger: .providerEnabled)
-    }
-
-    private func maybeAutoRefreshClaude() {
-        if !claudeAgentEnabled { return }
-        if claude.isIndexing { return }
-        if withinGuard(lastAutoRefreshClaude) { return }
-        lastAutoRefreshClaude = Date()
-        requestProviderRefresh(source: .claude, reason: "provider-enabled", trigger: .providerEnabled)
-    }
-
-    private func maybeAutoRefreshGemini() {
-        if !geminiAgentEnabled { return }
-        if gemini.isIndexing { return }
-        if withinGuard(lastAutoRefreshGemini) { return }
-        lastAutoRefreshGemini = Date()
-        requestProviderRefresh(source: .gemini, reason: "provider-enabled", trigger: .providerEnabled)
-    }
-    private func maybeAutoRefreshOpenCode() {
-        if !openCodeAgentEnabled { return }
-        if opencode.isIndexing { return }
-        if withinGuard(lastAutoRefreshOpenCode) { return }
-        lastAutoRefreshOpenCode = Date()
-        requestProviderRefresh(source: .opencode, reason: "provider-enabled", trigger: .providerEnabled)
-    }
-
-    private func maybeAutoRefreshCopilot() {
-        if !copilotAgentEnabled { return }
-        if copilot.isIndexing { return }
-        if withinGuard(lastAutoRefreshCopilot) { return }
-        lastAutoRefreshCopilot = Date()
-        requestProviderRefresh(source: .copilot, reason: "provider-enabled", trigger: .providerEnabled)
-    }
-
-    private func maybeAutoRefreshDroid() {
-        if !droidAgentEnabled { return }
-        if droid.isIndexing { return }
-        if withinGuard(lastAutoRefreshDroid) { return }
-        lastAutoRefreshDroid = Date()
-        requestProviderRefresh(source: .droid, reason: "provider-enabled", trigger: .providerEnabled)
-    }
-
-    private func maybeAutoRefreshOpenClaw() {
-        if !openClawAgentEnabled { return }
-        if openclaw.isIndexing { return }
-        if withinGuard(lastAutoRefreshOpenClaw) { return }
-        lastAutoRefreshOpenClaw = Date()
-        requestProviderRefresh(source: .openclaw, reason: "provider-enabled", trigger: .providerEnabled)
-    }
-
     // MARK: - Favorites
     func toggleFavorite(_ session: Session) {
         let nowStarred = favorites.toggle(id: session.id, source: session.source)
         if let idx = allSessions.firstIndex(where: { $0.id == session.id && $0.source == session.source }) {
             allSessions[idx].isFavorite = nowStarred
         }
+        bumpFavoritesSnapshotVersion()
 
         let pins = UserDefaults.standard.object(forKey: PreferencesKey.Archives.starPinsSessions) as? Bool ?? true
         if nowStarred, pins {
@@ -1824,6 +2150,7 @@ final class UnifiedSessionIndexer: ObservableObject {
         if let s = allSessions.first(where: { $0.id == id && $0.source == source }) {
             toggleFavorite(s)
         } else {
+            bumpFavoritesSnapshotVersion()
             let nowStarred = favorites.toggle(id: id, source: source)
             if !nowStarred {
                 let removeArchive = UserDefaults.standard.bool(forKey: PreferencesKey.Archives.unstarRemovesArchive)
@@ -1834,8 +2161,12 @@ final class UnifiedSessionIndexer: ObservableObject {
     }
 
     deinit {
+        analyticsBuildTask?.cancel()
         newSessionMonitorTask?.cancel()
         focusedSessionMonitorTask?.cancel()
+        for token in notificationObserverTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
     }
 }
     struct LaunchState {

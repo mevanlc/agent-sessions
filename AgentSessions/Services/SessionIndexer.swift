@@ -2,6 +2,9 @@ import Foundation
 import Combine
 import CryptoKit
 import SwiftUI
+import os.log
+
+private let indexLog = OSLog(subsystem: "com.triada.AgentSessions", category: "CodexIndexing")
 
 enum LaunchPhase: Int, Comparable {
     case idle = 0
@@ -77,6 +80,18 @@ extension SessionIndexerProtocol {
 #endif
 // swiftlint:disable type_body_length
 final class SessionIndexer: ObservableObject {
+    private struct PersistedFileStat: Codable {
+        let mtime: Int64
+        let size: Int64
+    }
+
+    private struct PersistedFileStatPayload: Codable {
+        let version: Int
+        let stats: [String: PersistedFileStat]
+    }
+
+    private static let coreFileStatsStateKey = "core_file_stats_v1:codex"
+
     // Source of truth
     @Published private(set) var allSessions: [Session] = []
     // Exposed to UI after filters
@@ -196,6 +211,7 @@ final class SessionIndexer: ObservableObject {
     private var recomputeDebouncer: DispatchWorkItem? = nil
     private var lastShowSystemProbeSessions: Bool = UserDefaults.standard.bool(forKey: "ShowSystemProbeSessions")
     private var refreshToken = UUID()
+    private let knownFileStatsLock = NSLock()
     private var lastKnownFileStatsByPath: [String: SessionFileStat] = [:]
     private var codexInternalIDBackfillTask: Task<Void, Never>? = nil
     private static let codexInternalIDBackfillCursorKey = "CodexInternalIDBackfillCursor"
@@ -443,7 +459,10 @@ final class SessionIndexer: ObservableObject {
                             cwd: current.lightweightCwd ?? fullSession.cwd,
                             repoName: current.repoName,
                             lightweightTitle: current.lightweightTitle,
-                            lightweightCommands: current.lightweightCommands
+                            lightweightCommands: current.lightweightCommands,
+                            parentSessionID: fullSession.parentSessionID ?? current.parentSessionID,
+                            subagentType: fullSession.subagentType ?? current.subagentType,
+                            customTitle: fullSession.customTitle ?? current.customTitle
                         )
                         var updated = self.allSessions
                         updated[idx] = merged
@@ -655,16 +674,22 @@ final class SessionIndexer: ObservableObject {
             // while we continue scanning incrementally in the background.
             let existingSessions = indexed
             let presentedHydration = !existingSessions.isEmpty
+            self.bootstrapKnownFileStatsIfNeeded(from: existingSessions)
+            // Load thread_name lookup once for the entire refresh cycle.
+            let threadNames = Self.loadCodexThreadNames(sessionsRoot: self.sessionsRoot())
+
             if presentedHydration {
+                // Apply thread_name overrides early so hydrated sessions show renamed titles immediately.
+                var hydratedSessions = existingSessions
+                Self.applyCodexThreadNames(&hydratedSessions, from: threadNames)
                 await MainActor.run {
                     guard self.refreshToken == token else { return }
-                    self.allSessions = SessionArchiveManager.shared.mergePinnedArchiveFallbacks(into: existingSessions, source: .codex)
+                    self.allSessions = SessionArchiveManager.shared.mergePinnedArchiveFallbacks(into: hydratedSessions, source: .codex)
                     self.scheduleCodexInternalSessionIDBackfillIfNeeded(in: self.allSessions)
                     self.totalFiles = existingSessions.count
                     self.filesProcessed = existingSessions.count
-                    self.isIndexing = false
-                    self.progressText = "Ready"
-                    self.launchPhase = .ready
+                    self.progressText = "Scanning for updates…"
+                    self.launchPhase = .scanning
                 }
             }
 
@@ -691,21 +716,46 @@ final class SessionIndexer: ObservableObject {
             }
 
             let discovery = CodexSessionDiscovery(customRoot: self.sessionsRootOverride.isEmpty ? nil : self.sessionsRootOverride)
-            let deltaScope: SessionDeltaScope = (mode == .fullReconcile || trigger == .manual) ? .full : .recent
-            let delta = discovery.discoverDelta(previousByPath: self.lastKnownFileStatsByPath, scope: deltaScope)
+            let deltaScope: SessionDeltaScope = (mode == .fullReconcile || trigger == .manual || trigger == .launch) ? .full : .recent
+            let previousStats = self.knownFileStatsSnapshot()
+            let delta = discovery.discoverDelta(previousByPath: previousStats, scope: deltaScope)
             let found = delta.currentByPath.keys.map { URL(fileURLWithPath: $0) }
             let foundIsEmpty = found.isEmpty
             let currentStatsByPath = delta.currentByPath
             let removedPaths = delta.removedPaths
+            let existingSessionPaths = Set(existingSessions.map(\.filePath))
             let changedOrNewFiles: [URL]
+            let missingHydratedCount: Int
             switch mode {
             case .fullReconcile:
                 changedOrNewFiles = found
+                missingHydratedCount = 0
             case .incremental:
-                changedOrNewFiles = delta.changedFiles
+                var combined = delta.changedFiles
+                // Supplement: force-parse files on disk but missing from hydrated snapshot.
+                // Uses set-difference to detect the exact gap rather than count comparison.
+                let diskPaths = Set(currentStatsByPath.keys)
+                let changedPaths = Set(delta.changedFiles.map(\.path))
+                let gapPaths = diskPaths
+                    .subtracting(existingSessionPaths)
+                    .subtracting(changedPaths)
+                if !gapPaths.isEmpty {
+                    combined.append(contentsOf: gapPaths.sorted().map { URL(fileURLWithPath: $0) })
+                }
+                missingHydratedCount = gapPaths.count
+                var seenPaths: Set<String> = []
+                changedOrNewFiles = combined.filter { seenPaths.insert($0.path).inserted }
             }
 
             DBG("📁 Found \(found.count) total files, \(changedOrNewFiles.count) changed/new, \(removedPaths.count) removed")
+            os_log("Codex.refresh: found=%d changed=%d gap=%d hydrated=%d removed=%d scope=%{public}@",
+                   log: indexLog, type: .info,
+                   found.count, delta.changedFiles.count, missingHydratedCount,
+                   existingSessions.count, removedPaths.count,
+                   deltaScope == .full ? "full" : "recent")
+            if missingHydratedCount > 0 {
+                LaunchProfiler.log("Codex.refresh: forcing parse for \(missingHydratedCount) files missing from hydrated session snapshot")
+            }
             LaunchProfiler.log("Codex.refresh: file enumeration done (found=\(found.count), changed=\(changedOrNewFiles.count), removed=\(removedPaths.count))")
 
             let sortedFiles = changedOrNewFiles.sorted { ($0.lastPathComponent) > ($1.lastPathComponent) }
@@ -731,15 +781,14 @@ final class SessionIndexer: ObservableObject {
                 sliceSize: executionProfile.sliceSize,
                 interSliceYieldNanoseconds: executionProfile.interSliceYieldNanoseconds,
                 onProgress: { processed, total in
-                    guard !presentedHydration else { return }
                     guard self.refreshToken == token else { return }
                     DispatchQueue.main.async {
                         Task { @MainActor in
                             await Task.yield()
                             guard self.refreshToken == token else { return }
-                            self.filesProcessed = processed
+                            self.filesProcessed = existingSessions.count + processed
                             if processed > 0 {
-                                self.progressText = "Indexed \(processed)/\(total)"
+                                self.progressText = "Indexed \(self.filesProcessed)/\(self.totalFiles)"
                             }
                         }
                     }
@@ -780,7 +829,11 @@ final class SessionIndexer: ObservableObject {
                         repoName: nil,
                         lightweightTitle: session.lightweightTitle ?? existing.lightweightTitle,
                         lightweightCommands: session.lightweightCommands ?? existing.lightweightCommands,
-                        isHousekeeping: existing.isHousekeeping
+                        isHousekeeping: existing.isHousekeeping,
+                        codexInternalSessionIDHint: session.codexInternalSessionIDHint ?? existing.codexInternalSessionIDHint,
+                        parentSessionID: session.parentSessionID ?? existing.parentSessionID,
+                        subagentType: session.subagentType ?? existing.subagentType,
+                        customTitle: session.customTitle ?? existing.customTitle
                     )
                     mergedByPath[session.filePath] = merged
                 } else {
@@ -790,23 +843,35 @@ final class SessionIndexer: ObservableObject {
             let fmExists: (Session) -> Bool = { s in
                 FileManager.default.fileExists(atPath: s.filePath)
             }
-            let allParsedSessions = Array(mergedByPath.values).filter(fmExists)
+            var allParsedSessions = Array(mergedByPath.values).filter(fmExists)
+
+            // Reuse thread_name lookup loaded earlier in this refresh cycle.
+            Self.applyCodexThreadNames(&allParsedSessions, from: threadNames)
+
             let hideProbes = !(UserDefaults.standard.bool(forKey: "ShowSystemProbeSessions"))
             let sortedSessions = allParsedSessions.sorted { $0.modifiedAt > $1.modifiedAt }
                 .filter { hideProbes ? !CodexProbeConfig.isProbeSession($0) : true }
             let mergedWithArchives = SessionArchiveManager.shared.mergePinnedArchiveFallbacks(into: sortedSessions, source: .codex)
-            if deltaScope == .full {
-                self.lastKnownFileStatsByPath = currentStatsByPath
-            } else {
-                for removed in removedPaths {
-                    self.lastKnownFileStatsByPath.removeValue(forKey: removed)
-                }
-                for (path, stat) in currentStatsByPath {
-                    self.lastKnownFileStatsByPath[path] = stat
+            self.applyKnownFileStatsDelta(scope: deltaScope, currentStatsByPath: currentStatsByPath, removedPaths: removedPaths)
+            await self.persistKnownFileStats()
+
+            // Persist lightweight session_meta so subsequent hydration is complete.
+            // Excludes probe sessions to match analytics policy.
+            let sessionsForMeta = allParsedSessions.filter { !CodexProbeConfig.isProbeSession($0) }
+            if !sessionsForMeta.isEmpty {
+                do {
+                    let db = try IndexDB()
+                    try await db.begin()
+                    for session in sessionsForMeta {
+                        try? await db.upsertSessionMetaCore(Self.sessionMetaRow(from: session))
+                    }
+                    try await db.commit()
+                    os_log("Codex: wrote %d session_meta rows", log: indexLog, type: .info, sessionsForMeta.count)
+                } catch {
+                    os_log("Codex: session_meta write failed: %{public}@", log: indexLog, type: .error, error.localizedDescription)
+                    // Non-fatal: hydration gap will persist until next successful write.
                 }
             }
-            self.scheduleAnalyticsDelta(changedFiles: sortedFiles, removedPaths: removedPaths, executionProfile: executionProfile)
-
             await MainActor.run {
                 guard self.refreshToken == token else { return }
                 LaunchProfiler.log("Codex.refresh: sessions merged (total=\(mergedWithArchives.count))")
@@ -948,19 +1013,43 @@ final class SessionIndexer: ObservableObject {
     }
 
     private func seedKnownFileStatsIfNeeded() async {
-        if !lastKnownFileStatsByPath.isEmpty { return }
+        if hasKnownFileStats() { return }
         do {
-            let db = try IndexDB()
-            let indexed = try await db.fetchIndexedFiles(for: SessionSource.codex.rawValue)
-            var map: [String: SessionFileStat] = [:]
-            map.reserveCapacity(indexed.count)
-            for row in indexed {
-                map[row.path] = SessionFileStat(mtime: row.mtime, size: row.size)
+            if let persisted = try await loadPersistedKnownFileStats() {
+                initializeKnownFileStatsIfNeeded(persisted)
+                os_log("Codex: seeded file stats from persisted baseline (%d entries)", log: indexLog, type: .info, persisted.count)
+                #if DEBUG
+                LaunchProfiler.log("Codex.refresh: known file stats loaded from persisted core baseline (\(persisted.count))")
+                #endif
+                return
             }
-            lastKnownFileStatsByPath = map
         } catch {
-            // Non-fatal. We'll build cache from filesystem deltas after this pass.
+            os_log("Codex: seedKnownFileStats failed: %{public}@", log: indexLog, type: .error, error.localizedDescription)
+            // Non-fatal. We'll bootstrap from hydrated sessions or runtime deltas.
         }
+    }
+
+    static func sessionMetaRow(from s: Session) -> SessionMetaRow {
+        SessionMetaRow(
+            sessionID: s.id,
+            source: s.source.rawValue,
+            path: s.filePath,
+            mtime: Int64(s.modifiedAt.timeIntervalSince1970),
+            size: Int64(s.fileSizeBytes ?? 0),
+            startTS: Int64((s.startTime ?? s.modifiedAt).timeIntervalSince1970),
+            endTS: Int64((s.endTime ?? s.modifiedAt).timeIntervalSince1970),
+            model: s.model,
+            cwd: s.lightweightCwd,
+            repo: s.repoName,
+            title: s.lightweightTitle,
+            codexInternalSessionID: s.codexInternalSessionIDHint,
+            isHousekeeping: s.isHousekeeping,
+            messages: s.eventCount,
+            commands: s.lightweightCommands ?? 0,
+            parentSessionID: s.parentSessionID,
+            subagentType: s.subagentType,
+            customTitle: s.customTitle
+        )
     }
 
     private static func fileStat(for url: URL) -> SessionFileStat? {
@@ -971,25 +1060,114 @@ final class SessionIndexer: ObservableObject {
         return SessionFileStat(mtime: mtime, size: size)
     }
 
-    private func scheduleAnalyticsDelta(changedFiles: [URL],
-                                        removedPaths: [String],
-                                        executionProfile: IndexRefreshExecutionProfile) {
-        guard !(changedFiles.isEmpty && removedPaths.isEmpty) else { return }
-        let delay = executionProfile.deferNonCriticalWork ? UInt64(500_000_000) : UInt64(120_000_000)
-        Task.detached(priority: .utility) {
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-            do {
-                let db = try IndexDB()
-                let indexer = AnalyticsIndexer(db: db, enabledSources: [SessionSource.codex.rawValue])
-                await indexer.refreshDelta(source: SessionSource.codex.rawValue,
-                                           changed: changedFiles,
-                                           removedPaths: removedPaths)
-            } catch {
-                // Non-fatal: analytics delta indexing is best-effort.
+    static func additionalChangedFilesForMissingHydratedSessions(
+        currentByPath: [String: SessionFileStat],
+        existingSessionPaths: Set<String>,
+        changedFiles: [URL]
+    ) -> [URL] {
+        let changedPaths = Set(changedFiles.map(\.path))
+        var missing: [URL] = []
+        missing.reserveCapacity(currentByPath.count)
+        for path in currentByPath.keys {
+            if existingSessionPaths.contains(path) { continue }
+            if changedPaths.contains(path) { continue }
+            missing.append(URL(fileURLWithPath: path))
+        }
+        return missing.sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+
+    private func bootstrapKnownFileStatsIfNeeded(from sessions: [Session]) {
+        if hasKnownFileStats() { return }
+        guard !sessions.isEmpty else { return }
+        var map: [String: SessionFileStat] = [:]
+        map.reserveCapacity(sessions.count)
+        for session in sessions {
+            let url = URL(fileURLWithPath: session.filePath)
+            if let stat = Self.fileStat(for: url) {
+                map[session.filePath] = stat
+            } else {
+                let size = Int64(max(0, session.fileSizeBytes ?? 0))
+                let mtime = Int64(max(0, session.modifiedAt.timeIntervalSince1970))
+                map[session.filePath] = SessionFileStat(mtime: mtime, size: size)
             }
         }
+        initializeKnownFileStatsIfNeeded(map)
+        #if DEBUG
+        LaunchProfiler.log("Codex.refresh: known file stats bootstrapped from hydrated sessions (\(map.count))")
+        #endif
+    }
+
+    private func persistKnownFileStats() async {
+        let snapshot = knownFileStatsSnapshot()
+        guard !snapshot.isEmpty else { return }
+        do {
+            let payload = PersistedFileStatPayload(
+                version: 1,
+                stats: snapshot.reduce(into: [:]) { partial, entry in
+                    partial[entry.key] = PersistedFileStat(mtime: entry.value.mtime, size: entry.value.size)
+                }
+            )
+            let data = try JSONEncoder().encode(payload)
+            guard let json = String(data: data, encoding: .utf8) else { return }
+            let db = try IndexDB()
+            try await db.setIndexState(key: Self.coreFileStatsStateKey, value: json)
+        } catch {
+            // Non-fatal. Next run can still bootstrap from DB/filesystem.
+        }
+    }
+
+    private func loadPersistedKnownFileStats() async throws -> [String: SessionFileStat]? {
+        let db = try IndexDB()
+        guard let raw = try await db.indexStateValue(for: Self.coreFileStatsStateKey),
+              let data = raw.data(using: .utf8) else {
+            return nil
+        }
+        let payload = try JSONDecoder().decode(PersistedFileStatPayload.self, from: data)
+        guard payload.version == 1 else { return nil }
+        let map = payload.stats.reduce(into: [String: SessionFileStat]()) { partial, entry in
+            partial[entry.key] = SessionFileStat(mtime: entry.value.mtime, size: entry.value.size)
+        }
+        return map.isEmpty ? nil : map
+    }
+
+    private func hasKnownFileStats() -> Bool {
+        knownFileStatsLock.lock()
+        let hasStats = !lastKnownFileStatsByPath.isEmpty
+        knownFileStatsLock.unlock()
+        return hasStats
+    }
+
+    private func initializeKnownFileStatsIfNeeded(_ stats: [String: SessionFileStat]) {
+        knownFileStatsLock.lock()
+        if lastKnownFileStatsByPath.isEmpty {
+            lastKnownFileStatsByPath = stats
+        }
+        knownFileStatsLock.unlock()
+    }
+
+    private func knownFileStatsSnapshot() -> [String: SessionFileStat] {
+        knownFileStatsLock.lock()
+        let snapshot = lastKnownFileStatsByPath
+        knownFileStatsLock.unlock()
+        return snapshot
+    }
+
+    private func applyKnownFileStatsDelta(scope: SessionDeltaScope,
+                                          currentStatsByPath: [String: SessionFileStat],
+                                          removedPaths: [String]) {
+        knownFileStatsLock.lock()
+        if scope == .full {
+            lastKnownFileStatsByPath = currentStatsByPath
+            knownFileStatsLock.unlock()
+            return
+        }
+        for removed in removedPaths {
+            lastKnownFileStatsByPath.removeValue(forKey: removed)
+        }
+        for (path, stat) in currentStatsByPath {
+            lastKnownFileStatsByPath[path] = stat
+        }
+        knownFileStatsLock.unlock()
     }
 
 	    private func hydrateFromIndexDBIfAvailable() async throws -> [Session]? {
@@ -1111,11 +1289,206 @@ final class SessionIndexer: ObservableObject {
                 lightweightTitle: session.lightweightTitle,
                 lightweightCommands: session.lightweightCommands,
                 isHousekeeping: session.isHousekeeping,
-                codexInternalSessionIDHint: internalID
+                codexInternalSessionIDHint: internalID,
+                parentSessionID: session.parentSessionID,
+                subagentType: session.subagentType,
+                customTitle: session.customTitle
             )
             var enriched = rebuilt
             enriched.isFavorite = session.isFavorite
             return enriched
+        }
+    }
+
+    // MARK: - Codex thread_name side-channel
+
+    /// Read budget: max bytes of `session_index.jsonl` to load per refresh (2 MB).
+    /// For files exceeding this, we read the tail so recent renames are never lost.
+    private static let threadNameReadBudget = 2 * 1024 * 1024
+
+    /// Bounded fingerprint segments to detect updates that preserve size/mtime metadata.
+    private static let threadNameFingerprintSegmentBytes = 8 * 1024
+    /// Force periodic re-parse so unchanged metadata/fingerprint does not live forever.
+    private static let threadNameCacheMaxAge: TimeInterval = 120
+
+    /// Lock-protected cache for parsed thread names, invalidated by path+mtime+size+fingerprint+age.
+    private static let threadNameCacheLock = NSLock()
+    private static var _threadNameCache: (
+        path: String,
+        mtime: Date,
+        size: Int,
+        fingerprint: UInt64,
+        loadedAt: Date,
+        lookup: [String: String]
+    )?
+
+    private static func fnv1a64(_ data: Data, seed: UInt64 = 0xcbf29ce484222325) -> UInt64 {
+        var hash = seed
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return hash
+    }
+
+    /// Returns `~/.codex/session_index.jsonl` only for verified `.../sessions` layouts.
+    /// For non-standard roots (for example imported snapshots), side-channel overrides are disabled.
+    private static func codexThreadNameIndexURL(sessionsRoot: URL) -> URL? {
+        guard sessionsRoot.lastPathComponent == "sessions" else {
+            os_log("Codex thread_name side-channel disabled for non-standard sessions root: %{public}@",
+                   log: indexLog, type: .info, sessionsRoot.path)
+            return nil
+        }
+        return sessionsRoot.deletingLastPathComponent().appendingPathComponent("session_index.jsonl")
+    }
+
+    /// Reads a small head+tail sample to detect same-size updates even on coarse mtime filesystems.
+    private static func computeThreadNameFingerprint(fileHandle: FileHandle, size: Int) -> UInt64 {
+        let boundedSize = max(0, size)
+        let segmentBytes = max(1, threadNameFingerprintSegmentBytes)
+        let segmentCount = min(boundedSize, segmentBytes)
+        var hash = fnv1a64(Data("\(boundedSize)".utf8))
+
+        do {
+            try fileHandle.seek(toOffset: 0)
+            let head = try fileHandle.read(upToCount: segmentCount) ?? Data()
+            hash = fnv1a64(head, seed: hash)
+
+            if boundedSize > segmentCount {
+                let tailOffset = UInt64(boundedSize - segmentCount)
+                try fileHandle.seek(toOffset: tailOffset)
+                let tail = try fileHandle.read(upToCount: segmentCount) ?? Data()
+                hash = fnv1a64(tail, seed: hash)
+            }
+        } catch {
+            // Leave hash as size-only fallback when sampling fails.
+        }
+
+        return hash
+    }
+
+    /// Reads `~/.codex/session_index.jsonl` and returns a lookup from internal session UUID to user-set thread name.
+    /// - Cached by (path, mtime, size, fingerprint) with max age fallback; safe for multi-root and root-switching scenarios.
+    /// - For files larger than `threadNameReadBudget`, reads the **tail** so recent appended renames are captured.
+    /// - Returns empty on any read failure — never serves stale data from a prior cycle.
+    static func loadCodexThreadNames(sessionsRoot: URL) -> [String: String] {
+        guard let indexFile = codexThreadNameIndexURL(sessionsRoot: sessionsRoot) else { return [:] }
+        let filePath = indexFile.path
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: filePath)) ?? [:]
+        guard let mtime = attrs[.modificationDate] as? Date,
+              let size = (attrs[.size] as? NSNumber)?.intValue else {
+            return [:]
+        }
+        guard let fh = try? FileHandle(forReadingFrom: indexFile) else { return [:] }
+        defer { try? fh.close() }
+
+        let fingerprint = computeThreadNameFingerprint(fileHandle: fh, size: size)
+
+        // Return cached result if file hasn't changed and cache age is within guard rails.
+        let now = Date()
+        threadNameCacheLock.lock()
+        let cached = _threadNameCache
+        threadNameCacheLock.unlock()
+        if let cached,
+           cached.path == filePath,
+           cached.mtime == mtime,
+           cached.size == size,
+           cached.fingerprint == fingerprint,
+           now.timeIntervalSince(cached.loadedAt) <= threadNameCacheMaxAge {
+            return cached.lookup
+        }
+        // For files within budget, read everything. For larger files, read the tail
+        // so recently appended renames (which are at the end) are always captured.
+        let data: Data
+        let skipFirstLine: Bool
+        if size <= threadNameReadBudget {
+            try? fh.seek(toOffset: 0)
+            guard let d = try? fh.read(upToCount: size) else { return [:] }
+            data = d
+            skipFirstLine = false
+        } else {
+            let tailOffset = UInt64(size - threadNameReadBudget)
+            var shouldSkipFirstLine = true
+            if tailOffset > 0 {
+                try? fh.seek(toOffset: tailOffset - 1)
+                if let previousByteData = (try? fh.read(upToCount: 1)) ?? nil,
+                   previousByteData.first == UInt8(ascii: "\n") {
+                    // Offset lands on a line boundary: first tail line is complete.
+                    shouldSkipFirstLine = false
+                }
+            }
+            try? fh.seek(toOffset: tailOffset)
+            guard let d = try? fh.read(upToCount: threadNameReadBudget) else { return [:] }
+            data = d
+            skipFirstLine = shouldSkipFirstLine
+        }
+        var lookup: [String: String] = [:]
+        var skippedFirstLine = skipFirstLine
+        data.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            let bytes = UnsafeBufferPointer(start: base, count: buffer.count)
+            var lineStart = bytes.startIndex
+            while lineStart < bytes.endIndex {
+                var lineEnd = lineStart
+                while lineEnd < bytes.endIndex && bytes[lineEnd] != UInt8(ascii: "\n") { lineEnd += 1 }
+                defer { lineStart = lineEnd + 1 }
+                // When reading from a tail offset, the first "line" is likely a partial — skip it.
+                if skippedFirstLine {
+                    skippedFirstLine = false
+                    continue
+                }
+                guard lineEnd > lineStart,
+                      let lineData = String(bytes: bytes[lineStart..<lineEnd], encoding: .utf8)?.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                      let id = obj["id"] as? String, !id.isEmpty,
+                      let name = obj["thread_name"] as? String, !name.isEmpty else { continue }
+                lookup[id] = name
+            }
+        }
+        threadNameCacheLock.lock()
+        _threadNameCache = (
+            path: filePath,
+            mtime: mtime,
+            size: size,
+            fingerprint: fingerprint,
+            loadedAt: now,
+            lookup: lookup
+        )
+        threadNameCacheLock.unlock()
+        return lookup
+    }
+
+    /// Applies thread_name overrides from session_index.jsonl as customTitle on matching sessions.
+    /// Overwrites existing customTitle when the lookup value differs, so re-renames propagate.
+    static func applyCodexThreadNames(_ sessions: inout [Session], from lookup: [String: String]) {
+        guard !lookup.isEmpty else { return }
+        for i in sessions.indices {
+            guard let hint = sessions[i].codexInternalSessionIDHint,
+                  let name = lookup[hint],
+                  sessions[i].customTitle != name else { continue }
+            let wasFavorite = sessions[i].isFavorite
+            var rebuilt = Session(
+                id: sessions[i].id,
+                source: sessions[i].source,
+                startTime: sessions[i].startTime,
+                endTime: sessions[i].endTime,
+                model: sessions[i].model,
+                filePath: sessions[i].filePath,
+                fileSizeBytes: sessions[i].fileSizeBytes,
+                eventCount: sessions[i].eventCount,
+                events: sessions[i].events,
+                cwd: sessions[i].lightweightCwd,
+                repoName: sessions[i].lightweightRepoName,
+                lightweightTitle: sessions[i].lightweightTitle,
+                lightweightCommands: sessions[i].lightweightCommands,
+                isHousekeeping: sessions[i].isHousekeeping,
+                codexInternalSessionIDHint: hint,
+                parentSessionID: sessions[i].parentSessionID,
+                subagentType: sessions[i].subagentType,
+                customTitle: name
+            )
+            rebuilt.isFavorite = wasFavorite
+            sessions[i] = rebuilt
         }
     }
 
@@ -1149,6 +1522,8 @@ final class SessionIndexer: ObservableObject {
         let reader = JSONLReader(url: url)
         var events: [SessionEvent] = []
         var modelSeen: String? = nil
+        var parentSessionID: String? = nil
+        var subagentType: String? = nil
         var idx = 0
         DBG("    📖 parseFileFull: Starting forEachLine...")
         do {
@@ -1158,6 +1533,33 @@ final class SessionIndexer: ObservableObject {
                 let safeLine = rawLine.utf8.count > 100_000 ? Self.sanitizeLargeLine(rawLine) : rawLine
                 let (event, maybeModel) = Self.parseLine(safeLine, eventID: self.eventID(for: url, index: idx))
                 if let m = maybeModel, modelSeen == nil { modelSeen = m }
+
+                // Extract subagent info and turn_context model from early lines
+                if idx <= 20, let data = safeLine.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let objType = obj["type"] as? String
+                    let payload = obj["payload"] as? [String: Any]
+
+                    if parentSessionID == nil, objType == "session_meta", let payload {
+                        if let source = payload["source"],
+                           let sourceDict = source as? [String: Any],
+                           let subagentInfo = sourceDict["subagent"] {
+                            if let subStr = subagentInfo as? String {
+                                subagentType = subStr
+                            } else if let subDict = subagentInfo as? [String: Any],
+                                      let threadSpawn = subDict["thread_spawn"] as? [String: Any] {
+                                parentSessionID = threadSpawn["parent_thread_id"] as? String
+                                subagentType = threadSpawn["agent_role"] as? String
+                            }
+                        }
+                    }
+
+                    if objType == "turn_context", let payload,
+                       let turnModel = payload["model"] as? String, !turnModel.isEmpty {
+                        modelSeen = turnModel
+                    }
+                }
+
                 events.append(event)
             }
         } catch {
@@ -1189,7 +1591,9 @@ final class SessionIndexer: ObservableObject {
                               eventCount: nonMetaCount,
                               events: events,
                               isHousekeeping: isHousekeeping,
-                              codexInternalSessionIDHint: internalSessionIDHint)
+                              codexInternalSessionIDHint: internalSessionIDHint,
+                              parentSessionID: parentSessionID,
+                              subagentType: subagentType)
 
         if size > 5_000_000 {  // Log full parse of files >5MB
             DBG("  ⚠️ FULL PARSE: \(url.lastPathComponent) size=\(size/1_000_000)MB events=\(events.count) nonMeta=\(session.nonMetaCount)")
@@ -1277,6 +1681,8 @@ final class SessionIndexer: ObservableObject {
         var sampleCount = 0
         var sampleEvents: [SessionEvent] = []
         var cwd: String? = nil
+        var parentSessionID: String? = nil
+        var subagentType: String? = nil
 
         func ingest(_ raw: String) {
             let line = sanitizeCodexHugeFields(sanitizeImagePayload(raw))
@@ -1286,20 +1692,52 @@ final class SessionIndexer: ObservableObject {
                 if tmax == nil || ts > tmax! { tmax = ts }
             }
             if model == nil, let m = maybeModel, !m.isEmpty { model = m }
-            // Extract cwd from session_meta or environment_context
-            if cwd == nil {
-                if let text = ev.text, text.contains("<cwd>") {
-                    if let start = text.range(of: "<cwd>"),
-                       let end = text.range(of: "</cwd>", range: start.upperBound..<text.endIndex) {
-                        cwd = String(text[start.upperBound..<end.lowerBound])
-                    }
-                } else if let data = line.data(using: .utf8),
-                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    if let payload = obj["payload"] as? [String: Any], let cwdValue = payload["cwd"] as? String, !cwdValue.isEmpty {
-                        cwd = cwdValue
+            // Extract cwd, subagent info, and turn_context model from raw JSON
+            if let data = line.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let objType = obj["type"] as? String
+                let payload = obj["payload"] as? [String: Any]
+
+                // Extract cwd from session_meta or environment_context
+                if cwd == nil {
+                    if let text = ev.text, text.contains("<cwd>") {
+                        if let start = text.range(of: "<cwd>"),
+                           let end = text.range(of: "</cwd>", range: start.upperBound..<text.endIndex) {
+                            cwd = String(text[start.upperBound..<end.lowerBound])
+                        }
+                    } else if let payload {
+                        if let cwdValue = payload["cwd"] as? String, !cwdValue.isEmpty { cwd = cwdValue }
                     } else if let cwdValue = obj["cwd"] as? String, !cwdValue.isEmpty {
                         cwd = cwdValue
                     }
+                }
+
+                // Codex session_meta: detect subagent source
+                if parentSessionID == nil, objType == "session_meta", let payload {
+                    if let source = payload["source"] {
+                        if let sourceDict = source as? [String: Any],
+                           let subagentInfo = sourceDict["subagent"] {
+                            if let subStr = subagentInfo as? String {
+                                // e.g. "review" — no parent thread ID available
+                                subagentType = subStr
+                            } else if let subDict = subagentInfo as? [String: Any],
+                                      let threadSpawn = subDict["thread_spawn"] as? [String: Any] {
+                                parentSessionID = threadSpawn["parent_thread_id"] as? String
+                                subagentType = threadSpawn["agent_role"] as? String
+                            }
+                        }
+                    }
+                }
+
+                // Codex turn_context: extract actual LLM model
+                if objType == "turn_context", let payload,
+                   let turnModel = payload["model"] as? String, !turnModel.isEmpty {
+                    model = turnModel
+                }
+            } else if cwd == nil, let text = ev.text, text.contains("<cwd>") {
+                if let start = text.range(of: "<cwd>"),
+                   let end = text.range(of: "</cwd>", range: start.upperBound..<text.endIndex) {
+                    cwd = String(text[start.upperBound..<end.lowerBound])
                 }
             }
             sampleEvents.append(ev)
@@ -1331,7 +1769,9 @@ final class SessionIndexer: ObservableObject {
                                   eventCount: estEvents,
                                   events: sampleEvents,
                                   isHousekeeping: tempIsHousekeeping,
-                                  codexInternalSessionIDHint: internalSessionIDHint)
+                                  codexInternalSessionIDHint: internalSessionIDHint,
+                                  parentSessionID: parentSessionID,
+                                  subagentType: subagentType)
 
         // Extract title from sample events using existing logic
         let title = tempSession.codexPreviewTitle ?? tempSession.title
@@ -1350,7 +1790,10 @@ final class SessionIndexer: ObservableObject {
                               repoName: nil,  // Will be computed from cwd
                               lightweightTitle: title,
                               isHousekeeping: tempIsHousekeeping || title == "No prompt",
-                              codexInternalSessionIDHint: internalSessionIDHint)
+                              codexInternalSessionIDHint: internalSessionIDHint,
+                              parentSessionID: parentSessionID,
+                              subagentType: subagentType,
+                              customTitle: tempSession.customTitle)
         return session
     }
 

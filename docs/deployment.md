@@ -7,6 +7,19 @@ This runbook provides a **fully automated deployment process** with comprehensiv
 
 ## One-screen cheat sheet
 
+**Recommended first step**:
+- Run the pre-release QA checklist: `docs/release/pre-release-qa.md`
+
+**Workspace rule (mandatory)**:
+- Deploy only from the user’s current local repository checkout.
+- Do not use temporary clones or alternate worktrees to bypass a dirty tree.
+- If `git status --short` is not clean, stop and ask the user to clean/stash/commit before any deploy command.
+
+**Version format rule**:
+- Major and minor releases use `X.Y` (for example `3.1`).
+- Patch releases use `X.Y.Z` (for example `3.1.1`).
+- Never publish `X.Y.0`.
+
 **Core commands** (run from repo root):
 - `tools/release/deploy changelog [FROM_TAG]`
 - `tools/release/deploy bump [patch|minor|major]`
@@ -38,6 +51,9 @@ The entire deployment workflow is now handled by a single unified tool: `tools/r
 ### Typical Release Workflow
 
 ```bash
+# 0. Run recommended pre-release QA checklist first
+# docs/release/pre-release-qa.md
+
 # 1. Review what changed since last release
 tools/release/deploy changelog
 
@@ -48,10 +64,10 @@ tools/release/deploy bump minor
 git push origin main
 
 # 4. Deploy the release
-tools/release/deploy release 2.8.0
+tools/release/deploy release 2.8
 
 # 5. Verify deployment (runs automatically, but can re-run)
-tools/release/deploy verify 2.8.0
+tools/release/deploy verify 2.8
 ```
 
 ### Quick Patch Release
@@ -165,6 +181,10 @@ Before building, the system validates:
 
 **Benefit**: Catches errors before the 10-minute build/notarize cycle
 
+Agent behavior requirement:
+- If git state is dirty, do not workaround with a separate clone/worktree.
+- Stop and request local cleanup in the same repository, then continue deployment there.
+
 ### 3. Pre-Deployment Smoke Testing (NEW!)
 After DMG creation, before upload:
 - ✅ **DMG verification**: Validates structure with `hdiutil verify`
@@ -185,7 +205,7 @@ All network operations retry automatically (3 attempts, 5s backoff):
 
 ### 5. Improved Cache Propagation Waits
 Smart timeout-based waiting instead of hardcoded loops:
-- **GitHub Pages**: Waits up to 120s for appcast.xml to be live
+- **GitHub Pages**: Waits up to 120s for the exact target appcast item and DMG URL to be live, not just any matching version text
 - **Homebrew cask**: Waits up to 40s for cask version to propagate
 - Shows elapsed time when cache propagates
 - Non-blocking warnings if timeout exceeded
@@ -226,7 +246,7 @@ All operations log to timestamped files:
 - Format: `/tmp/<subcommand>-<VERSION>-<timestamp>.log`
 - Includes ISO timestamps and severity levels
 - Captures all output for debugging
-- Example: `/tmp/release-2.8.0-1732652300.log`
+- Example: `/tmp/release-2.8-1732652300.log`
 
 **Benefit**: Easy to debug failed deployments, share logs with team
 
@@ -258,6 +278,10 @@ Generate CHANGELOG entries from conventional commits:
 ## Pre-flight Checklist (Mostly Automated Now)
 
 Complete this checklist **before** running the deployment script. Answer all questions and verify all conditions.
+
+### 0. Recommended QA Gate
+- [ ] Run `docs/release/pre-release-qa.md` for the release candidate.
+- [ ] Record outcome (`GO` / `NO-GO`) and unresolved known risks (if any).
 
 ### 1. Version Planning
 - [ ] What version are you releasing? (e.g., 2.5.1)
@@ -397,15 +421,18 @@ gh release view v{VERSION} --json name,assets | jq '.assets[] | .name'
 # Expected: AgentSessions-{VERSION}.dmg and AgentSessions-{VERSION}.dmg.sha256
 
 # 2. Verify Sparkle appcast.xml published on GitHub Pages
-curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | grep -E "(sparkle:version|sparkle:edSignature|enclosure url)"
-# Expected:
-#   <sparkle:version>1</sparkle:version>
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | \
+  awk 'BEGIN { RS="</item>"; ORS="</item>\n" } index($0, "<sparkle:shortVersionString>{VERSION}</sparkle:shortVersionString>")'
+# Expected: the item for {VERSION} is present and includes:
+#   <sparkle:version>{BUILD}</sparkle:version>
 #   <sparkle:shortVersionString>{VERSION}</sparkle:shortVersionString>
 #   <enclosure url="https://github.com/jazzyalex/agent-sessions/releases/download/v{VERSION}/AgentSessions-{VERSION}.dmg" ... sparkle:edSignature="..."/>
 
-# 3. Verify `<description>` (release notes) is present for the latest item
-curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | grep -A2 "<title>2.5.1" | grep -n "<description>"
-# Expected: a `<description><![CDATA[` block immediately after `<pubDate>`
+# 3. Verify `<description>` (release notes) is present for the target item
+curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | \
+  awk 'BEGIN { RS="</item>"; ORS="</item>\n" } index($0, "<sparkle:shortVersionString>{VERSION}</sparkle:shortVersionString>")' | \
+  grep -n "<description"
+# Expected: a `<description><![CDATA[` block inside the {VERSION} item
 
 # 4. Verify EdDSA signature is present in appcast
 curl -s https://jazzyalex.github.io/agent-sessions/appcast.xml | grep "sparkle:edSignature" | wc -l
@@ -541,10 +568,10 @@ xcrun notarytool submit dist/AgentSessions-{VERSION}.dmg --keychain-profile Agen
 
 ## Docs sanity check (for agents)
 
-Before changing deployment scripts, do a quick paper dry run using a fake version (for example, 2.9.0):
+Before changing deployment scripts, do a quick paper dry run using a fake version (for example, 2.9):
 - Walk through the cheat sheet commands and confirm each one is documented with required flags and environment variables.
 - Verify that `docs/deployment.md` and `.claude/skills/deploy.md` reference the same entrypoints (`tools/release/deploy`).
-- Treat this as a documentation validation step only; do not actually tag or publish 2.9.0.
+- Treat this as a documentation validation step only; do not actually tag or publish 2.9.
 
 ### Sparkle EdDSA signature errors
 

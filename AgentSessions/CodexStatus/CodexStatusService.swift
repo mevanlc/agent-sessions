@@ -39,11 +39,10 @@ import IOKit.ps
 // - CodexUsageSnapshot.weekRemainingPercent: Stores "% remaining"
 // - UI displays use helper methods to convert between used/remaining as needed
 //
-// TODO (Future Work - Quota Tracking):
-// - Add absolute quota tracking (e.g., "127 of 500 requests remaining")
-// - Implement "buy credits" feature detection and UI
-// - Support mobile subscription quota display
-// - See original plan step 7 for detailed requirements
+// Future Work — Quota Tracking:
+// - Absolute quota tracking (e.g., "127 of 500 requests remaining")
+// - "Buy credits" feature detection and UI
+// - Mobile subscription quota display
 //
 // ## Staleness Semantics
 //
@@ -73,8 +72,13 @@ import IOKit.ps
 struct CodexUsageSnapshot: Equatable {
     var fiveHourRemainingPercent: Int = 0
     var fiveHourResetText: String = ""
+    var hasFiveHourRateLimit: Bool = false
+    var fiveHourLimitsSource: CodexLimitsSource? = nil
     var weekRemainingPercent: Int = 0
     var weekResetText: String = ""
+    var hasWeekRateLimit: Bool = false
+    var weekLimitsSource: CodexLimitsSource? = nil
+    var limitsSource: CodexLimitsSource? = nil
     var usageLine: String? = nil
     var accountLine: String? = nil
     var modelLine: String? = nil
@@ -110,6 +114,26 @@ struct CodexProbeDiagnostics {
     let stderr: String
 }
 
+enum CodexLimitsSource: String, Equatable {
+    case oauth
+    case cliRPC = "cli_rpc"
+    case jsonlFallback = "jsonl_fallback"
+    case statusProbe = "status_probe"
+
+    var displayName: String {
+        switch self {
+        case .oauth:
+            return "OAuth"
+        case .cliRPC:
+            return "CLI RPC"
+        case .jsonlFallback:
+            return "JSONL fallback"
+        case .statusProbe:
+            return "/status probe"
+        }
+    }
+}
+
 @MainActor
 final class CodexUsageModel: ObservableObject {
     static let shared = CodexUsageModel()
@@ -118,6 +142,7 @@ final class CodexUsageModel: ObservableObject {
     @Published var fiveHourResetText: String = ""
     @Published var weekRemainingPercent: Int = 0
     @Published var weekResetText: String = ""
+    @Published var limitsSource: CodexLimitsSource? = nil
     @Published var usageLine: String? = nil
     @Published var accountLine: String? = nil
     @Published var modelLine: String? = nil
@@ -137,11 +162,17 @@ final class CodexUsageModel: ObservableObject {
     private var isEnabled: Bool = false
     private var stripVisible: Bool = false
     private var menuVisible: Bool = false
+    private var cockpitVisible: Bool = false
+    private var cockpitPinned: Bool = false
     // Avoid touching NSApp during singleton initialization at app launch.
     // NSApp is an IUO and can be nil this early in startup.
     private var appIsActive: Bool = false
 
     func setEnabled(_ enabled: Bool) {
+        if AppRuntime.isRunningTests {
+            if !enabled { stop() }
+            return
+        }
         guard enabled != isEnabled else { return }
         isEnabled = enabled
         if enabled {
@@ -167,7 +198,16 @@ final class CodexUsageModel: ObservableObject {
     }
 
     func setAppActive(_ active: Bool) {
+        guard !AppRuntime.isRunningTests else { return }
         appIsActive = active
+        propagateVisibility()
+    }
+
+    /// Called by the cockpit HUD window. When `pinned`, the cockpit is always on top
+    /// and should poll even when the app loses focus (treated like menu bar visibility).
+    func setCockpitVisible(_ visible: Bool, pinned: Bool) {
+        cockpitVisible = visible
+        cockpitPinned = visible && pinned
         propagateVisibility()
     }
 
@@ -175,8 +215,9 @@ final class CodexUsageModel: ObservableObject {
         // Treat the in-app strip as non-visible while the app is inactive to avoid
         // background polling. Menu bar visibility should remain effective even when
         // the app is inactive so the user can still read live usage in the menu bar.
-        let menuVisible = self.menuVisible
-        let stripVisible = self.stripVisible
+        // A pinned cockpit window is treated like the menu bar (always-on polls).
+        let menuVisible = self.menuVisible || self.cockpitPinned
+        let stripVisible = self.stripVisible || self.cockpitVisible
         let appIsActive = self.appIsActive
         Task.detached { [weak self] in
             await self?.service?.setVisibility(menuVisible: menuVisible, stripVisible: stripVisible, appIsActive: appIsActive)
@@ -184,6 +225,7 @@ final class CodexUsageModel: ObservableObject {
     }
 
     func refreshNow() {
+        guard !AppRuntime.isRunningTests else { return }
         guard isEnabled else { return }
         if isUpdating { return }
         isUpdating = true
@@ -229,7 +271,7 @@ final class CodexUsageModel: ObservableObject {
                 await MainActor.run {
                     if diag.success {
                         self.lastSuccessAt = Date()
-                        setFreshUntil(for: .codex, until: Date().addingTimeInterval(60 * 60))
+                        setFreshUntil(for: .codex, until: Date().addingTimeInterval(UsageFreshnessTTL.probeFreshness))
                     }
                     self.isUpdating = false
                     completion(diag.success)
@@ -248,7 +290,7 @@ final class CodexUsageModel: ObservableObject {
             await MainActor.run {
                 if diag.success {
                     self.lastSuccessAt = Date()
-                    setFreshUntil(for: .codex, until: Date().addingTimeInterval(60 * 60))
+                    setFreshUntil(for: .codex, until: Date().addingTimeInterval(UsageFreshnessTTL.probeFreshness))
                 }
                 self.isUpdating = false
                 completion(diag.success)
@@ -280,7 +322,7 @@ final class CodexUsageModel: ObservableObject {
                 await MainActor.run {
                     if diag.success {
                         self.lastSuccessAt = Date()
-                        setFreshUntil(for: .codex, until: Date().addingTimeInterval(60 * 60))
+                        setFreshUntil(for: .codex, until: Date().addingTimeInterval(UsageFreshnessTTL.probeFreshness))
                     }
                     completion(diag)
                 }
@@ -297,7 +339,7 @@ final class CodexUsageModel: ObservableObject {
             await MainActor.run {
                 if diag.success {
                     self.lastSuccessAt = Date()
-                    setFreshUntil(for: .codex, until: Date().addingTimeInterval(60 * 60))
+                    setFreshUntil(for: .codex, until: Date().addingTimeInterval(UsageFreshnessTTL.probeFreshness))
                 }
                 self.isUpdating = false
                 completion(diag)
@@ -306,6 +348,7 @@ final class CodexUsageModel: ObservableObject {
     }
 
     private func start() {
+        guard !AppRuntime.isRunningTests else { return }
         let model = self
         let handler: @Sendable (CodexUsageSnapshot) -> Void = { snapshot in
             Task { @MainActor in
@@ -337,6 +380,7 @@ final class CodexUsageModel: ObservableObject {
         weekRemainingPercent = clampPercent(s.weekRemainingPercent)
         fiveHourResetText = s.fiveHourResetText
         weekResetText = s.weekResetText
+        limitsSource = s.limitsSource
         usageLine = s.usageLine
         accountLine = s.accountLine
         modelLine = s.modelLine
@@ -351,7 +395,6 @@ final class CodexUsageModel: ObservableObject {
         if isUpdating { isUpdating = false }
     }
 
-    private func clampPercent(_ v: Int) -> Int { max(0, min(100, v)) }
 }
 
 // MARK: - Rate-limit models (log probe)
@@ -368,6 +411,7 @@ struct RateLimitSummary {
     var eventTimestamp: Date?
     var stale: Bool
     var sourceFile: URL?
+    var missingRateLimits: Bool = false
 }
 
 // MARK: - Service
@@ -407,7 +451,9 @@ actor CodexStatusService {
         if let regex = try? NSRegularExpression(pattern: pattern, options: options) {
             return regex
         }
+        #if DEBUG
         print("[CodexStatus] Regex compile failed for \(label); using never-match fallback.")
+        #endif
         return try? NSRegularExpression(pattern: "(?!)", options: [])
     }
 
@@ -422,6 +468,34 @@ actor CodexStatusService {
 
     func parseTokenCountTailForTesting(url: URL) -> RateLimitSummary? {
         parseTokenCountTail(url: url)
+    }
+
+    func parseStatusJSONForTesting(_ json: String) -> CodexUsageSnapshot? {
+        parseStatusJSON(json)
+    }
+
+    func setSnapshotForTesting(_ snapshot: CodexUsageSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func mergeRateLimitSnapshotForTesting(_ source: CodexUsageSnapshot, requirePositivePercent: Bool = false) -> CodexUsageSnapshot {
+        var merged = snapshot
+        mergeRateLimitSnapshot(source, into: &merged, requirePositivePercent: requirePositivePercent)
+        return self.snapshot
+    }
+
+    func applyJSONLFallbackSummaryForTesting(_ summary: RateLimitSummary) -> CodexUsageSnapshot {
+        var merged = snapshot
+        applyJSONLFallbackSummary(summary, into: &merged)
+        return self.snapshot
+    }
+
+    var lastFiveHourResetDateForTesting: Date? {
+        lastFiveHourResetDate
+    }
+
+    var hasAuthoritativeLimitsSnapshotForTesting: Bool {
+        hasAuthoritativeLimitsSnapshot
     }
 #endif
 
@@ -441,6 +515,7 @@ actor CodexStatusService {
         options: [.caseInsensitive],
         label: "resetLineRegex"
     )
+    private let missingRateLimitsUsageLine = "Recent Codex logs omitted rate limits"
 
     private nonisolated let updateHandler: @Sendable (CodexUsageSnapshot) -> Void
     private nonisolated let availabilityHandler: @Sendable (Bool) -> Void
@@ -462,13 +537,18 @@ actor CodexStatusService {
     private var visibilityMode: VisibilityMode { visibilityContext.mode }
     private var backoffSeconds: UInt64 = 1
     private var refresherTask: Task<Void, Never>?
+    private var deferredTmuxCleanupTask: Task<Void, Never>?
+    private let codexOAuthFetcher: CodexOAuthUsageFetcher = {
+        CodexOAuthUsageFetcher(credentials: CodexOAuthCredentials())
+    }()
+    private let codexRPCProbe = CodexCLIRPCProbe()
     private var lastStatusProbe: Date? = nil
     private var lastAppliedSourceFilePath: String? = nil
     private var lastAppliedSourceFileMTime: Date? = nil
     private var lastAppliedEventTimestamp: Date? = nil
     private var lastParseWasStaleOrFailed: Bool = false
     private let unchangedParseSkipFreshnessSeconds: TimeInterval = 12 * 60
-    private let automaticProbeCooldownSeconds: TimeInterval = 20 * 60
+    private let automaticProbeCooldownSeconds: TimeInterval = 4 * 60 * 60
     private let preferredLogProbeCandidateLimit: Int = 8
     private let fallbackLogProbeCandidateLimit: Int = 32
     private let logTailReadMaxBytes: Int = 192 * 1024
@@ -476,7 +556,8 @@ actor CodexStatusService {
     private var cachedTerminalPATH: String? = nil
     private var hasResolvedTmuxPath: Bool = false
     private var cachedTmuxPath: String? = nil
-    private var didRunOrphanCleanup: Bool = false
+    private var lastOrphanCleanupAt: Date? = nil
+    private let orphanCleanupMinInterval: TimeInterval = 3600 // 1 hour
     private var didRunMenuBarOrphanCleanup: Bool = false
 
     init(updateHandler: @escaping @Sendable (CodexUsageSnapshot) -> Void,
@@ -492,6 +573,12 @@ actor CodexStatusService {
 
     func start() async {
         shouldRun = true
+        // Clear persisted auto-probe cooldown from a prior app session. The UI
+        // freshness TTL is separate and should survive hard probes, but a stale
+        // launch-time cooldown can incorrectly block the first eligible auto-probe.
+        if let cooldown = codexAutoProbeCooldownUntil(), cooldown > Date() {
+            setCodexAutoProbeCooldown(until: Date())
+        }
         // Orphan cleanup is deferred until a usage surface becomes visible
         // to avoid heavy background work when the app is inactive/hidden.
         restartRefresherLoop()
@@ -737,6 +824,7 @@ actor CodexStatusService {
             var s = snapshot
             s.fiveHourRemainingPercent = extractPercent(from: clean) ?? s.fiveHourRemainingPercent
             s.fiveHourResetText = extractResetText(from: clean) ?? s.fiveHourResetText
+            s.hasFiveHourRateLimit = true
             snapshot = s
             updateHandler(snapshot)
             return
@@ -746,6 +834,7 @@ actor CodexStatusService {
             var s = snapshot
             s.weekRemainingPercent = extractPercent(from: clean) ?? s.weekRemainingPercent
             s.weekResetText = extractResetText(from: clean) ?? s.weekResetText
+            s.hasWeekRateLimit = true
             snapshot = s
             updateHandler(snapshot)
             return
@@ -779,9 +868,7 @@ actor CodexStatusService {
     private func refreshTick(userInitiated: Bool = false) async {
         let mode = visibilityMode
         if mode == .hidden && !userInitiated { return }
-        // Log-probe path: scan latest JSONL for token_count/rate_limits across known roots
         let roots = sessionsRoots()
-        guard !roots.isEmpty else { availabilityHandler(true); return }
         availabilityHandler(false)
 
         if mode == .menuBackground && !userInitiated {
@@ -789,49 +876,38 @@ actor CodexStatusService {
             return
         }
 
-        let candidateDaysBack = lastParseWasStaleOrFailed ? 10 : 2
-        var latestCandidate = newestCandidateFile(roots: roots, daysBack: candidateDaysBack, limit: 10)
-        if latestCandidate == nil, candidateDaysBack < 10 {
-            latestCandidate = newestCandidateFile(roots: roots, daysBack: 10, limit: 10)
+        let now = Date()
+        if !roots.isEmpty {
+            let candidateDaysBack = lastParseWasStaleOrFailed ? 10 : 2
+            var latestCandidate = newestCandidateFile(roots: roots, daysBack: candidateDaysBack, limit: 10)
+            if latestCandidate == nil, candidateDaysBack < 10 {
+                latestCandidate = newestCandidateFile(roots: roots, daysBack: 10, limit: 10)
+            }
+
+            let shouldSkipParse = shouldSkipLogParse(latestCandidate: latestCandidate, now: now)
+            if !shouldSkipParse, let summary = probeLatestRateLimits(roots: roots, expandSearch: lastParseWasStaleOrFailed) {
+                var s = snapshot
+                if !summary.missingRateLimits {
+                    applyJSONLFallbackSummary(summary, into: &s)
+                } else if !hasAuthoritativeLimitsSnapshot {
+                    markRateLimitsUnavailable(into: &s)
+                    snapshot = s
+                    updateHandler(snapshot)
+                }
+
+                if let sourceFile = summary.sourceFile {
+                    lastAppliedSourceFilePath = sourceFile.path
+                    lastAppliedSourceFileMTime = fileModificationDate(sourceFile)
+                }
+                lastAppliedEventTimestamp = summary.eventTimestamp
+                lastParseWasStaleOrFailed = summary.stale
+            } else if !shouldSkipParse {
+                lastParseWasStaleOrFailed = true
+            }
         }
 
-        let now = Date()
-        let shouldSkipParse = shouldSkipLogParse(latestCandidate: latestCandidate, now: now)
-        if !shouldSkipParse, let summary = probeLatestRateLimits(roots: roots, expandSearch: lastParseWasStaleOrFailed) {
-            // Do not regress to older data after a successful /status probe.
-            // Only apply log-derived snapshots when they are at least as new
-            // as the current in-memory snapshot, or when we have no timestamp.
-            let previousEvent = snapshot.eventTimestamp
-            let newEvent = summary.eventTimestamp
-            let shouldApply: Bool
-            if let newEvent, let previousEvent {
-                shouldApply = newEvent >= previousEvent
-            } else {
-                // When either side lacks a timestamp, prefer applying the update.
-                shouldApply = true
-            }
-
-            if shouldApply {
-                var s = snapshot
-                if let p = summary.fiveHour.remainingPercent { s.fiveHourRemainingPercent = clampPercent(p) }
-                if let p = summary.weekly.remainingPercent { s.weekRemainingPercent = clampPercent(p) }
-                s.fiveHourResetText = formatCodexReset(summary.fiveHour.resetAt, windowMinutes: summary.fiveHour.windowMinutes)
-                s.weekResetText = formatCodexReset(summary.weekly.resetAt, windowMinutes: summary.weekly.windowMinutes)
-                lastFiveHourResetDate = summary.fiveHour.resetAt
-                s.usageLine = summary.stale ? "Usage is stale (>3m)" : nil
-                s.eventTimestamp = summary.eventTimestamp
-                snapshot = s
-                updateHandler(snapshot)
-            }
-
-            if let sourceFile = summary.sourceFile {
-                lastAppliedSourceFilePath = sourceFile.path
-                lastAppliedSourceFileMTime = fileModificationDate(sourceFile)
-            }
-            lastAppliedEventTimestamp = summary.eventTimestamp
-            lastParseWasStaleOrFailed = summary.stale
-        } else if !shouldSkipParse {
-            lastParseWasStaleOrFailed = true
+        if mode == .active || mode == .menuBackground || userInitiated {
+            _ = await refreshPreferredLiveLimits(visibleFastPath: mode == .active || userInitiated)
         }
 
         // Optional: run a one-shot tmux /status probe only when stale (manual or auto)
@@ -886,6 +962,8 @@ actor CodexStatusService {
         }
         guard let sourceFile else { return }
 
+        _ = await refreshPreferredLiveLimits(visibleFastPath: false)
+
         // Only parse when the file changes; otherwise rely on the cached snapshot.
         guard let mtime = fileModificationDate(sourceFile) else { return }
         if let lastAppliedSourceFileMTime,
@@ -896,23 +974,11 @@ actor CodexStatusService {
         }
 
         if let summary = parseTokenCountTail(url: sourceFile) {
-            let previousEvent = snapshot.eventTimestamp
-            let newEvent = summary.eventTimestamp
-            let shouldApply: Bool
-            if let newEvent, let previousEvent {
-                shouldApply = newEvent >= previousEvent
-            } else {
-                shouldApply = true
-            }
-            if shouldApply {
-                var s = snapshot
-                if let p = summary.fiveHour.remainingPercent { s.fiveHourRemainingPercent = clampPercent(p) }
-                if let p = summary.weekly.remainingPercent { s.weekRemainingPercent = clampPercent(p) }
-                s.fiveHourResetText = formatCodexReset(summary.fiveHour.resetAt, windowMinutes: summary.fiveHour.windowMinutes)
-                s.weekResetText = formatCodexReset(summary.weekly.resetAt, windowMinutes: summary.weekly.windowMinutes)
-                lastFiveHourResetDate = summary.fiveHour.resetAt
-                s.usageLine = summary.stale ? "Usage is stale (>3m)" : nil
-                s.eventTimestamp = summary.eventTimestamp
+            var s = snapshot
+            if !summary.missingRateLimits {
+                applyJSONLFallbackSummary(summary, into: &s)
+            } else if !hasAuthoritativeLimitsSnapshot {
+                markRateLimitsUnavailable(into: &s)
                 snapshot = s
                 updateHandler(snapshot)
             }
@@ -923,6 +989,114 @@ actor CodexStatusService {
         } else {
             lastParseWasStaleOrFailed = true
         }
+
+        // Run probe in menu-background mode too (e.g. cockpit pinned, app inactive).
+        if !FeatureFlags.disableCodexProbes {
+            await maybeProbeStatusViaTMUX(userInitiated: false)
+        }
+    }
+
+    // MARK: - Alternate rate-limit sources (OAuth API → CLI RPC)
+
+    private var hasAuthoritativeLimitsSnapshot: Bool {
+        isAuthoritativeLimitsSource(snapshot.fiveHourLimitsSource) &&
+        isAuthoritativeLimitsSource(snapshot.weekLimitsSource)
+    }
+
+    /// Primary chain for authoritative limits. JSONL is deliberately excluded here and
+    /// remains a fallback-only source handled by the log parsing path.
+    private func fetchPreferredRateLimits(oauthSuccessCooldown: TimeInterval) async -> CodexUsageSnapshot? {
+        if let snap = await codexOAuthFetcher.fetchUsage(cooldownSuccess: oauthSuccessCooldown) {
+            return snap
+        }
+        if let snap = await codexRPCProbe.fetchRateLimits() {
+            return snap
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func refreshPreferredLiveLimits(visibleFastPath: Bool) async -> CodexUsageSnapshot? {
+        let successCooldown: TimeInterval = visibleFastPath ? 60 : 5 * 60
+        guard let preferredSnap = await fetchPreferredRateLimits(oauthSuccessCooldown: successCooldown) else {
+            return nil
+        }
+        var merged = snapshot
+        mergeRateLimitSnapshot(preferredSnap, into: &merged)
+        return preferredSnap
+    }
+
+    /// Merges rate-limit fields from `source` into `dest`, commits to `snapshot`,
+    /// and notifies the UI. 0% remains valid for exhausted buckets when the probe
+    /// actually returned a percentage, but reset-only probe fragments are ignored.
+    private func mergeRateLimitSnapshot(_ source: CodexUsageSnapshot, into dest: inout CodexUsageSnapshot, requirePositivePercent: Bool = false) {
+        let shouldMergeFiveHour = source.hasFiveHourRateLimit && (!requirePositivePercent || source.fiveHourRemainingPercent >= 0)
+        if shouldMergeFiveHour {
+            dest.fiveHourRemainingPercent = clampPercent(source.fiveHourRemainingPercent)
+        }
+        if shouldMergeFiveHour {
+            dest.hasFiveHourRateLimit = true
+            if !source.fiveHourResetText.isEmpty { dest.fiveHourResetText = source.fiveHourResetText }
+            dest.fiveHourLimitsSource = source.fiveHourLimitsSource ?? source.limitsSource
+        }
+        let shouldMergeWeek = source.hasWeekRateLimit && (!requirePositivePercent || source.weekRemainingPercent >= 0)
+        if shouldMergeWeek {
+            dest.weekRemainingPercent = clampPercent(source.weekRemainingPercent)
+        }
+        if shouldMergeWeek {
+            dest.hasWeekRateLimit = true
+            if !source.weekResetText.isEmpty { dest.weekResetText = source.weekResetText }
+            dest.weekLimitsSource = source.weekLimitsSource ?? source.limitsSource
+        }
+        dest.limitsSource = aggregateLimitsSource(for: dest)
+        dest.usageLine = nil  // Fresh data from probe/API; clear any stale marker
+        dest.eventTimestamp = Date()
+        snapshot = dest
+        updateHandler(snapshot)
+    }
+
+    private func applyJSONLFallbackSummary(_ summary: RateLimitSummary, into s: inout CodexUsageSnapshot) {
+        let canApplyFiveHourFallback = !isAuthoritativeLimitsSource(s.fiveHourLimitsSource)
+        if canApplyFiveHourFallback, let p = summary.fiveHour.remainingPercent {
+            s.fiveHourRemainingPercent = clampPercent(p)
+            s.hasFiveHourRateLimit = true
+            s.fiveHourLimitsSource = .jsonlFallback
+        }
+        if canApplyFiveHourFallback, let resetAt = summary.fiveHour.resetAt {
+            s.fiveHourResetText = formatResetISO8601(resetAt)
+            s.hasFiveHourRateLimit = true
+            s.fiveHourLimitsSource = .jsonlFallback
+        }
+        let canApplyWeekFallback = !isAuthoritativeLimitsSource(s.weekLimitsSource)
+        if canApplyWeekFallback, let p = summary.weekly.remainingPercent {
+            s.weekRemainingPercent = clampPercent(p)
+            s.hasWeekRateLimit = true
+            s.weekLimitsSource = .jsonlFallback
+        }
+        if canApplyWeekFallback, let resetAt = summary.weekly.resetAt {
+            s.weekResetText = formatResetISO8601(resetAt)
+            s.hasWeekRateLimit = true
+            s.weekLimitsSource = .jsonlFallback
+        }
+        s.usageLine = summary.stale ? "Usage is stale (>3m)" : nil
+        s.eventTimestamp = summary.eventTimestamp
+        lastFiveHourResetDate = summary.fiveHour.resetAt
+        s.limitsSource = aggregateLimitsSource(for: s)
+        snapshot = s
+        updateHandler(snapshot)
+    }
+
+    private func markRateLimitsUnavailable(into s: inout CodexUsageSnapshot) {
+        if !isAuthoritativeLimitsSource(s.fiveHourLimitsSource) {
+            s.fiveHourResetText = UsageStaleThresholds.unavailableCopy
+            s.fiveHourLimitsSource = nil
+        }
+        if !isAuthoritativeLimitsSource(s.weekLimitsSource) {
+            s.weekResetText = UsageStaleThresholds.unavailableCopy
+            s.weekLimitsSource = nil
+        }
+        s.limitsSource = aggregateLimitsSource(for: s)
+        s.usageLine = missingRateLimitsUsageLine
     }
 
     // MARK: - Optional tmux /status probe
@@ -935,7 +1109,7 @@ actor CodexStatusService {
         // Check if we have NO recent JSONL events (no local sessions in last 6 hours)
         var noRecentSessions = false
         if let eventTime = snapshot.eventTimestamp {
-            if now.timeIntervalSince(eventTime) > 6 * 60 * 60 { noRecentSessions = true }
+            if now.timeIntervalSince(eventTime) > UsageStaleThresholds.codexSeverelyStale { noRecentSessions = true }
         } else {
             noRecentSessions = true  // No events at all
         }
@@ -943,37 +1117,47 @@ actor CodexStatusService {
         // Also check staleness for backward compat (data age display)
         let stale5h = isResetInfoStale(kind: "5h", source: .codex, lastUpdate: nil, eventTimestamp: snapshot.eventTimestamp, now: now)
         let staleWeek = isResetInfoStale(kind: "week", source: .codex, lastUpdate: nil, eventTimestamp: snapshot.eventTimestamp, now: now)
+        let missingRateLimits = isResetInfoUnavailable(raw: snapshot.fiveHourResetText) || isResetInfoUnavailable(raw: snapshot.weekResetText)
 
-        // Auto probes are intentionally strict to avoid energy spikes from low-value tmux launches.
+        // Auto probes run whenever data is stale, even during active sessions.
+        // The 4-hour cooldown + user opt-in gate keep token cost negligible (≤1-2 msgs/4h).
         let shouldProbe = userInitiated
-            ? (noRecentSessions || stale5h || staleWeek)
-            : (noRecentSessions && (stale5h || staleWeek))
+            ? (noRecentSessions || stale5h || staleWeek || missingRateLimits)
+            : (stale5h || staleWeek || missingRateLimits)
         guard shouldProbe else { return }
 
         // Additional gates for automatic/background path only
         if !userInitiated {
-            // If a recent hard /status probe ran, respect its freshness TTL and
-            // avoid firing an additional automatic probe until it expires.
-            if let ttl = freshUntil(for: .codex, now: now), ttl > now {
-                return
+            // When rate limits are completely missing (no JSONL data AND OAuth/RPC
+            // both failed), bypass cooldowns and visibility gates — the user has NO
+            // usable data and the probe is the last resort.
+            let needsProbeOverride = missingRateLimits || (stale5h && staleWeek)
+
+            if !needsProbeOverride {
+                // Normal path: respect all gates
+                if let cooldown = codexAutoProbeCooldownUntil(now: now), cooldown > now { return }
+                let allowAuto = UserDefaults.standard.bool(forKey: "CodexAllowStatusProbe")
+                guard allowAuto else { return }
+                guard visible else { return }
+                if let last = lastStatusProbe, now.timeIntervalSince(last) < automaticProbeCooldownSeconds { return }
+            } else {
+                // Override path: only respect in-memory cooldown (shorter, 30 min)
+                // to prevent retry storms, but skip persisted cooldown and visibility.
+                if let last = lastStatusProbe, now.timeIntervalSince(last) < 30 * 60 { return }
             }
-            let allowAuto = UserDefaults.standard.bool(forKey: "CodexAllowStatusProbe")
-            guard allowAuto else { return }
-            guard visible else { return }
-            if let last = lastStatusProbe, now.timeIntervalSince(last) < automaticProbeCooldownSeconds { return }
         }
 
-        guard let tmuxSnap = await runCodexStatusViaTMUX() else { return }
+        let tmuxSnap = await runCodexStatusViaTMUX()
+        // Set cooldown timestamp unconditionally so a failed probe doesn't allow
+        // an immediate retry on the next tick.
         lastStatusProbe = now
-        var merged = snapshot
-        if tmuxSnap.fiveHourRemainingPercent > 0 { merged.fiveHourRemainingPercent = clampPercent(tmuxSnap.fiveHourRemainingPercent) }
-        if !tmuxSnap.fiveHourResetText.isEmpty { merged.fiveHourResetText = tmuxSnap.fiveHourResetText }
-        if tmuxSnap.weekRemainingPercent > 0 { merged.weekRemainingPercent = clampPercent(tmuxSnap.weekRemainingPercent) }
-        if !tmuxSnap.weekResetText.isEmpty { merged.weekResetText = tmuxSnap.weekResetText }
-        merged.eventTimestamp = now
-        snapshot = merged
-        updateHandler(merged)
         _ = CodexProbeCleanup.cleanupNowIfAuto()
+        guard let tmuxSnap else { return }
+        var merged = snapshot
+        mergeRateLimitSnapshot(tmuxSnap, into: &merged, requirePositivePercent: true)
+        // Persist auto-probe cooldown separately from UI freshness so a successful
+        // probe does not make old data appear freshly updated for the whole window.
+        setCodexAutoProbeCooldown(until: now.addingTimeInterval(automaticProbeCooldownSeconds))
     }
 
     // Hard-probe entry point: forces a tmux /status probe regardless of staleness or prefs.
@@ -983,16 +1167,10 @@ actor CodexStatusService {
             return CodexProbeDiagnostics(success: false, exitCode: 127, scriptPath: "(not run)", workdir: CodexProbeConfig.probeWorkingDirectory(), codexBin: nil, tmuxBin: nil, timeoutSecs: nil, stdout: "", stderr: "Probes disabled by feature flag")
         }
         let (snap, diag) = await runCodexStatusViaTMUXAndCollect()
+        _ = CodexProbeCleanup.cleanupNowIfAuto()
         if let tmuxSnap = snap {
             var merged = snapshot
-            if tmuxSnap.fiveHourRemainingPercent > 0 { merged.fiveHourRemainingPercent = clampPercent(tmuxSnap.fiveHourRemainingPercent) }
-            if !tmuxSnap.fiveHourResetText.isEmpty { merged.fiveHourResetText = tmuxSnap.fiveHourResetText }
-            if tmuxSnap.weekRemainingPercent > 0 { merged.weekRemainingPercent = clampPercent(tmuxSnap.weekRemainingPercent) }
-            if !tmuxSnap.weekResetText.isEmpty { merged.weekResetText = tmuxSnap.weekResetText }
-            merged.eventTimestamp = Date()
-            snapshot = merged
-            updateHandler(merged)
-            _ = CodexProbeCleanup.cleanupNowIfAuto()
+            mergeRateLimitSnapshot(tmuxSnap, into: &merged, requirePositivePercent: true)
         }
         return diag
     }
@@ -1041,23 +1219,39 @@ actor CodexStatusService {
         process.standardOutput = out; process.standardError = err
         do { try process.run() } catch {
             let d = CodexProbeDiagnostics(success: false, exitCode: 127, scriptPath: scriptURL.path, workdir: workDir, codexBin: codexBin, tmuxBin: tmuxBin, timeoutSecs: env["TIMEOUT_SECS"], stdout: "", stderr: error.localizedDescription)
+            #if DEBUG
             print("[CodexProbe] Failed to launch capture script: \(error.localizedDescription)")
+            #endif
             return (nil, d)
         }
         let didExit = await waitForProcessExit(process, timeoutSeconds: scriptTimeoutSeconds, label: probeLabel, session: Self.probeSessionName)
         let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        // Schedule force-cleanup on ALL exit paths (success, error, timeout).
+        // Waits 2s for shell EXIT trap, then kills by ps scanning — works even
+        // when the socket was already deleted by the shell cleanup.
+        let capturedLabel = probeLabel
+        deferredTmuxCleanupTask?.cancel()
+        deferredTmuxCleanupTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
+            await self?.forceCleanupProbeByLabel(capturedLabel)
+            await self?.cleanupOrphanedTmuxLabels()
+        }
+
         if !didExit {
             let d = CodexProbeDiagnostics(success: false, exitCode: 124, scriptPath: scriptURL.path, workdir: workDir, codexBin: codexBin, tmuxBin: tmuxBin, timeoutSecs: env["TIMEOUT_SECS"], stdout: stdout, stderr: stderr.isEmpty ? "Script timed out" : stderr)
             return (nil, d)
         }
         if process.terminationStatus != 0 {
+            #if DEBUG
             if !stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 print("[CodexProbe] Script non-zero (\(process.terminationStatus)). stdout: \n\(stdout)")
             }
             if !stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 print("[CodexProbe] Script stderr: \n\(stderr)")
             }
+            #endif
             let d = CodexProbeDiagnostics(success: false, exitCode: process.terminationStatus, scriptPath: scriptURL.path, workdir: workDir, codexBin: codexBin, tmuxBin: tmuxBin, timeoutSecs: env["TIMEOUT_SECS"], stdout: stdout, stderr: stderr)
             return (nil, d)
         }
@@ -1072,15 +1266,60 @@ actor CodexStatusService {
         if let ok = obj["ok"] as? Bool, !ok { return nil }
         var s = CodexUsageSnapshot()
         if let fh = obj["five_hour"] as? [String: Any] {
-            if let p = fh["pct_left"] as? Int { s.fiveHourRemainingPercent = p }
-            if let r = fh["resets"] as? String { s.fiveHourResetText = r }
+            let percent = statusProbePercent(from: fh)
+            if let p = percent {
+                s.fiveHourRemainingPercent = p
+            }
+            if let r = fh["resets"] as? String, percent != nil { s.fiveHourResetText = r }
+            if percent != nil {
+                s.hasFiveHourRateLimit = true
+                s.fiveHourLimitsSource = .statusProbe
+            }
         }
         if let wk = obj["weekly"] as? [String: Any] {
-            if let p = wk["pct_left"] as? Int { s.weekRemainingPercent = p }
-            if let r = wk["resets"] as? String { s.weekResetText = r }
+            let percent = statusProbePercent(from: wk)
+            if let p = percent {
+                s.weekRemainingPercent = p
+            }
+            if let r = wk["resets"] as? String, percent != nil { s.weekResetText = r }
+            if percent != nil {
+                s.hasWeekRateLimit = true
+                s.weekLimitsSource = .statusProbe
+            }
         }
+        s.limitsSource = aggregateLimitsSource(for: s)
         s.eventTimestamp = Date()
         return s
+    }
+
+    private func statusProbePercent(from payload: [String: Any]) -> Int? {
+        if let percent = payload["pct_left"] as? Int {
+            return clampPercent(percent)
+        }
+        if let percent = payload["pct_left"] as? Double {
+            return clampPercent(Int(percent.rounded()))
+        }
+        if let percent = payload["pct_left"] as? NSNumber {
+            return clampPercent(percent.intValue)
+        }
+        return nil
+    }
+
+    private func isAuthoritativeLimitsSource(_ source: CodexLimitsSource?) -> Bool {
+        switch source {
+        case .oauth?, .cliRPC?, .statusProbe?:
+            return true
+        case .jsonlFallback?, nil:
+            return false
+        }
+    }
+
+    private func aggregateLimitsSource(for snapshot: CodexUsageSnapshot) -> CodexLimitsSource? {
+        let sources = [snapshot.hasFiveHourRateLimit ? snapshot.fiveHourLimitsSource : nil,
+                       snapshot.hasWeekRateLimit ? snapshot.weekLimitsSource : nil]
+            .compactMap { $0 }
+        guard let first = sources.first else { return nil }
+        return sources.allSatisfy({ $0 == first }) ? first : nil
     }
 
     private func waitForProcessExit(_ process: Process,
@@ -1105,6 +1344,13 @@ actor CodexStatusService {
                 _ = kill(process.processIdentifier, SIGKILL)
             }
             return false
+        }
+        // Belt-and-suspenders: even on clean script exit, verify the tmux server
+        // is gone. The shell EXIT trap should handle it, but may silently fail.
+        Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            await self.cleanupTmuxProbe(label: label, session: session)
         }
         return true
     }
@@ -1165,6 +1411,30 @@ actor CodexStatusService {
                 labels.insert(label)
             }
         }
+        // Secondary: find codex processes whose CWD matches the probe working directory.
+        // The ps-eww check above misses processes inside tmux (no inherited env markers).
+        // "-c codex" is a prefix match and may capture unrelated processes (e.g. codex-something),
+        // but the CWD equality check below provides a sufficient safety filter.
+        let lsofResult = await runProcess(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-w", "-a", "-c", "codex", "-d", "cwd", "-nP", "-F", "pn"],
+            timeoutSeconds: 3
+        )
+        if !lsofResult.stdout.isEmpty {
+            let normalizedWD = normalizeProbePath(workDir)
+            var cwdPID: Int32? = nil
+            for line in lsofResult.stdout.split(separator: "\n") {
+                let s = String(line)
+                if s.hasPrefix("p"), let pid = Int32(s.dropFirst()) {
+                    cwdPID = pid
+                } else if s.hasPrefix("n"), let pid = cwdPID {
+                    if normalizeProbePath(String(s.dropFirst())) == normalizedWD,
+                       !pids.contains(pid_t(pid)) {
+                        pids.append(pid_t(pid))
+                    }
+                }
+            }
+        }
         labels.formUnion(scanTmuxLabels(prefix: Self.probeLabelPrefix))
         for label in labels {
             if await tmuxServerLooksLikeProbe(label: label,
@@ -1176,6 +1446,11 @@ actor CodexStatusService {
         for pid in pids {
             await terminateProcessGroup(pid: pid)
         }
+        // Kill socketless probe tmux servers: these survive when kill-server can't reach
+        // them because the socket was already deleted by a prior partial cleanup.
+        // Reuse the snapshot already captured above to avoid a redundant ps -A call.
+        terminateSocketlessProbeServers(labelPrefix: Self.probeLabelPrefix,
+                                       psOutput: snapshot.stdout)
     }
 
     private func cleanupOrphanedTmuxLabels() async {
@@ -1185,7 +1460,140 @@ actor CodexStatusService {
                                               session: Self.probeSessionName,
                                               expectedCommandToken: "codex") {
                 await cleanupTmuxProbe(label: label, session: Self.probeSessionName)
+            } else {
+                // Server is dead/unreachable — socket is an orphan. Remove it.
+                // The as-cx- prefix is unique to our probes, so this is always safe.
+                removeOrphanedSocketFiles(label: label)
             }
+        }
+        // Also kill socketless probe tmux servers (socket deleted but process alive).
+        let psSnap = await runProcess(executable: "/bin/ps",
+                                      arguments: ["-A", "-o", "pid=", "-o", "command="],
+                                      timeoutSeconds: 2)
+        terminateSocketlessProbeServers(labelPrefix: Self.probeLabelPrefix,
+                                       psOutput: psSnap.stdout)
+    }
+
+    /// Forcefully clean up a probe by scanning the process table.
+    /// Does NOT rely on tmux socket/commands — works even when socket is already deleted.
+    private func forceCleanupProbeByLabel(_ label: String) async {
+        // 1. Find and kill the tmux server process by its command-line label argument
+        let psSnap = await runProcess(executable: "/bin/ps",
+                                      arguments: ["-A", "-o", "pid=", "-o", "command="],
+                                      timeoutSeconds: 2)
+        let labelArg = "-L \(label)"
+        for line in psSnap.stdout.split(separator: "\n") {
+            let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = trimmed.split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
+            guard parts.count == 2, let pid = Int32(parts[0]) else { continue }
+            let command = String(parts[1])
+            if command.contains("tmux"), command.contains(labelArg) {
+                _ = kill(pid_t(pid), SIGKILL)
+            }
+        }
+        // 2. Kill orphaned codex processes by CWD. When another probe is active,
+        // find its tmux server PID and protect its entire process tree.
+        // Fresh ps snapshot is required: the active probe may have started after
+        // the snapshot used for step 1, so its tmux server wouldn't appear there.
+        var activeTmuxPID: Int32? = nil
+        if let currentLabel = activeProbeLabel {
+            activeTmuxPID = await findTmuxServerPID(label: currentLabel)
+        }
+        await killProbeProcessesByCWD(protectDescendantsOf: activeTmuxPID)
+        // 3. Remove socket files
+        removeOrphanedSocketFiles(label: label)
+    }
+
+    /// Kill codex processes whose CWD matches the probe working directory.
+    /// When `protectDescendantsOf` is set, skips any process whose ancestor chain
+    /// includes that PID (i.e., belongs to the active probe's tmux tree).
+    private func killProbeProcessesByCWD(protectDescendantsOf protectedRootPID: Int32? = nil) async {
+        let workDir = CodexProbeConfig.probeWorkingDirectory()
+        let normalizedWD = normalizeProbePath(workDir)
+        let lsofResult = await runProcess(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-w", "-a", "-c", "codex", "-d", "cwd", "-nP", "-F", "pn"],
+            timeoutSeconds: 3
+        )
+        guard !lsofResult.stdout.isEmpty else { return }
+
+        // Build a pid→ppid map once (avoids per-process ps calls).
+        var ppidMap: [Int32: Int32] = [:]
+        if protectedRootPID != nil {
+            let psSnap = await runProcess(executable: "/bin/ps",
+                                          arguments: ["-A", "-o", "pid=", "-o", "ppid="],
+                                          timeoutSeconds: 2)
+            for line in psSnap.stdout.split(separator: "\n") {
+                let cols = line.split(whereSeparator: { $0.isWhitespace })
+                if cols.count >= 2, let pid = Int32(cols[0]), let ppid = Int32(cols[1]) {
+                    ppidMap[pid] = ppid
+                }
+            }
+        }
+
+        var cwdPID: Int32? = nil
+        for line in lsofResult.stdout.split(separator: "\n") {
+            let s = String(line)
+            if s.hasPrefix("p"), let pid = Int32(s.dropFirst()) {
+                cwdPID = pid
+            } else if s.hasPrefix("n"), let pid = cwdPID {
+                if normalizeProbePath(String(s.dropFirst())) == normalizedWD {
+                    if let root = protectedRootPID, isDescendant(pid, of: root, ppidMap: ppidMap) {
+                        continue
+                    }
+                    await terminateProcessGroup(pid: pid_t(pid))
+                }
+            }
+        }
+    }
+
+    /// Walk the ppid chain to check if `pid` is a descendant of `ancestorPID`.
+    private func isDescendant(_ pid: Int32, of ancestorPID: Int32, ppidMap: [Int32: Int32]) -> Bool {
+        var current = pid
+        var hops = 0
+        while let parent = ppidMap[current], parent > 1, hops < 20 {
+            if parent == ancestorPID { return true }
+            current = parent
+            hops += 1
+        }
+        return false
+    }
+
+    /// Find the tmux **server** PID for a given label from a fresh ps snapshot.
+    /// Filters out short-lived tmux client processes (capture-pane, send-keys, etc.)
+    /// by requiring the command to contain "new-session" or "start-server", or by
+    /// falling back to the process with the lowest PID (the server starts first).
+    private func findTmuxServerPID(label: String) async -> Int32? {
+        let snap = await runProcess(executable: "/bin/ps",
+                                    arguments: ["-A", "-o", "pid=", "-o", "command="],
+                                    timeoutSeconds: 2)
+        let labelArg = "-L \(label)"
+        var serverPID: Int32? = nil
+        var lowestPID: Int32? = nil
+        for line in snap.stdout.split(separator: "\n") {
+            let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = trimmed.split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
+            guard parts.count == 2, let pid = Int32(parts[0]) else { continue }
+            let command = String(parts[1])
+            guard command.contains("tmux"), command.contains(labelArg) else { continue }
+            // Prefer the server process (new-session or start-server in command)
+            if command.contains("new-session") || command.contains("start-server") {
+                serverPID = pid
+                break
+            }
+            // Track lowest PID as fallback (server starts before clients)
+            if lowestPID == nil || pid < (lowestPID ?? Int32.max) {
+                lowestPID = pid
+            }
+        }
+        return serverPID ?? lowestPID
+    }
+
+    private func removeOrphanedSocketFiles(label: String) {
+        guard label.hasPrefix(Self.probeLabelPrefix) else { return }
+        let uid = getuid()
+        for root in ["/private/tmp/tmux-\(uid)", "/tmp/tmux-\(uid)"] {
+            try? FileManager.default.removeItem(atPath: "\(root)/\(label)")
         }
     }
 
@@ -1273,6 +1681,12 @@ actor CodexStatusService {
         _ = await runProcess(executable: tmuxPath,
                              arguments: ["-L", label, "kill-server"],
                              timeoutSeconds: 2)
+        // Remove orphaned socket files (parity with claude_usage_capture.sh)
+        let uid = getuid()
+        for root in ["/private/tmp/tmux-\(uid)", "/tmp/tmux-\(uid)"] {
+            let socketPath = "\(root)/\(label)"
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
     }
 
     private func tmuxPanePID(tmuxPath: String, label: String, session: String) async -> pid_t? {
@@ -1345,8 +1759,8 @@ actor CodexStatusService {
             if !Self.onACPower() {
                 return 10 * 60 * 1_000_000_000
             }
-            // Clamp to at least 5 minutes to avoid high-frequency wakeups when hidden.
-            return max(UInt64(300), userInterval) * 1_000_000_000
+            // Clamp to at least 60s on AC power; JSONL parse is mtime-guarded so fast ticks are cheap.
+            return max(UInt64(60), userInterval) * 1_000_000_000
         }
 
         // Policy when visible or urgent:
@@ -1368,13 +1782,16 @@ actor CodexStatusService {
     }
 
     private func ensureOrphanCleanupIfNeeded() async {
-        guard !didRunOrphanCleanup else { return }
-        didRunOrphanCleanup = true
+        if let last = lastOrphanCleanupAt, Date().timeIntervalSince(last) < orphanCleanupMinInterval { return }
+        lastOrphanCleanupAt = Date()
         await cleanupOrphanedProbeProcesses()
     }
 
     private func ensureMenuBarOrphanCleanupIfNeeded() async {
-        if didRunOrphanCleanup { return }
+        if let last = lastOrphanCleanupAt, Date().timeIntervalSince(last) < orphanCleanupMinInterval { return }
+        // didRunMenuBarOrphanCleanup is intentionally one-shot per session: the menu-bar
+        // path only needs to run once on launch. Periodic re-runs are handled by
+        // ensureOrphanCleanupIfNeeded (which calls cleanupOrphanedProbeProcesses).
         guard !didRunMenuBarOrphanCleanup else { return }
         didRunMenuBarOrphanCleanup = true
 
@@ -1491,7 +1908,8 @@ actor CodexStatusService {
             weekly: RateLimitWindowInfo(remainingPercent: nil, resetAt: nil, windowMinutes: nil),
             eventTimestamp: nil,
             stale: true,
-            sourceFile: nil
+            sourceFile: nil,
+            missingRateLimits: true
         )
     }
 
@@ -1531,6 +1949,7 @@ actor CodexStatusService {
         guard let lines = tailLines(url: url, maxBytes: logTailReadMaxBytes) else { return nil }
         var fallbackSummary: RateLimitSummary? = nil
         var didCaptureNewestUsage = false
+        var newestRelevantTimestamp: Date? = nil
         // Walk most-recent → older. Be permissive about shape; Codex logs can vary.
         for raw in lines.reversed() {
             guard let data = raw.data(using: .utf8) else { continue }
@@ -1545,6 +1964,9 @@ actor CodexStatusService {
                             decodeFlexibleDate(obj["timestamp"]) ??
                             decodeFlexibleDate(payload["timestamp"]) ??
                             Date()
+            if newestRelevantTimestamp == nil, isRelevantRateLimitOrUsageEvent(payload: payload, obj: obj) {
+                newestRelevantTimestamp = createdAt
+            }
 
             // Surface usage tokens if present (new or legacy forms)
             if !didCaptureNewestUsage {
@@ -1578,7 +2000,30 @@ actor CodexStatusService {
                 }
             }
         }
-        return fallbackSummary
+        if let fallbackSummary {
+            return fallbackSummary
+        }
+        if let newestRelevantTimestamp {
+            return RateLimitSummary(
+                fiveHour: RateLimitWindowInfo(remainingPercent: nil, resetAt: nil, windowMinutes: nil),
+                weekly: RateLimitWindowInfo(remainingPercent: nil, resetAt: nil, windowMinutes: nil),
+                eventTimestamp: newestRelevantTimestamp,
+                stale: true,
+                sourceFile: url,
+                missingRateLimits: true
+            )
+        }
+        return nil
+    }
+
+    private func isRelevantRateLimitOrUsageEvent(payload: [String: Any], obj: [String: Any]) -> Bool {
+        if (payload["rate_limits"] as? [String: Any]) != nil || (obj["rate_limits"] as? [String: Any]) != nil {
+            return true
+        }
+        let kind = (payload["type"] as? String)?.lowercased() ?? ""
+        if kind == "token_count" { return true }
+        if kind == "turn.completed" || kind == "turn_completed" || kind == "turn-completed" { return true }
+        return false
     }
 
     // MARK: - Usage extraction (new + legacy)
@@ -1826,17 +2271,6 @@ actor CodexStatusService {
         if !text.hasSuffix("\n") { if let lastNL = text.lastIndex(of: "\n") { text = String(text[..<lastNL]) } }
         return text.split(separator: "\n", omittingEmptySubsequences: true).map { String($0) }
     }
-
-    private func formatCodexReset(_ date: Date?, windowMinutes: Int?) -> String {
-        guard let date else { return "" }
-        // 5-hour window → show time-only. Weekly → show date + time.
-        if let w = windowMinutes, w <= 360 { // treat <=6h as 5h style
-            return "resets \(AppDateFormatting.timeShort(date))"
-        }
-        return "resets \(AppDateFormatting.dateTimeShort(date))"
-    }
-
-    private func clampPercent(_ v: Int) -> Int { max(0, min(100, v)) }
 
     private func stripANSI(_ s: String) -> String {
         var result = s

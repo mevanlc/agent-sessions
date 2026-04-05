@@ -18,8 +18,15 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
 
     // Lightweight session metadata (when events is empty)
     public let lightweightCwd: String?
+    public let lightweightRepoName: String?
     public let lightweightTitle: String?
+    public let customTitle: String?
     public let codexInternalSessionIDHint: String?
+
+    // Subagent hierarchy
+    public let parentSessionID: String?   // Raw ID of parent session (UUID for Claude/Codex, ses_ID for OpenCode)
+    public let subagentType: String?      // e.g. "Explore", "review", "thread_spawn", "general"
+    public var isSubagent: Bool { parentSessionID != nil || subagentType != nil }
 
     // Runtime UI state (not persisted in session files)
     public var isFavorite: Bool = false
@@ -35,7 +42,10 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
                 eventCount: Int,
                 events: [SessionEvent],
                 isHousekeeping: Bool = false,
-                codexInternalSessionIDHint: String? = nil) {
+                codexInternalSessionIDHint: String? = nil,
+                parentSessionID: String? = nil,
+                subagentType: String? = nil,
+                customTitle: String? = nil) {
         self.id = id
         self.source = source
         self.startTime = startTime
@@ -47,9 +57,13 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
         self.events = events
         self.isHousekeeping = isHousekeeping
         self.lightweightCwd = nil
+        self.lightweightRepoName = nil
         self.lightweightTitle = nil
+        self.customTitle = customTitle
         self.codexInternalSessionIDHint = codexInternalSessionIDHint
         self.lightweightCommands = nil
+        self.parentSessionID = parentSessionID
+        self.subagentType = subagentType
         self.isFavorite = false
     }
 
@@ -68,7 +82,10 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
                 lightweightTitle: String?,
                 lightweightCommands: Int? = nil,
                 isHousekeeping: Bool = false,
-                codexInternalSessionIDHint: String? = nil) {
+                codexInternalSessionIDHint: String? = nil,
+                parentSessionID: String? = nil,
+                subagentType: String? = nil,
+                customTitle: String? = nil) {
         self.id = id
         self.source = source
         self.startTime = startTime
@@ -80,9 +97,13 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
         self.events = events
         self.isHousekeeping = isHousekeeping
         self.lightweightCwd = cwd
+        self.lightweightRepoName = repoName
         self.lightweightTitle = lightweightTitle
+        self.customTitle = customTitle
         self.codexInternalSessionIDHint = codexInternalSessionIDHint
         self.lightweightCommands = lightweightCommands
+        self.parentSessionID = parentSessionID
+        self.subagentType = subagentType
         self.isFavorite = false
     }
 
@@ -97,9 +118,13 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
         case eventCount
         case events
         case lightweightCwd
+        case lightweightRepoName
         case lightweightTitle
         case lightweightCommands
         case codexInternalSessionIDHint
+        case parentSessionID
+        case subagentType
+        case customTitle
         // isFavorite intentionally excluded (runtime only)
         // isHousekeeping intentionally excluded (derived at parse/index time)
     }
@@ -109,9 +134,34 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
         events.first(where: { $0.kind == .user })?.text?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // Lightweight title for high-frequency list rendering/sorting paths.
+    // Avoids expensive preamble heuristics that are better suited for detail views.
+    public var listTitle: String {
+        if let custom = customTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
+            return custom
+        }
+        if let light = lightweightTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !light.isEmpty {
+            return light
+        }
+        if let user = events.first(where: { $0.kind == .user })?.text?.collapsedWhitespace(), !user.isEmpty {
+            return user
+        }
+        if let assistant = events.first(where: { $0.kind == .assistant })?.text?.collapsedWhitespace(), !assistant.isEmpty {
+            return assistant
+        }
+        if let name = events.first(where: { $0.kind == .tool_call && ($0.toolName?.isEmpty == false) })?.toolName {
+            return name
+        }
+        return "No prompt"
+    }
+
     // Derived human-friendly title for the session row.
     // Use improved Codex-style filtering with fallbacks for robustness
     public var title: String {
+        // Custom title from /rename takes absolute precedence
+        if let custom = customTitle, !custom.isEmpty {
+            return custom
+        }
         let defaults = UserDefaults.standard
         let skipPreamble = (defaults.object(forKey: "SkipAgentsPreamble") == nil)
             ? true
@@ -418,14 +468,15 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
         return nil
     }
     public var repoName: String? {
-        guard let cwd else { return nil }
-
-        // 1. Try git repository detection first
-        if let info = Self.gitInfo(from: cwd) {
-            return URL(fileURLWithPath: info.root).lastPathComponent
+        if let stored = lightweightRepoName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !stored.isEmpty {
+            return stored
         }
 
-        // 2. Fallback: use directory name if it looks like a project
+        guard let cwd else { return nil }
+        // Avoid implicit filesystem probing here. This property is read per-row
+        // during startup/indexing and probing arbitrary cwd paths can trigger TCC prompts.
+        // Prefer lightweight metadata and path-based heuristics only.
         let url = URL(fileURLWithPath: cwd)
         let dirName = url.lastPathComponent
 
@@ -435,7 +486,7 @@ public struct Session: Identifiable, Equatable, Codable, Sendable {
             return dirName
         }
 
-        // 3. Final fallback: try parent directory name
+        // Final fallback: try parent directory name
         let parent = url.deletingLastPathComponent()
         let parentName = parent.lastPathComponent
         if !genericNames.contains(parentName) && !parentName.isEmpty && parentName != "." {
@@ -584,7 +635,7 @@ extension Array where Element == Session {
     func groupedBySection(now: Date = Date(), calendar: Calendar = .current) -> [(SessionDateSection, [Session])] {
         let cal = calendar
         let today = cal.startOfDay(for: now)
-        let yesterday = cal.date(byAdding: .day, value: -1, to: today)!
+        let yesterday = cal.date(byAdding: .day, value: -1, to: today) ?? today
         var buckets: [SessionDateSection: [Session]] = [:]
         for s in self {
             guard let start = s.startTime else {
@@ -745,15 +796,45 @@ private extension Session {
 
     // Try to find a Git repository root by walking up from cwd.
     struct GitInfo { let root: String; let isWorktree: Bool; let isSubmodule: Bool }
+    private final class GitInfoCacheBox: NSObject {
+        let root: String?
+        let isWorktree: Bool
+        let isSubmodule: Bool
+
+        init(_ info: GitInfo?) {
+            self.root = info?.root
+            self.isWorktree = info?.isWorktree ?? false
+            self.isSubmodule = info?.isSubmodule ?? false
+        }
+
+        var info: GitInfo? {
+            guard let root else { return nil }
+            return GitInfo(root: root, isWorktree: isWorktree, isSubmodule: isSubmodule)
+        }
+    }
+    private static let gitInfoCache: NSCache<NSString, GitInfoCacheBox> = {
+        let cache = NSCache<NSString, GitInfoCacheBox>()
+        cache.countLimit = 2048
+        return cache
+    }()
+
     static func gitInfo(from start: String, maxLevels: Int = 6) -> GitInfo? {
-        var url = URL(fileURLWithPath: start)
+        let normalizedStart = URL(fileURLWithPath: start).standardizedFileURL.path
+        let cacheKey = "\(normalizedStart)|\(maxLevels)" as NSString
+        if let cached = gitInfoCache.object(forKey: cacheKey) {
+            return cached.info
+        }
+
+        var url = URL(fileURLWithPath: normalizedStart)
         let fm = FileManager.default
+        var resolved: GitInfo?
         for _ in 0..<maxLevels {
             let dotGitDir = url.appendingPathComponent(".git")
             var isDir: ObjCBool = false
             if fm.fileExists(atPath: dotGitDir.path, isDirectory: &isDir), isDir.boolValue {
                 // Regular repo root
-                return GitInfo(root: url.path, isWorktree: false, isSubmodule: false)
+                resolved = GitInfo(root: url.path, isWorktree: false, isSubmodule: false)
+                break
             }
             // .git file pointing to gitdir
             if fm.fileExists(atPath: dotGitDir.path) {
@@ -763,13 +844,15 @@ private extension Session {
                     let lower = path.lowercased()
                     let worktree = lower.contains(".git/worktrees/")
                     let submodule = lower.contains(".git/modules/")
-                    return GitInfo(root: url.path, isWorktree: worktree, isSubmodule: submodule)
+                    resolved = GitInfo(root: url.path, isWorktree: worktree, isSubmodule: submodule)
+                    break
                 }
             }
             let parent = url.deletingLastPathComponent()
             if parent.path == url.path { break }
             url = parent
         }
-        return nil
+        gitInfoCache.setObject(GitInfoCacheBox(resolved), forKey: cacheKey)
+        return resolved
     }
 }

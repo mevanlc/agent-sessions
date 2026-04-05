@@ -210,6 +210,7 @@ private struct IndexingIndicator: View {
             .opacity(isVisible ? 1 : 0)
             .animation(isVisible ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default,
                        value: isAnimating)
+            .drawingGroup()
             .onAppear { isAnimating = true }
     }
 }
@@ -242,9 +243,11 @@ private struct IndexingIndicator: View {
 	    }
 
 	    private var presentation: Presentation {
-	        let fiveResetRaw = data.fiveHourResetText.trimmingCharacters(in: .whitespacesAndNewlines)
-	        let weekResetRaw = data.weekResetText.trimmingCharacters(in: .whitespacesAndNewlines)
-	        let hasResetInfo = !(fiveResetRaw.isEmpty && weekResetRaw.isEmpty)
+		        let fiveResetRaw = data.fiveHourResetText.trimmingCharacters(in: .whitespacesAndNewlines)
+		        let weekResetRaw = data.weekResetText.trimmingCharacters(in: .whitespacesAndNewlines)
+		        let fiveUnavailable = isResetInfoUnavailable(raw: fiveResetRaw)
+		        let weekUnavailable = isResetInfoUnavailable(raw: weekResetRaw)
+		        let hasResetInfo = !((fiveResetRaw.isEmpty || fiveUnavailable) && (weekResetRaw.isEmpty || weekUnavailable))
 
         let fiveLeft = clampPercent(data.fiveHourRemainingPercent)
         let weekLeft = clampPercent(data.weekRemainingPercent)
@@ -288,35 +291,37 @@ private struct IndexingIndicator: View {
 	            }
 	        }()
 
-	        let fiveResetDate = fiveIsStale ? nil : data.resetDate(kind: "5h", raw: data.fiveHourResetText)
-	        let weekResetDate = weekIsStale ? nil : data.resetDate(kind: "Wk", raw: data.weekResetText)
+	        let fiveResetDate = data.resetDate(kind: "5h", raw: data.fiveHourResetText)
+	        let weekResetDate = data.resetDate(kind: "Wk", raw: data.weekResetText)
 
 	        let fiveResetDisplayText: String = {
+	            if fiveUnavailable { return UsageStaleThresholds.unavailableCopy }
 	            let rel = formatRelativeTimeUntil(fiveResetDate)
-	            if fiveIsStale { return "n/a" }
 	            if rel != "—" { return rel }
+	            if fiveIsStale { return "n/a" }
 	            let fallback = data.resetDisplayFallback(kind: "5h", raw: data.fiveHourResetText)
 	            return fallback.isEmpty ? "—" : fallback
 	        }()
 
 	        let weekResetDisplayText: String = {
+	            if weekUnavailable { return UsageStaleThresholds.unavailableCopy }
 	            let s = formatWeeklyReset(weekResetDate)
-	            if weekIsStale { return "n/a" }
 	            if s != "—" { return s }
+	            if weekIsStale { return "n/a" }
 	            let fallback = data.resetDisplayFallback(kind: "Wk", raw: data.weekResetText)
 	            return fallback.isEmpty ? "—" : fallback
 	        }()
 
-	        return Presentation(
-	            barFillPercent: barFillPercent,
-	            barFillColor: isCritical ? .red : .white,
-	            bottleneckUsedPercent: hasResetInfo ? bottleneckUsed : 0,
-	            fiveHourPercentLabelText: "\(mode.numericPercent(fromLeft: fiveLeft))%",
-	            weekPercentLabelText: "\(mode.numericPercent(fromLeft: weekLeft))%",
-	            fiveHourResetLabelText: fiveResetDisplayText,
-	            weekResetLabelText: weekResetDisplayText
-	        )
-	    }
+		        return Presentation(
+		            barFillPercent: barFillPercent,
+		            barFillColor: isCritical ? .red : .white,
+		            bottleneckUsedPercent: hasResetInfo ? bottleneckUsed : 0,
+		            fiveHourPercentLabelText: fiveUnavailable ? "--" : "\(mode.numericPercent(fromLeft: fiveLeft))%",
+		            weekPercentLabelText: weekUnavailable ? "--" : "\(mode.numericPercent(fromLeft: weekLeft))%",
+		            fiveHourResetLabelText: fiveResetDisplayText,
+		            weekResetLabelText: weekResetDisplayText
+		        )
+		    }
 
 	    @ViewBuilder
 	    private func resetIndicator(labelText: String) -> some View {
@@ -398,33 +403,12 @@ private struct IndexingIndicator: View {
 	        }
 	    }
 
-    private func clampPercent(_ value: Int) -> Int {
-        max(0, min(100, value))
-    }
-
     private func formatRelativeTimeUntil(_ date: Date?, now: Date = Date()) -> String {
-        guard let date else { return "—" }
-        let interval = max(0, date.timeIntervalSince(now))
-        if interval < 60 { return "<1m" }
-        let totalMinutes = Int(ceil(interval / 60.0))
-        let hours = totalMinutes / 60
-        let minutes = totalMinutes % 60
-        if hours <= 0 { return "\(minutes)m" }
-        if minutes <= 0 { return "\(hours)h" }
-        return "\(hours)h \(minutes)m"
+        formatUsageRelativeTimeLabel(date, now: now) ?? "—"
     }
 
     private func formatWeeklyReset(_ date: Date?, now: Date = Date()) -> String {
-        guard let date else { return "—" }
-        let interval = date.timeIntervalSince(now)
-        if interval >= 0, interval < 24 * 60 * 60 {
-            let formatter = DateFormatter()
-            formatter.locale = .current
-            formatter.timeZone = .autoupdatingCurrent
-            formatter.dateFormat = "HH:mm"
-            return formatter.string(from: date)
-        }
-        return AppDateFormatting.weekdayAbbrev(date)
+        formatUsageWeeklyResetLabel(date, now: now) ?? "—"
     }
 	}
 
@@ -438,6 +422,7 @@ private struct RefreshSpinner: View {
             .font(.system(size: 11, weight: .semibold))
             .rotationEffect(.degrees(rotate ? 360 : 0))
             .animation(.linear(duration: 1.0).repeatForever(autoreverses: false), value: rotate)
+            .drawingGroup()
             .onAppear { rotate = true }
     }
 }
@@ -478,6 +463,7 @@ private struct MiniUsageBar: View {
                 Capsule(style: .continuous)
                     .fill(tint)
                     .frame(width: max(0, 24 * clampedFill), height: 4)
+                    .drawingGroup()
                     .opacity((blinkDuration == nil) ? 1 : (isBlinking ? 0.35 : 1))
                     .task(id: blinkDuration) {
                         guard let d = blinkDuration else {

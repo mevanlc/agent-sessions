@@ -35,6 +35,17 @@ enum ClaudeProbeConfig {
         return session.filePath.hasPrefix(probeConfigDir() + "/")
     }
 
+    /// Returns true if the given path is the Claude probe working directory.
+    static func isProbeWorkingDirectory(_ path: String?) -> Bool {
+        guard let path, !path.isEmpty else { return false }
+        return normalizePath(path) == normalizePath(probeWorkingDirectory())
+    }
+
+    private static func normalizePath(_ path: String) -> String {
+        let expanded = (path as NSString).expandingTildeInPath
+        return (expanded as NSString).standardizingPath
+    }
+
     private static func envValue(_ key: String) -> String? {
         guard let value = getenv(key) else { return nil }
         return String(cString: value)

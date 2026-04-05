@@ -1,9 +1,24 @@
 import Foundation
 import Combine
 import SwiftUI
+import os.log
+
+private let indexLog = OSLog(subsystem: "com.triada.AgentSessions", category: "ClaudeIndexing")
 
 /// Session indexer for Claude Code sessions
 final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
+    private struct PersistedFileStat: Codable {
+        let mtime: Int64
+        let size: Int64
+    }
+
+    private struct PersistedFileStatPayload: Codable {
+        let version: Int
+        let stats: [String: PersistedFileStat]
+    }
+
+    private static let coreFileStatsStateKey = "core_file_stats_v1:claude"
+
     @Published private(set) var allSessions: [Session] = []
     @Published private(set) var sessions: [Session] = []
     @Published var isIndexing: Bool = false
@@ -224,6 +239,22 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
             let fm = FileManager.default
             let exists: (Session) -> Bool = { s in fm.fileExists(atPath: s.filePath) }
             let existingSessions = indexed.filter(exists)
+            self.bootstrapKnownFileStatsIfNeeded(from: existingSessions)
+
+            // Publish hydrated sessions immediately so the UI is populated
+            // while the background file scan runs (matches Codex indexer pattern).
+            let presentedHydration = !existingSessions.isEmpty
+            if presentedHydration {
+                let hideProbes = !(UserDefaults.standard.bool(forKey: "ShowSystemProbeSessions"))
+                let hydratedFiltered = existingSessions.filter { hideProbes ? !ClaudeProbeConfig.isProbeSession($0) : true }
+                let hydratedSorted = hydratedFiltered.sorted { $0.modifiedAt > $1.modifiedAt }
+                let hydratedWithArchives = SessionArchiveManager.shared.mergePinnedArchiveFallbacks(into: hydratedSorted, source: .claude)
+                self.publishAfterCurrentUpdate { [weak self] in
+                    guard let self, self.isRefreshTokenCurrent(token) else { return }
+                    self.allSessions = hydratedWithArchives
+                    self.launchPhase = .scanning
+                }
+            }
 
             #if DEBUG
             if !existingSessions.isEmpty {
@@ -234,10 +265,10 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
             LaunchProfiler.log("Claude.refresh: DB hydrate complete (existing=\(existingSessions.count))")
             #endif
 
-            let deltaScope: SessionDeltaScope = (mode == .fullReconcile) ? .full : .recent
+            let deltaScope: SessionDeltaScope = (mode == .fullReconcile || trigger == .manual || trigger == .launch) ? .full : .recent
             let previousStats = self.knownFileStatsByPathSnapshot()
             let initialDelta = self.discovery.discoverDelta(previousByPath: previousStats, scope: deltaScope)
-            let shouldEscalate = Self.shouldEscalateRecentDeltaToFullReconcile(mode: mode, delta: initialDelta)
+            let shouldEscalate = Self.shouldEscalateRecentDeltaToFullReconcile(mode: mode)
             let effectiveMode: IndexRefreshMode = shouldEscalate ? .fullReconcile : mode
             let delta: SessionDiscoveryDelta = {
                 if shouldEscalate {
@@ -245,12 +276,28 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
                 }
                 return initialDelta
             }()
-            let files: [URL] = {
-                if effectiveMode == .fullReconcile {
-                    return delta.currentByPath.keys.map { URL(fileURLWithPath: $0) }
+            let files: [URL]
+            let missingHydratedCount: Int
+            if effectiveMode == .fullReconcile {
+                files = delta.currentByPath.keys.map { URL(fileURLWithPath: $0) }
+                missingHydratedCount = 0
+            } else {
+                // Supplement: force-parse files on disk but missing from hydrated snapshot.
+                // Without this, sessions not in session_meta AND not file-stat-changed stay invisible.
+                let existingPaths = Set(existingSessions.map(\.filePath))
+                let changedPaths = Set(delta.changedFiles.map(\.path))
+                let missingPaths = Set(delta.currentByPath.keys)
+                    .subtracting(existingPaths)
+                    .subtracting(changedPaths)
+                missingHydratedCount = missingPaths.count
+                if missingPaths.isEmpty {
+                    files = delta.changedFiles
+                } else {
+                    var combined = delta.changedFiles
+                    combined.append(contentsOf: missingPaths.sorted().map { URL(fileURLWithPath: $0) })
+                    files = combined
                 }
-                return delta.changedFiles
-            }()
+            }
             if shouldEscalate {
                 LaunchProfiler.log("Claude.refresh: escalating recent delta to full reconcile due to drift")
             }
@@ -261,6 +308,12 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
             )
             #endif
             LaunchProfiler.log("Claude.refresh: file enumeration done (changed=\(files.count), removed=\(delta.removedPaths.count), drift=\(delta.driftDetected))")
+            os_log("Claude.refresh: found=%d changed=%d gap=%d hydrated=%d removed=%d scope=%{public}@",
+                   log: indexLog, type: .info,
+                   delta.currentByPath.count, delta.changedFiles.count,
+                   missingHydratedCount,
+                   existingSessions.count, delta.removedPaths.count,
+                   deltaScope == .full ? "full" : "recent")
 
             let config = SessionIndexingEngine.ScanConfig(
                 source: .claude,
@@ -321,7 +374,10 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
                         lightweightTitle: session.lightweightTitle ?? existing.lightweightTitle,
                         lightweightCommands: session.lightweightCommands ?? existing.lightweightCommands,
                         isHousekeeping: existing.isHousekeeping,
-                        codexInternalSessionIDHint: session.codexInternalSessionIDHint ?? existing.codexInternalSessionIDHint
+                        codexInternalSessionIDHint: session.codexInternalSessionIDHint ?? existing.codexInternalSessionIDHint,
+                        parentSessionID: session.parentSessionID ?? existing.parentSessionID,
+                        subagentType: session.subagentType ?? existing.subagentType,
+                        customTitle: session.customTitle ?? existing.customTitle
                     )
                     mergedByPath[session.filePath] = merged
                 } else {
@@ -334,9 +390,25 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
             let sortedSessions = filtered.sorted { $0.modifiedAt > $1.modifiedAt }
             let mergedWithArchives = SessionArchiveManager.shared.mergePinnedArchiveFallbacks(into: sortedSessions, source: .claude)
             self.applyKnownFileStatsDelta(mode: effectiveMode, delta: delta)
-            self.scheduleAnalyticsDelta(changedFiles: files,
-                                        removedPaths: delta.removedPaths,
-                                        executionProfile: executionProfile)
+            await self.persistKnownFileStats()
+
+            // Persist lightweight session_meta so subsequent hydration is complete.
+            // Excludes probe sessions to match analytics policy.
+            let sessionsForMeta = merged.filter { !ClaudeProbeConfig.isProbeSession($0) }
+            if !sessionsForMeta.isEmpty {
+                do {
+                    let db = try IndexDB()
+                    try await db.begin()
+                    for session in sessionsForMeta {
+                        try? await db.upsertSessionMetaCore(SessionIndexer.sessionMetaRow(from: session))
+                    }
+                    try await db.commit()
+                    os_log("Claude: wrote %d session_meta rows", log: indexLog, type: .info, sessionsForMeta.count)
+                } catch {
+                    os_log("Claude: session_meta write failed: %{public}@", log: indexLog, type: .error, error.localizedDescription)
+                    // Non-fatal: hydration gap will persist until next successful write.
+                }
+            }
 
             self.publishAfterCurrentUpdate { [weak self] in
                 guard let self, self.isRefreshTokenCurrent(token) else { return }
@@ -412,23 +484,25 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
     private func seedKnownFileStatsIfNeeded() async {
         if hasKnownFileStats() { return }
         do {
-            let db = try IndexDB()
-            let indexed = try await db.fetchIndexedFiles(for: SessionSource.claude.rawValue)
-            var map: [String: SessionFileStat] = [:]
-            map.reserveCapacity(indexed.count)
-            for row in indexed {
-                map[row.path] = SessionFileStat(mtime: row.mtime, size: row.size)
+            if let persisted = try await loadPersistedKnownFileStats() {
+                initializeKnownFileStatsIfNeeded(persisted)
+                os_log("Claude: seeded file stats from persisted baseline (%d entries)", log: indexLog, type: .info, persisted.count)
+                #if DEBUG
+                LaunchProfiler.log("Claude.refresh: known file stats loaded from persisted core baseline (\(persisted.count))")
+                #endif
             }
-            initializeKnownFileStatsIfNeeded(map)
         } catch {
-            // Non-fatal. Cache will be built from runtime deltas.
+            os_log("Claude: seedKnownFileStats failed: %{public}@", log: indexLog, type: .error, error.localizedDescription)
+            // Non-fatal. We'll bootstrap from hydrated sessions or runtime deltas.
         }
     }
 
-    static func shouldEscalateRecentDeltaToFullReconcile(mode: IndexRefreshMode,
-                                                          delta: SessionDiscoveryDelta) -> Bool {
+    static func shouldEscalateRecentDeltaToFullReconcile(mode: IndexRefreshMode) -> Bool {
         guard mode != .fullReconcile else { return false }
-        return delta.driftDetected
+        // Do not auto-upgrade recent delta scans to full reconciles during normal
+        // launch/monitor refreshes. For large histories this can repeatedly trigger
+        // near-full reindex passes on each app start.
+        return false
     }
 
     private func setRefreshToken(_ token: UUID) {
@@ -482,6 +556,67 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
         refreshStateLock.unlock()
     }
 
+    private func bootstrapKnownFileStatsIfNeeded(from sessions: [Session]) {
+        if hasKnownFileStats() { return }
+        guard !sessions.isEmpty else { return }
+        var map: [String: SessionFileStat] = [:]
+        map.reserveCapacity(sessions.count)
+        for session in sessions {
+            let url = URL(fileURLWithPath: session.filePath)
+            if let stat = Self.fileStat(for: url) {
+                map[session.filePath] = stat
+            } else {
+                let size = Int64(max(0, session.fileSizeBytes ?? 0))
+                let mtime = Int64(max(0, session.modifiedAt.timeIntervalSince1970))
+                map[session.filePath] = SessionFileStat(mtime: mtime, size: size)
+            }
+        }
+        initializeKnownFileStatsIfNeeded(map)
+        #if DEBUG
+        LaunchProfiler.log("Claude.refresh: known file stats bootstrapped from hydrated sessions (\(map.count))")
+        #endif
+    }
+
+    private func knownFileStatsSnapshot() -> [String: SessionFileStat] {
+        refreshStateLock.lock()
+        let snapshot = lastKnownFileStatsByPath
+        refreshStateLock.unlock()
+        return snapshot
+    }
+
+    private func persistKnownFileStats() async {
+        let snapshot = knownFileStatsSnapshot()
+        guard !snapshot.isEmpty else { return }
+        do {
+            let payload = PersistedFileStatPayload(
+                version: 1,
+                stats: snapshot.reduce(into: [:]) { partial, entry in
+                    partial[entry.key] = PersistedFileStat(mtime: entry.value.mtime, size: entry.value.size)
+                }
+            )
+            let data = try JSONEncoder().encode(payload)
+            guard let json = String(data: data, encoding: .utf8) else { return }
+            let db = try IndexDB()
+            try await db.setIndexState(key: Self.coreFileStatsStateKey, value: json)
+        } catch {
+            // Non-fatal. Next run can still bootstrap from DB/filesystem.
+        }
+    }
+
+    private func loadPersistedKnownFileStats() async throws -> [String: SessionFileStat]? {
+        let db = try IndexDB()
+        guard let raw = try await db.indexStateValue(for: Self.coreFileStatsStateKey),
+              let data = raw.data(using: .utf8) else {
+            return nil
+        }
+        let payload = try JSONDecoder().decode(PersistedFileStatPayload.self, from: data)
+        guard payload.version == 1 else { return nil }
+        let map = payload.stats.reduce(into: [String: SessionFileStat]()) { partial, entry in
+            partial[entry.key] = SessionFileStat(mtime: entry.value.mtime, size: entry.value.size)
+        }
+        return map.isEmpty ? nil : map
+    }
+
     private func shouldPrewarmSessionSignature(_ session: Session) -> Bool {
         let size = session.fileSizeBytes ?? 0
         let signature = size ^ (session.eventCount << 16)
@@ -492,27 +627,6 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
         }
         refreshStateLock.unlock()
         return shouldPrewarm
-    }
-
-    private func scheduleAnalyticsDelta(changedFiles: [URL],
-                                        removedPaths: [String],
-                                        executionProfile: IndexRefreshExecutionProfile) {
-        guard !(changedFiles.isEmpty && removedPaths.isEmpty) else { return }
-        let delay = executionProfile.deferNonCriticalWork ? UInt64(500_000_000) : UInt64(120_000_000)
-        Task.detached(priority: .utility) {
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-            do {
-                let db = try IndexDB()
-                let indexer = AnalyticsIndexer(db: db, enabledSources: [SessionSource.claude.rawValue])
-                await indexer.refreshDelta(source: SessionSource.claude.rawValue,
-                                           changed: changedFiles,
-                                           removedPaths: removedPaths)
-            } catch {
-                // Non-fatal: analytics delta indexing is best-effort.
-            }
-        }
     }
 
     private func hydrateFromIndexDBIfAvailable() async throws -> [Session]? {
@@ -556,7 +670,10 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
                 repoName: nil,
                 lightweightTitle: newTitle,
                 lightweightCommands: current.lightweightCommands,
-                codexInternalSessionIDHint: current.codexInternalSessionIDHint
+                codexInternalSessionIDHint: current.codexInternalSessionIDHint,
+                parentSessionID: current.parentSessionID,
+                subagentType: current.subagentType,
+                customTitle: current.customTitle
             )
 
             do {
@@ -721,7 +838,10 @@ final class ClaudeSessionIndexer: ObservableObject, @unchecked Sendable {
                     repoName: current.repoName,
                     lightweightTitle: current.lightweightTitle ?? fullSession.lightweightTitle,
                     lightweightCommands: current.lightweightCommands,
-                    codexInternalSessionIDHint: fullSession.codexInternalSessionIDHint ?? current.codexInternalSessionIDHint
+                    codexInternalSessionIDHint: fullSession.codexInternalSessionIDHint ?? current.codexInternalSessionIDHint,
+                    parentSessionID: fullSession.parentSessionID ?? current.parentSessionID,
+                    subagentType: fullSession.subagentType ?? current.subagentType,
+                    customTitle: fullSession.customTitle ?? current.customTitle
                 )
                 self.allSessions[idx] = merged
 

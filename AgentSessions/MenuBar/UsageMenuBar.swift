@@ -1,7 +1,191 @@
 import SwiftUI
 import AppKit
+import Combine
+
+@MainActor
+private final class UsageMenuBarLiveSummaryModel: ObservableObject {
+    @Published private(set) var summary = HUDLiveSessionSummary(activeCount: 0, waitingCount: 0)
+
+    private var activeCodexID: ObjectIdentifier?
+    private var codexIndexerID: ObjectIdentifier?
+    private var claudeIndexerID: ObjectIdentifier?
+    private var opencodeIndexerID: ObjectIdentifier?
+    private weak var activeCodex: CodexActiveSessionsModel?
+    private weak var codexIndexer: SessionIndexer?
+    private weak var claudeIndexer: ClaudeSessionIndexer?
+    private weak var opencodeIndexer: OpenCodeSessionIndexer?
+    private var lookupIndexes = SessionLookupIndexes(byLogPath: [:], bySessionID: [:], byWorkspace: [:])
+    private var cancellables: Set<AnyCancellable> = []
+
+    func connect(activeCodex: CodexActiveSessionsModel,
+                 codexIndexer: SessionIndexer,
+                 claudeIndexer: ClaudeSessionIndexer,
+                 opencodeIndexer: OpenCodeSessionIndexer) {
+        let nextActiveCodexID = ObjectIdentifier(activeCodex)
+        let nextCodexIndexerID = ObjectIdentifier(codexIndexer)
+        let nextClaudeIndexerID = ObjectIdentifier(claudeIndexer)
+        let nextOpenCodeIndexerID = ObjectIdentifier(opencodeIndexer)
+        guard activeCodexID != nextActiveCodexID
+            || codexIndexerID != nextCodexIndexerID
+            || claudeIndexerID != nextClaudeIndexerID
+            || opencodeIndexerID != nextOpenCodeIndexerID else {
+            return
+        }
+
+        activeCodexID = nextActiveCodexID
+        codexIndexerID = nextCodexIndexerID
+        claudeIndexerID = nextClaudeIndexerID
+        opencodeIndexerID = nextOpenCodeIndexerID
+        self.activeCodex = activeCodex
+        self.codexIndexer = codexIndexer
+        self.claudeIndexer = claudeIndexer
+        self.opencodeIndexer = opencodeIndexer
+        cancellables.removeAll()
+
+        activeCodex.$activeMembershipVersion
+            .sink { [weak self] _ in self?.rebuild() }
+            .store(in: &cancellables)
+
+        codexIndexer.$allSessions
+            .sink { [weak self] sessions in
+                guard let self else { return }
+                guard let claudeIndexer = self.claudeIndexer else { return }
+                self.lookupIndexes = AgentCockpitHUDView.buildSessionLookupIndexes(
+                    codexSessions: sessions,
+                    claudeSessions: claudeIndexer.allSessions,
+                    opencodeSessions: self.opencodeIndexer?.allSessions ?? []
+                )
+                self.rebuild()
+            }
+            .store(in: &cancellables)
+
+        claudeIndexer.$allSessions
+            .sink { [weak self] sessions in
+                guard let self else { return }
+                guard let codexIndexer = self.codexIndexer else { return }
+                self.lookupIndexes = AgentCockpitHUDView.buildSessionLookupIndexes(
+                    codexSessions: codexIndexer.allSessions,
+                    claudeSessions: sessions,
+                    opencodeSessions: self.opencodeIndexer?.allSessions ?? []
+                )
+                self.rebuild()
+            }
+            .store(in: &cancellables)
+
+        opencodeIndexer.$allSessions
+            .sink { [weak self] sessions in
+                guard let self else { return }
+                guard let codexIndexer = self.codexIndexer,
+                      let claudeIndexer = self.claudeIndexer else { return }
+                self.lookupIndexes = AgentCockpitHUDView.buildSessionLookupIndexes(
+                    codexSessions: codexIndexer.allSessions,
+                    claudeSessions: claudeIndexer.allSessions,
+                    opencodeSessions: sessions
+                )
+                self.rebuild()
+            }
+            .store(in: &cancellables)
+
+        lookupIndexes = AgentCockpitHUDView.buildSessionLookupIndexes(
+            codexSessions: codexIndexer.allSessions,
+            claudeSessions: claudeIndexer.allSessions,
+            opencodeSessions: opencodeIndexer.allSessions
+        )
+        rebuild()
+    }
+
+    private func rebuild() {
+        guard let activeCodex else { return }
+        summary = AgentCockpitHUDView.liveSessionSummary(activeCodex: activeCodex, lookupIndexes: lookupIndexes)
+    }
+}
 
 struct UsageMenuBarLabel: View {
+    @EnvironmentObject var activeCodex: CodexActiveSessionsModel
+    @EnvironmentObject var codexIndexer: SessionIndexer
+    @EnvironmentObject var claudeIndexer: ClaudeSessionIndexer
+    @EnvironmentObject var opencodeIndexer: OpenCodeSessionIndexer
+    @EnvironmentObject var codexStatus: CodexUsageModel
+    @EnvironmentObject var claudeStatus: ClaudeUsageModel
+    @AppStorage(PreferencesKey.Cockpit.codexActiveSessionsEnabled) private var liveSessionsEnabled: Bool = true
+    @AppStorage(PreferencesKey.MenuBar.showLiveSessionIcons) private var showLiveSessionIcons: Bool = true
+    @AppStorage(PreferencesKey.Agents.codexEnabled) private var codexAgentEnabled: Bool = true
+    @AppStorage(PreferencesKey.Agents.claudeEnabled) private var claudeAgentEnabled: Bool = true
+    @AppStorage(PreferencesKey.codexUsageEnabled) private var codexUsageEnabled: Bool = false
+    @AppStorage(PreferencesKey.claudeUsageEnabled) private var claudeUsageEnabled: Bool = false
+    @StateObject private var liveSummaryModel = UsageMenuBarLiveSummaryModel()
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if liveSessionsEnabled && showLiveSessionIcons {
+                LiveSessionMenuBarLabel(summary: liveSummaryModel.summary)
+            }
+            if hasAnyUsageSource {
+                UsageMeterMenuBarLabel()
+                    .environmentObject(codexStatus)
+                    .environmentObject(claudeStatus)
+            }
+            if !(liveSessionsEnabled && showLiveSessionIcons) && !hasAnyUsageSource {
+                FallbackMenuBarLabel()
+            }
+        }
+        .frame(height: NSStatusBar.system.thickness)
+        .fixedSize(horizontal: true, vertical: false)
+        .onAppear {
+            liveSummaryModel.connect(
+                activeCodex: activeCodex,
+                codexIndexer: codexIndexer,
+                claudeIndexer: claudeIndexer,
+                opencodeIndexer: opencodeIndexer
+            )
+        }
+    }
+
+    private var hasAnyUsageSource: Bool {
+        (codexAgentEnabled && codexUsageEnabled) || (claudeAgentEnabled && claudeUsageEnabled)
+    }
+}
+
+private struct LiveSessionMenuBarLabel: View {
+    let summary: HUDLiveSessionSummary
+
+    var body: some View {
+        HStack(spacing: 7) {
+            if summary.activeCount > 0 {
+                countSegment(count: summary.activeCount, color: Color(hex: "30d158"))
+            }
+            if summary.waitingCount > 0 {
+                countSegment(count: summary.waitingCount, color: Color(hex: "e08600"))
+            }
+            if summary.activeCount == 0 && summary.waitingCount == 0 {
+                Text("—")
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary.opacity(0.85))
+            }
+        }
+    }
+
+    private func countSegment(count: Int, color: Color) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+            Text("\(count)")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.primary)
+        }
+    }
+}
+
+private struct FallbackMenuBarLabel: View {
+    var body: some View {
+        Text("AS")
+            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.secondary.opacity(0.9))
+    }
+}
+
+private struct UsageMeterMenuBarLabel: View {
     @EnvironmentObject var codexStatus: CodexUsageModel
     @EnvironmentObject var claudeStatus: ClaudeUsageModel
     @Environment(\.colorScheme) private var colorScheme
@@ -79,8 +263,6 @@ struct UsageMenuBarLabel: View {
                 )
             }
         }
-        .frame(height: NSStatusBar.system.thickness)
-        .fixedSize(horizontal: true, vertical: false)
         .onAppear { applyMenuVisibility(visibility) }
         .onChange(of: visibility) { _, newValue in
             applyMenuVisibility(newValue)
@@ -95,7 +277,6 @@ struct UsageMenuBarMenuContent: View {
     @EnvironmentObject var indexer: SessionIndexer
     @EnvironmentObject var codexStatus: CodexUsageModel
     @EnvironmentObject var claudeStatus: ClaudeUsageModel
-    @Environment(\.openWindow) private var openWindow
     @AppStorage("ShowUsageStrip") private var showUsageStrip: Bool = false
     @AppStorage("MenuBarScope") private var menuBarScopeRaw: String = MenuBarScope.both.rawValue
     @AppStorage("MenuBarStyle") private var menuBarStyleRaw: String = MenuBarStyleKind.bars.rawValue
@@ -214,9 +395,7 @@ struct UsageMenuBarMenuContent: View {
             }
             Divider()
             Button("Open Agent Sessions") {
-                // Bring main window to front
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "Agent Sessions")
+                AppWindowRouter.showAgentSessionsWindow()
             }
             // Dynamic label: warn when Claude probes will consume tokens
             let refreshLabel: some View = AnyView(Text("Refresh Limits"))
@@ -305,6 +484,12 @@ private func resetLine(label: String, percent: Int, reset: String) -> Attributed
     var labelAttr = AttributedString(label + " ")
     labelAttr.font = .system(size: 13, weight: .semibold)
     line.append(labelAttr)
+    if reset.trimmingCharacters(in: .whitespacesAndNewlines) == UsageStaleThresholds.unavailableCopy {
+        var unavailableAttr = AttributedString("--  \(UsageStaleThresholds.unavailableCopy)")
+        unavailableAttr.font = .system(size: 13)
+        line.append(unavailableAttr)
+        return line
+    }
     let mode = UsageDisplayMode.current()
     let clampedLeft = max(0, min(100, percent))
     // Bar always shows "used" (filled = used) for consistency
